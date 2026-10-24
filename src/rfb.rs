@@ -7,13 +7,14 @@
 //! - Security type `None` (unencrypted)
 //! - A single client at a time
 //! - 32-bit true-color pixel format with BGRA byte order
-//! - Raw encoding only
+//! - Raw and Hextile encodings, selected from the client's advertised list
 //! - Incremental update requests with damage-region Raw rectangles
 //!
 //! Remote input and text clipboard transfer are enabled only when explicitly
 //! requested and granted by the XDG Desktop Portal. The server does not claim
 //! support for encodings or extensions that are not implemented here.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -36,6 +37,9 @@ const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_SLICE: Duration = Duration::from_millis(250);
 const MAX_UPDATE_RECTS: usize = 128;
 
+const ENCODING_RAW: i32 = 0;
+const ENCODING_HEXTILE: i32 = 5;
+
 /// Protocol settings and optional capability gates for an RFB listener.
 #[derive(Debug, Clone)]
 pub struct RfbConfig {
@@ -49,6 +53,28 @@ pub struct RfbConfig {
     pub input_enabled: bool,
     /// Whether clipboard messages are enabled.
     pub clipboard_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    Raw,
+    Hextile,
+}
+
+impl Encoding {
+    fn rfb_value(self) -> i32 {
+        match self {
+            Self::Raw => ENCODING_RAW,
+            Self::Hextile => ENCODING_HEXTILE,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientUpdateState {
+    encoding: Encoding,
+    last_sequence: u64,
+    pending_damage: Vec<DamageRect>,
 }
 
 /// Start the RFB listener thread.
@@ -175,9 +201,12 @@ fn handle_client(
         shutdown,
     )?;
 
-    let mut last_sequence = 0u64;
+    let mut update_state = ClientUpdateState {
+        encoding: Encoding::Raw,
+        last_sequence: 0,
+        pending_damage: Vec::new(),
+    };
     let mut input_warned = false;
-    let mut pending_damage = Vec::new();
     let mut held_input = if config.input_enabled {
         input_tx.map(ClientInputGuard::new)
     } else {
@@ -192,15 +221,14 @@ fn handle_client(
         let message_type = read_message_type(&mut stream, shutdown, clipboard_rx)?;
         match message_type {
             0 => handle_set_pixel_format(&mut stream, shutdown)?,
-            2 => handle_set_encodings(&mut stream, shutdown)?,
+            2 => update_state.encoding = handle_set_encodings(&mut stream, shutdown)?,
             3 => {
                 handle_update_request(
                     &mut stream,
                     store,
                     config.width,
                     config.height,
-                    &mut last_sequence,
-                    &mut pending_damage,
+                    &mut update_state,
                     shutdown,
                 )?;
             }
@@ -296,7 +324,7 @@ fn handle_set_pixel_format(stream: &mut TcpStream, shutdown: &AtomicBool) -> io:
     validate_client_pixel_format(&format)
 }
 
-fn handle_set_encodings(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<()> {
+fn handle_set_encodings(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<Encoding> {
     let mut padding = [0u8; 1];
     read_exact_interruptible(stream, &mut padding, shutdown)?;
 
@@ -310,17 +338,21 @@ fn handle_set_encodings(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Re
     let mut encodings = vec![0u8; count as usize * 4];
     read_exact_interruptible(stream, &mut encodings, shutdown)?;
 
-    let raw_supported = encodings.chunks_exact(4).any(|encoding| {
-        i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]) == 0
-    });
+    select_encoding(&encodings)
+}
 
-    if !raw_supported {
-        return Err(invalid_data(
-            "client did not offer Raw encoding; only Raw is supported",
-        ));
+fn select_encoding(encodings: &[u8]) -> io::Result<Encoding> {
+    for encoding in encodings.chunks_exact(4) {
+        let value = i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]);
+        match value {
+            ENCODING_HEXTILE => return Ok(Encoding::Hextile),
+            ENCODING_RAW => return Ok(Encoding::Raw),
+            _ => {}
+        }
     }
-
-    Ok(())
+    Err(invalid_data(
+        "client did not offer a supported encoding (Raw or Hextile)",
+    ))
 }
 
 fn handle_update_request(
@@ -328,8 +360,7 @@ fn handle_update_request(
     store: &FrameStore,
     width: u16,
     height: u16,
-    last_sequence: &mut u64,
-    pending_damage: &mut Vec<DamageRect>,
+    state: &mut ClientUpdateState,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let incremental = read_u8(stream, shutdown)? != 0;
@@ -348,7 +379,7 @@ fn handle_update_request(
     };
 
     if !incremental {
-        let changes = match store.changes_since(*last_sequence) {
+        let changes = match store.changes_since(state.last_sequence) {
             Some(changes) => changes,
             None => match store.latest() {
                 Some((sequence, frame)) => crate::framebuffer::FrameChanges {
@@ -364,35 +395,35 @@ fn handle_update_request(
         };
         ensure_frame_dimensions(&changes.frame, width, height)?;
         accumulate_damage(
-            pending_damage,
+            &mut state.pending_damage,
             changes.damage,
             u32::from(width),
             u32::from(height),
         );
-        *last_sequence = changes.sequence;
+        state.last_sequence = changes.sequence;
 
         let updates = vec![requested];
-        send_update(stream, &changes.frame, &updates, shutdown)?;
-        subtract_damage(pending_damage, requested);
+        send_update(stream, &changes.frame, &updates, state.encoding, shutdown)?;
+        subtract_damage(&mut state.pending_damage, requested);
         return Ok(());
     }
 
     let deadline = Instant::now() + INCREMENTAL_TIMEOUT;
     loop {
         let mut changed_frame = None;
-        if let Some(changes) = store.changes_since(*last_sequence) {
+        if let Some(changes) = store.changes_since(state.last_sequence) {
             ensure_frame_dimensions(&changes.frame, width, height)?;
             accumulate_damage(
-                pending_damage,
+                &mut state.pending_damage,
                 changes.damage,
                 u32::from(width),
                 u32::from(height),
             );
-            *last_sequence = changes.sequence;
+            state.last_sequence = changes.sequence;
             changed_frame = Some(changes.frame);
         }
 
-        let updates = damage_within(pending_damage, requested);
+        let updates = damage_within(&state.pending_damage, requested);
         if !updates.is_empty() {
             let updates = bounded_updates(updates, requested);
             let frame = match changed_frame {
@@ -403,8 +434,8 @@ fn handle_update_request(
                     .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
             };
             ensure_frame_dimensions(&frame, width, height)?;
-            send_update(stream, &frame, &updates, shutdown)?;
-            subtract_damage(pending_damage, requested);
+            send_update(stream, &frame, &updates, state.encoding, shutdown)?;
+            subtract_damage(&mut state.pending_damage, requested);
             return Ok(());
         }
 
@@ -414,7 +445,7 @@ fn handle_update_request(
         if Instant::now() >= deadline {
             return send_empty_update(stream, shutdown);
         }
-        let _ = store.wait_next(*last_sequence, WAIT_SLICE);
+        let _ = store.wait_next(state.last_sequence, WAIT_SLICE);
     }
 }
 
@@ -616,6 +647,7 @@ fn send_update(
     stream: &mut TcpStream,
     frame: &Frame,
     rectangles: &[DamageRect],
+    encoding: Encoding,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let frame_width = frame.width as usize;
@@ -661,8 +693,13 @@ fn send_update(
         rectangle_header[2..4].copy_from_slice(&y.to_be_bytes());
         rectangle_header[4..6].copy_from_slice(&width.to_be_bytes());
         rectangle_header[6..8].copy_from_slice(&height.to_be_bytes());
-        rectangle_header[8..12].copy_from_slice(&0i32.to_be_bytes()); // Raw encoding
+        rectangle_header[8..12].copy_from_slice(&encoding.rfb_value().to_be_bytes());
         write_all_interruptible(stream, &rectangle_header, shutdown)?;
+
+        if encoding == Encoding::Hextile {
+            send_hextile_rectangle(stream, frame, *rect, shutdown)?;
+            continue;
+        }
 
         let row_bytes = (width as usize)
             .checked_mul(4)
@@ -707,6 +744,222 @@ fn send_update(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct HextileSubrect {
+    x: u8,
+    y: u8,
+    width: u8,
+    height: u8,
+    color: [u8; 4],
+}
+
+fn send_hextile_rectangle(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    rectangle: DamageRect,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let right = rectangle.x + rectangle.width;
+    let bottom = rectangle.y + rectangle.height;
+
+    for tile_y in (rectangle.y..bottom).step_by(16) {
+        let tile_height = (bottom - tile_y).min(16) as u8;
+        for tile_x in (rectangle.x..right).step_by(16) {
+            let tile_width = (right - tile_x).min(16) as u8;
+            send_hextile_tile(
+                stream,
+                frame,
+                tile_x,
+                tile_y,
+                tile_width,
+                tile_height,
+                shutdown,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn send_hextile_tile(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    tile_x: u32,
+    tile_y: u32,
+    tile_width: u8,
+    tile_height: u8,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    const BACKGROUND_SPECIFIED: u8 = 2;
+    const FOREGROUND_SPECIFIED: u8 = 4;
+    const ANY_SUBRECTS: u8 = 8;
+    const SUBRECTS_COLOURED: u8 = 16;
+
+    let mut frequencies = HashMap::<[u8; 4], usize>::with_capacity(16);
+    let mut background = [0u8; 4];
+    let mut most_frequent = 0usize;
+    for y in 0..u32::from(tile_height) {
+        for x in 0..u32::from(tile_width) {
+            let color = frame_pixel(frame, tile_x + x, tile_y + y)?;
+            let count = frequencies.entry(color).or_default();
+            *count += 1;
+            if *count > most_frequent {
+                most_frequent = *count;
+                background = color;
+            }
+        }
+    }
+
+    let mut subrects = Vec::<HextileSubrect>::new();
+    for y in 0..tile_height {
+        let mut x = 0u8;
+        while x < tile_width {
+            let color = frame_pixel(frame, tile_x + u32::from(x), tile_y + u32::from(y))?;
+            if color == background {
+                x += 1;
+                continue;
+            }
+
+            let run_start = x;
+            x += 1;
+            while x < tile_width
+                && frame_pixel(frame, tile_x + u32::from(x), tile_y + u32::from(y))? == color
+            {
+                x += 1;
+            }
+            let run_width = x - run_start;
+
+            if let Some(previous) = subrects.iter_mut().rev().find(|candidate| {
+                candidate.x == run_start
+                    && candidate.width == run_width
+                    && candidate.color == color
+                    && candidate.y + candidate.height == y
+            }) {
+                previous.height += 1;
+            } else {
+                if subrects.len() == u8::MAX as usize {
+                    return send_raw_hextile_tile(
+                        stream,
+                        frame,
+                        tile_x,
+                        tile_y,
+                        tile_width,
+                        tile_height,
+                        shutdown,
+                    );
+                }
+                subrects.push(HextileSubrect {
+                    x: run_start,
+                    y,
+                    width: run_width,
+                    height: 1,
+                    color,
+                });
+            }
+        }
+    }
+
+    let foreground = subrects.first().map(|subrect| subrect.color);
+    let single_foreground =
+        foreground.is_some_and(|color| subrects.iter().all(|subrect| subrect.color == color));
+    let bytes_per_subrect = if single_foreground { 2 } else { 6 };
+    let encoded_size = 1
+        + 4
+        + usize::from(!subrects.is_empty())
+        + subrects.len() * bytes_per_subrect
+        + if single_foreground { 4 } else { 0 };
+    let raw_size = 1 + usize::from(tile_width) * usize::from(tile_height) * 4;
+
+    if !subrects.is_empty() && encoded_size >= raw_size {
+        return send_raw_hextile_tile(
+            stream,
+            frame,
+            tile_x,
+            tile_y,
+            tile_width,
+            tile_height,
+            shutdown,
+        );
+    }
+
+    let mut flags = BACKGROUND_SPECIFIED;
+    if !subrects.is_empty() {
+        flags |= ANY_SUBRECTS;
+        if single_foreground {
+            flags |= FOREGROUND_SPECIFIED;
+        } else {
+            flags |= SUBRECTS_COLOURED;
+        }
+    }
+    write_all_interruptible(stream, &[flags], shutdown)?;
+    write_all_interruptible(stream, &background, shutdown)?;
+
+    if !subrects.is_empty() {
+        if single_foreground {
+            write_all_interruptible(stream, &foreground.unwrap_or([0; 4]), shutdown)?;
+        }
+        write_all_interruptible(stream, &[subrects.len() as u8], shutdown)?;
+        for subrect in subrects {
+            write_all_interruptible(stream, &[(subrect.x << 4) | subrect.y], shutdown)?;
+            write_all_interruptible(
+                stream,
+                &[((subrect.width - 1) << 4) | (subrect.height - 1)],
+                shutdown,
+            )?;
+            if !single_foreground {
+                write_all_interruptible(stream, &subrect.color, shutdown)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn send_raw_hextile_tile(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    tile_x: u32,
+    tile_y: u32,
+    tile_width: u8,
+    tile_height: u8,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    write_all_interruptible(stream, &[1], shutdown)?; // Raw tile subencoding
+    let row_bytes = usize::from(tile_width) * 4;
+    for row in 0..u32::from(tile_height) {
+        let start = ((tile_y + row) as usize)
+            .checked_mul(frame.width as usize)
+            .and_then(|pixel| pixel.checked_add(tile_x as usize))
+            .and_then(|pixel| pixel.checked_mul(4))
+            .ok_or_else(|| invalid_data("Hextile tile offset overflows"))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| invalid_data("Hextile tile offset overflows"))?;
+        let pixels = frame
+            .data
+            .get(start..end)
+            .ok_or_else(|| invalid_data("Hextile tile is outside the framebuffer"))?;
+        write_all_interruptible(stream, pixels, shutdown)?;
+    }
+    Ok(())
+}
+
+fn frame_pixel(frame: &Frame, x: u32, y: u32) -> io::Result<[u8; 4]> {
+    let start = (y as usize)
+        .checked_mul(frame.width as usize)
+        .and_then(|pixel| pixel.checked_add(x as usize))
+        .and_then(|pixel| pixel.checked_mul(4))
+        .ok_or_else(|| invalid_data("Hextile pixel offset overflows"))?;
+    let end = start
+        .checked_add(4)
+        .ok_or_else(|| invalid_data("Hextile pixel offset overflows"))?;
+    let pixel = frame
+        .data
+        .get(start..end)
+        .ok_or_else(|| invalid_data("Hextile pixel is outside the framebuffer"))?;
+    Ok([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
 /// Tracks held remote inputs so a client disconnect can release them.
@@ -1374,6 +1627,90 @@ mod tests {
         assert_eq!(&message[..4], &[3, 0, 0, 0]);
         assert_eq!(u32::from_be_bytes(message[4..8].try_into().unwrap()), 5);
         assert_eq!(&message[8..], b"hello");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn honors_client_encoding_preference_with_raw_fallback() {
+        let hextile = ENCODING_HEXTILE.to_be_bytes();
+        let raw = ENCODING_RAW.to_be_bytes();
+        let mut offered = Vec::new();
+        offered.extend_from_slice(&hextile);
+        offered.extend_from_slice(&raw);
+        assert_eq!(select_encoding(&offered).unwrap(), Encoding::Hextile);
+
+        offered.clear();
+        offered.extend_from_slice(&raw);
+        offered.extend_from_slice(&hextile);
+        assert_eq!(select_encoding(&offered).unwrap(), Encoding::Raw);
+        assert!(select_encoding(&42i32.to_be_bytes()).is_err());
+    }
+
+    #[test]
+    fn hextile_encodes_solid_and_subrect_tiles() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let solid_pixels = [10, 20, 30, 255].repeat(4);
+        let solid_frame = Frame::new(2, 2, solid_pixels).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            send_update(
+                &mut stream,
+                &solid_frame,
+                &[DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }],
+                Encoding::Hextile,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut update = [0u8; 21];
+        client.read_exact(&mut update).unwrap();
+        assert_eq!(&update[..4], &[0, 0, 0, 1]);
+        assert_eq!(
+            i32::from_be_bytes(update[12..16].try_into().unwrap()),
+            ENCODING_HEXTILE
+        );
+        assert_eq!(&update[16..], &[2, 10, 20, 30, 255]);
+        server.join().unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut pixels = [1, 2, 3, 255].repeat(16);
+        pixels[24..28].copy_from_slice(&[4, 5, 6, 255]); // pixel (2, 1)
+        let frame = Frame::new(4, 4, pixels).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            send_update(
+                &mut stream,
+                &frame,
+                &[DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                }],
+                Encoding::Hextile,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut update = [0u8; 28];
+        client.read_exact(&mut update).unwrap();
+        assert_eq!(update[16], 14); // Background, foreground, one subrect.
+        assert_eq!(&update[17..21], &[1, 2, 3, 255]);
+        assert_eq!(&update[21..25], &[4, 5, 6, 255]);
+        assert_eq!(update[25], 1);
+        assert_eq!(update[26], 0x21); // x=2, y=1
+        assert_eq!(update[27], 0x00); // 1x1 subrect
         server.join().unwrap();
     }
 
