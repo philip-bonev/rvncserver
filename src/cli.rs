@@ -19,6 +19,16 @@ pub const DEFAULT_LISTEN: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default RFB port.
 pub const DEFAULT_PORT: u16 = 5900;
 
+/// Supported RFB authentication modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// VeNCrypt with TLS and username/password authentication.
+    #[default]
+    VeNCrypt,
+    /// Legacy VNC DES challenge-response (no session encryption).
+    Vnc,
+}
+
 /// Validated runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -39,6 +49,8 @@ pub struct Config {
     pub tls_key: Option<PathBuf>,
     /// Restrictive-permission file containing the VeNCrypt username/password.
     pub password_file: Option<PathBuf>,
+    /// Authentication mode selected from CLI or JSON.
+    pub auth_mode: AuthMode,
     /// Path from which this configuration was loaded, if any.
     pub config_file: Option<PathBuf>,
 }
@@ -122,6 +134,7 @@ struct FileConfig {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     password_file: Option<PathBuf>,
+    auth_mode: Option<String>,
 }
 
 impl Error for CliError {}
@@ -142,6 +155,7 @@ where
     let mut tls_cert = None;
     let mut tls_key = None;
     let mut password_file = None;
+    let mut auth_mode = AuthMode::default();
     let mut config_path = None;
 
     let mut listen_set = false;
@@ -152,6 +166,7 @@ where
     let mut tls_cert_set = false;
     let mut tls_key_set = false;
     let mut password_file_set = false;
+    let mut auth_mode_set = false;
     let mut config_path_set = false;
 
     let mut args = args.into_iter();
@@ -249,6 +264,14 @@ where
                     "--password-file",
                 )?));
             }
+            "--auth" => {
+                if auth_mode_set {
+                    return Err(CliError::DuplicateOption("--auth"));
+                }
+                auth_mode_set = true;
+                let value = take_value(inline_value, &mut args, "--auth")?;
+                auth_mode = parse_auth_mode(&value)?;
+            }
             "--enable-input" => {
                 if inline_value.is_some() {
                     return Err(CliError::UnknownArgument(raw));
@@ -339,6 +362,11 @@ where
     if !password_file_set {
         password_file = file_config.password_file;
     }
+    if !auth_mode_set {
+        if let Some(value) = file_config.auth_mode {
+            auth_mode = parse_auth_mode(&value)?;
+        }
+    }
     if let Some(base) = selected_config.as_ref().and_then(|path| path.parent()) {
         if !capture_probe_set {
             resolve_relative(&mut capture_probe, base);
@@ -354,10 +382,18 @@ where
         }
     }
 
-    let any_tls_setting = tls_cert.is_some() || tls_key.is_some() || password_file.is_some();
-    if any_tls_setting && (tls_cert.is_none() || tls_key.is_none() || password_file.is_none()) {
+    let any_credential_setting = tls_cert.is_some() || tls_key.is_some() || password_file.is_some();
+    if auth_mode == AuthMode::VeNCrypt
+        && any_credential_setting
+        && (tls_cert.is_none() || tls_key.is_none() || password_file.is_none())
+    {
         return Err(CliError::IncompatibleOptions(
-            "TLS authentication requires tls_cert, tls_key, and password_file together",
+            "VeNCrypt authentication requires tls_cert, tls_key, and password_file together",
+        ));
+    }
+    if auth_mode == AuthMode::Vnc && password_file.is_none() {
+        return Err(CliError::IncompatibleOptions(
+            "VNC authentication requires password_file",
         ));
     }
 
@@ -376,6 +412,7 @@ where
         tls_cert,
         tls_key,
         password_file,
+        auth_mode,
         config_file: selected_config.filter(|path| path.exists()),
     }))
 }
@@ -385,6 +422,16 @@ fn default_config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(path).join("rvncserver/config.json"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/rvncserver/config.json"))
+}
+
+fn parse_auth_mode(value: &str) -> Result<AuthMode, CliError> {
+    match value {
+        "vencrypt" => Ok(AuthMode::VeNCrypt),
+        "vnc" => Ok(AuthMode::Vnc),
+        _ => Err(CliError::IncompatibleOptions(
+            "invalid auth mode; expected vencrypt or vnc",
+        )),
+    }
 }
 
 fn resolve_relative(path: &mut Option<PathBuf>, base: &std::path::Path) {
@@ -432,9 +479,10 @@ Options:
   --port <PORT>            TCP port to bind (default: 5900)
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
-  --tls-cert <PATH>        TLS server certificate PEM (enables VeNCrypt/TLSPlain)
+  --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt
   --tls-key <PATH>         TLS private key PEM
-  --password-file <PATH>   Username/password file (restrict permissions to owner)
+  --password-file <PATH>   Authentication credentials file (owner-only permissions)
+  --auth <MODE>            Authentication: vencrypt (default) or vnc
   --enable-input           Request portal permission for keyboard/pointer control
   --disable-input          Disable keyboard/pointer control from the config file
   --enable-clipboard       Request portal permission for clipboard sharing
@@ -443,8 +491,8 @@ Options:
   -V, --version            Print the application version
 
 The captured screen source is selected in the desktop portal dialog.
-Input and clipboard are disabled unless explicitly enabled. TLS authentication
-is enabled only when all three TLS paths are configured.
+Input and clipboard are disabled unless explicitly enabled. VeNCrypt is the
+secure default; VNC mode uses weak DES and does not encrypt traffic.
 The default address is loopback only.
 In capture-probe mode, --listen and --port are accepted but unused.
 ",
@@ -457,7 +505,28 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Command, CliError> {
-        parse_args(args.iter().map(|argument| OsString::from(*argument)))
+        if args
+            .iter()
+            .any(|argument| argument.starts_with("--config="))
+            || args.contains(&"--config")
+        {
+            return parse_args(args.iter().map(|argument| OsString::from(*argument)));
+        }
+
+        let config_path = std::env::temp_dir().join(format!(
+            "rvncserver-empty-config-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&config_path, "{}").unwrap();
+        let mut isolated_args = vec![
+            OsString::from("--config"),
+            config_path.as_os_str().to_owned(),
+        ];
+        isolated_args.extend(args.iter().map(OsString::from));
+        let result = parse_args(isolated_args);
+        fs::remove_file(config_path).unwrap();
+        result
     }
 
     fn config(args: &[&str]) -> Config {
@@ -478,6 +547,7 @@ mod tests {
         assert!(config.tls_cert.is_none());
         assert!(config.tls_key.is_none());
         assert!(config.password_file.is_none());
+        assert_eq!(config.auth_mode, AuthMode::VeNCrypt);
     }
 
     #[test]
@@ -511,6 +581,22 @@ mod tests {
     }
 
     #[test]
+    fn selects_vnc_authentication_mode() {
+        let selected = config(&["--auth", "vnc", "--password-file", "/tmp/pass"]);
+        assert_eq!(selected.auth_mode, AuthMode::Vnc);
+        assert_eq!(
+            config(&["--auth", "vencrypt"]).auth_mode,
+            AuthMode::VeNCrypt
+        );
+        assert_eq!(
+            parse(&["--auth", "vnc"]),
+            Err(CliError::IncompatibleOptions(
+                "VNC authentication requires password_file"
+            ))
+        );
+    }
+
+    #[test]
     fn rejects_input_options_with_capture_probe() {
         assert_eq!(
             parse(&["--capture-probe", "/tmp/frame.ppm", "--enable-input"]),
@@ -529,7 +615,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt"}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -538,6 +624,15 @@ mod tests {
         assert_eq!(loaded.port, 5902);
         assert!(loaded.enable_input);
         assert!(loaded.enable_clipboard);
+        assert_eq!(loaded.auth_mode, AuthMode::Vnc);
+        assert_eq!(
+            loaded.password_file,
+            Some(PathBuf::from("/tmp/credentials.txt"))
+        );
+        assert_eq!(
+            config(&["--config", &path_argument, "--auth", "vencrypt"]).auth_mode,
+            AuthMode::VeNCrypt
+        );
         assert_eq!(loaded.config_file, Some(path.clone()));
         fs::remove_file(path).unwrap();
     }

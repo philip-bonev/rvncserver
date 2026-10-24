@@ -22,9 +22,9 @@ cargo build --release
 
 ## Run
 
-Create the default TLS configuration and credentials described below before
-the first server start. TLS authentication is required; without the TLS
-settings, the server exits.
+Configure an authentication mode and credential file as described below before
+the first server start. VeNCrypt is the default and requires its TLS settings;
+VNC mode does not use TLS.
 
 ```sh
 ./target/release/rvncserver
@@ -44,8 +44,8 @@ Defaults:
 ```
 
 Remote input and clipboard sharing are disabled by default. Enable either
-capability explicitly when needed. TLS authentication is required to start the
-server:
+capability explicitly when needed. VeNCrypt/TLS authentication is the default;
+classic VNC authentication can be selected for clients that need it:
 
 ```sh
 ./target/release/rvncserver --enable-input --enable-clipboard
@@ -66,14 +66,15 @@ Example configuration:
   "capture_probe": null,
   "enable_input": false,
   "enable_clipboard": false,
+  "auth_mode": "vencrypt",
   "tls_cert": "server.crt",
   "tls_key": "server.key",
   "password_file": "credentials.txt"
 }
 ```
 
-Generate a server certificate/key and the owner-only credentials file (replace
-the sample password with a long unique value):
+For VeNCrypt, generate a server certificate/key and owner-only credentials
+file (replace the sample password with a long unique value):
 
 ```sh
 mkdir -p ~/.config/rvncserver
@@ -91,11 +92,21 @@ Add the generated `server.crt` to the VNC client's trusted certificates. For
 remote access, issue a certificate with the actual DNS name/IP in its subject
 alternative names and keep the private key and credential file private.
 
-TLS uses VeNCrypt `X509Plain`; clients must support that security subtype and
-trust the configured server certificate. The password file must be accessible
-only to its owner (`chmod 600`) and contain the username and password on
-separate lines. The desktop portal requests permission for enabled input and
-clipboard capabilities. Authenticated clients can use any enabled capability.
+VeNCrypt uses `X509Plain`; clients must support that security subtype and trust
+the configured server certificate. Its password file contains username and
+password on separate lines. For `auth_mode: "vnc"` (or `--auth vnc`), clients
+use classic VNC Authentication; the password is limited to 8 bytes and may be
+provided as a one-line file, or as the second line of the same two-line file.
+Both credential-file formats require owner-only permissions (`chmod 600`).
+Classic VNC Authentication does not encrypt the session and its DES challenge
+response is weak; use VeNCrypt unless compatibility requires VNC mode. The
+desktop portal requests permission for enabled input and clipboard capabilities.
+Authenticated clients can use any enabled capability.
+
+To select classic VNC authentication from the command line, provide a
+password-only file (maximum 8 bytes) and use `--auth vnc`; the same mode can be
+selected with `"auth_mode": "vnc"` in JSON. When using the two-line VeNCrypt
+credential file, VNC mode uses the second line as its password.
 
 Use `--help` for the complete command-line interface.
 
@@ -112,8 +123,8 @@ This captures one normalized frame and writes it as a binary PPM file.
 ## Supported RFB behavior
 
 - RFB 3.8 version negotiation for authenticated server sessions
-- VeNCrypt X509Plain (TLS plus username/password authentication; required for
-  normal server startup)
+- VeNCrypt X509Plain (TLS plus username/password authentication; default)
+- Classic VNC Authentication (RFB SecurityType 2), selectable with `--auth vnc`
 - One client at a time
 - 32-bit true-color framebuffer, little-endian BGRA byte order
 - Hextile when offered by the client, with Raw fallback according to the
@@ -130,11 +141,15 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 ## Current limitations
 
-- TLS certificate trust must be configured on each VNC client. Protect the
-  private key and credential file; the server rejects either file if it has
-  group/other permission bits set.
-- RFB 3.3 clients are not accepted in authenticated server mode. The old
-  SecurityType None negotiation remains only as an internal protocol-test path.
+- TLS certificate trust must be configured on each client using VeNCrypt.
+  Protect the private key and credential file; the server rejects either file
+  if it has group/other permission bits set.
+- VNC mode is unencrypted, uses obsolete DES, truncates password security to
+  at most 8 bytes, and permits offline guessing from captured challenges. Do
+  not use it on untrusted networks.
+- VeNCrypt requires RFB 3.8; VNC Authentication also supports RFB 3.3.
+- macOS Screen Sharing compatibility with VNC Authentication has not yet been
+  verified against an actual Mac client.
 - VeNCrypt X509Plain client compatibility varies; use a client that supports
   this subtype. Authentication attempts are not currently rate-limited.
 - Only the first stream advertised by the portal is used. Multi-monitor

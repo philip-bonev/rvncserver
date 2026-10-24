@@ -9,7 +9,7 @@ use lamco_pipewire::PwStreamState;
 use tokio::sync::mpsc;
 
 use crate::capture::{CaptureConfig, CaptureSession};
-use crate::cli::Config;
+use crate::cli::{AuthMode, Config};
 use crate::error::AppError;
 use crate::framebuffer::{Frame, FrameStore};
 use crate::input::ClientEvent;
@@ -20,37 +20,39 @@ const FRAME_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Run the capture and RFB server until Ctrl+C.
 pub async fn run(config: Config) -> Result<(), AppError> {
-    if config.tls_cert.is_none() || config.tls_key.is_none() || config.password_file.is_none() {
-        return Err(AppError::Network(
-            "TLS authentication is required; configure tls_cert, tls_key, and password_file in config.json or pass their CLI options".to_string(),
-        ));
+    let password_path = config.password_file.as_deref().ok_or_else(|| {
+        AppError::Network(
+            "authentication requires password_file in config.json or --password-file".to_string(),
+        )
+    })?;
+
+    let authentication = match config.auth_mode {
+        AuthMode::VeNCrypt => {
+            let certificate = config.tls_cert.as_deref().ok_or_else(|| {
+                AppError::Network("VeNCrypt authentication requires tls_cert".to_string())
+            })?;
+            let key = config.tls_key.as_deref().ok_or_else(|| {
+                AppError::Network("VeNCrypt authentication requires tls_key".to_string())
+            })?;
+            rfb::load_authentication(certificate, key, password_path)
+        }
+        AuthMode::Vnc => rfb::load_vnc_authentication(password_path),
     }
+    .map(Arc::new)
+    .map_err(|error| AppError::Network(format!("failed to initialize authentication: {error}")))?;
 
     let address = SocketAddr::new(config.listen, config.port);
     let listener = TcpListener::bind(address)
         .map_err(|error| AppError::Network(format!("failed to bind {address}: {error}")))?;
 
+    if config.auth_mode == AuthMode::Vnc {
+        eprintln!(
+            "warning: classic VNC authentication uses weak DES and does not encrypt session traffic; do not use on untrusted networks"
+        );
+    }
     if config.enable_input || config.enable_clipboard {
         eprintln!("warning: any authenticated client can use enabled input/clipboard features");
     }
-
-    let authentication = match (
-        config.tls_cert.as_deref(),
-        config.tls_key.as_deref(),
-        config.password_file.as_deref(),
-    ) {
-        (Some(certificate), Some(key), Some(password)) => Some(Arc::new(
-            rfb::load_authentication(certificate, key, password).map_err(|error| {
-                AppError::Network(format!("failed to initialize TLS authentication: {error}"))
-            })?,
-        )),
-        (None, None, None) => None,
-        _ => {
-            return Err(AppError::Network(
-                "TLS authentication requires certificate, key, and password file".to_string(),
-            ));
-        }
-    };
 
     let capture_config = CaptureConfig {
         enable_input: config.enable_input,
@@ -100,7 +102,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             name: "rvncserver".to_string(),
             input_enabled: config.enable_input,
             clipboard_enabled: config.enable_clipboard,
-            authentication,
+            authentication: Some(authentication),
         },
         Arc::clone(&shutdown),
         has_remote_events.then_some(client_event_tx),

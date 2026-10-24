@@ -28,11 +28,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use des::Des;
+use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
 use crate::input::ClientEvent;
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 const SECURITY_TYPE_NONE: u32 = 1;
+const SECURITY_TYPE_VNC_AUTH: u8 = 2;
 const SECURITY_TYPE_VENCRYPT: u8 = 19;
 const VENCRYPT_SUBTYPE_X509_PLAIN: u32 = 262;
 const MAX_ENCODINGS: u16 = 1024;
@@ -65,16 +69,28 @@ pub struct RfbConfig {
 
 /// TLS server identity and VeNCrypt credentials. Secret values are deliberately
 /// not formatted with `Debug`.
-pub struct AuthenticationConfig {
-    tls: Arc<rustls::ServerConfig>,
-    username: Vec<u8>,
-    password: Vec<u8>,
+pub enum AuthenticationConfig {
+    VeNCrypt {
+        tls: Arc<rustls::ServerConfig>,
+        username: Vec<u8>,
+        password: Vec<u8>,
+    },
+    Vnc {
+        password: Vec<u8>,
+    },
 }
 
 impl Drop for AuthenticationConfig {
     fn drop(&mut self) {
-        self.username.fill(0);
-        self.password.fill(0);
+        match self {
+            Self::VeNCrypt {
+                username, password, ..
+            } => {
+                username.fill(0);
+                password.fill(0);
+            }
+            Self::Vnc { password } => password.fill(0),
+        }
     }
 }
 
@@ -196,11 +212,57 @@ pub fn load_authentication(
             )
         })?;
 
-    Ok(AuthenticationConfig {
+    Ok(AuthenticationConfig::VeNCrypt {
         tls: Arc::new(tls),
         username,
         password,
     })
+}
+
+pub fn load_vnc_authentication(password_path: &Path) -> io::Result<AuthenticationConfig> {
+    let file = File::open(password_path)?;
+    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VNC password file must not be accessible by group or other users (chmod 600)",
+        ));
+    }
+    let mut contents = Vec::with_capacity(2050);
+    file.take(2051).read_to_end(&mut contents)?;
+    if contents.len() > 2050 {
+        contents.fill(0);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VNC credential file exceeds the 2050-byte limit",
+        ));
+    }
+    if contents.last() == Some(&b'\n') {
+        contents.pop();
+    }
+    if contents.last() == Some(&b'\r') {
+        contents.pop();
+    }
+    let password_start = contents
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(0, |separator| separator + 1);
+    if contents[password_start..].contains(&b'\n') || contents[password_start..].contains(&b'\r') {
+        contents.fill(0);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VNC credential file must contain at most username and password lines",
+        ));
+    }
+    let mut password = contents[password_start..].to_vec();
+    contents.fill(0);
+    if password.is_empty() || password.len() > 8 {
+        password.fill(0);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VNC authentication requires a password of 1 to 8 bytes (the second line when username is present)",
+        ));
+    }
+    Ok(AuthenticationConfig::Vnc { password })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,116 +380,47 @@ fn handle_client(
     read_exact_interruptible(&mut tcp_stream, &mut version, shutdown)?;
     let version = parse_client_version(&version)?;
 
-    let mut stream = if let Some(authentication) = &config.authentication {
-        if version != RfbVersion::V3_8 {
-            return Err(invalid_data(
-                "VeNCrypt authentication requires RFB 3.7 or newer",
-            ));
-        }
-        write_all_interruptible(&mut tcp_stream, &[1, SECURITY_TYPE_VENCRYPT], shutdown)?;
-        let selected = read_u8(&mut tcp_stream, shutdown)?;
-        if selected != SECURITY_TYPE_VENCRYPT {
-            return Err(invalid_data(
-                "client did not select VeNCrypt authentication",
-            ));
-        }
-
-        // VeNCrypt version negotiation: protocol version 0.2.
-        write_all_interruptible(&mut tcp_stream, &[0, 2], shutdown)?;
-        let mut client_vencrypt_version = [0u8; 2];
-        read_exact_interruptible(&mut tcp_stream, &mut client_vencrypt_version, shutdown)?;
-        if client_vencrypt_version != [0, 2] {
-            return Err(invalid_data(
-                "client selected an unsupported VeNCrypt version",
-            ));
-        }
-        write_all_interruptible(&mut tcp_stream, &[0], shutdown)?; // version accepted
-        write_all_interruptible(&mut tcp_stream, &[1], shutdown)?;
-        write_all_interruptible(
-            &mut tcp_stream,
-            &VENCRYPT_SUBTYPE_X509_PLAIN.to_be_bytes(),
-            shutdown,
-        )?;
-        if read_u32(&mut tcp_stream, shutdown)? != VENCRYPT_SUBTYPE_X509_PLAIN {
-            write_all_interruptible(&mut tcp_stream, &[0], shutdown)?;
-            return Err(invalid_data("client did not select VeNCrypt X509Plain"));
-        }
-        write_all_interruptible(&mut tcp_stream, &[1], shutdown)?; // subtype accepted; begin TLS
-
-        let mut connection = rustls::ServerConnection::new(Arc::clone(&authentication.tls))
-            .map_err(|error| {
-                io::Error::other(format!("could not create TLS connection: {error}"))
-            })?;
-        while connection.is_handshaking() {
-            if shutdown.load(Ordering::Acquire) {
-                return Err(shutdown_error());
+    let mut stream = match config.authentication.as_deref() {
+        Some(AuthenticationConfig::VeNCrypt {
+            tls,
+            username,
+            password,
+        }) => {
+            if version != RfbVersion::V3_8 {
+                return Err(invalid_data("VeNCrypt authentication requires RFB 3.8"));
             }
-            if let Err(error) = connection.complete_io(&mut tcp_stream) {
-                if error.kind() == io::ErrorKind::TimedOut
-                    || error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::Interrupted
-                {
-                    continue;
+            negotiate_vencrypt(tcp_stream, tls, username, password, shutdown)?
+        }
+        Some(AuthenticationConfig::Vnc { password }) => {
+            negotiate_vnc_auth(&mut tcp_stream, version, password, shutdown)?;
+            ClientStream::Plain(tcp_stream)
+        }
+        None => {
+            match version {
+                RfbVersion::V3_3 => {
+                    write_all_interruptible(
+                        &mut tcp_stream,
+                        &SECURITY_TYPE_NONE.to_be_bytes(),
+                        shutdown,
+                    )?;
                 }
-                return Err(error);
-            }
-        }
-        let mut tls_stream =
-            ClientStream::Tls(Box::new(rustls::StreamOwned::new(connection, tcp_stream)));
-        let username_length = read_u32(&mut tls_stream, shutdown)?;
-        let password_length = read_u32(&mut tls_stream, shutdown)?;
-        if username_length > 1024 || password_length > 1024 {
-            return Err(invalid_data(
-                "VeNCrypt username or password exceeds 1024 bytes",
-            ));
-        }
-        let mut username = vec![0; username_length as usize];
-        let mut password = vec![0; password_length as usize];
-        read_exact_interruptible(&mut tls_stream, &mut username, shutdown)?;
-        read_exact_interruptible(&mut tls_stream, &mut password, shutdown)?;
-        let authenticated = constant_time_equal(&username, &authentication.username)
-            & constant_time_equal(&password, &authentication.password);
-        password.fill(0);
-        write_all_interruptible(
-            &mut tls_stream,
-            &u32::from(!authenticated).to_be_bytes(),
-            shutdown,
-        )?;
-        if !authenticated {
-            let reason = b"VeNCrypt credentials rejected";
-            write_all_interruptible(
-                &mut tls_stream,
-                &(reason.len() as u32).to_be_bytes(),
-                shutdown,
-            )?;
-            write_all_interruptible(&mut tls_stream, reason, shutdown)?;
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "VeNCrypt credentials rejected",
-            ));
-        }
-        tls_stream
-    } else {
-        match version {
-            RfbVersion::V3_3 => {
-                write_all_interruptible(
-                    &mut tcp_stream,
-                    &SECURITY_TYPE_NONE.to_be_bytes(),
-                    shutdown,
-                )?;
-            }
-            RfbVersion::V3_8 => {
-                write_all_interruptible(&mut tcp_stream, &[1, SECURITY_TYPE_NONE as u8], shutdown)?;
-                let security_type = read_u8(&mut tcp_stream, shutdown)?;
-                if u32::from(security_type) != SECURITY_TYPE_NONE {
-                    return Err(invalid_data(format!(
-                        "client selected unsupported security type {security_type}"
-                    )));
+                RfbVersion::V3_8 => {
+                    write_all_interruptible(
+                        &mut tcp_stream,
+                        &[1, SECURITY_TYPE_NONE as u8],
+                        shutdown,
+                    )?;
+                    let security_type = read_u8(&mut tcp_stream, shutdown)?;
+                    if u32::from(security_type) != SECURITY_TYPE_NONE {
+                        return Err(invalid_data(format!(
+                            "client selected unsupported security type {security_type}"
+                        )));
+                    }
+                    write_all_interruptible(&mut tcp_stream, &0u32.to_be_bytes(), shutdown)?;
                 }
-                write_all_interruptible(&mut tcp_stream, &0u32.to_be_bytes(), shutdown)?;
             }
+            ClientStream::Plain(tcp_stream)
         }
-        ClientStream::Plain(tcp_stream)
     };
 
     // ClientInit: shared flag. The initial server supports one client, so the
@@ -535,6 +528,151 @@ fn handle_client(
             }
         }
     }
+}
+
+fn negotiate_vencrypt(
+    mut tcp_stream: TcpStream,
+    tls: &Arc<rustls::ServerConfig>,
+    expected_username: &[u8],
+    expected_password: &[u8],
+    shutdown: &AtomicBool,
+) -> io::Result<ClientStream> {
+    write_all_interruptible(&mut tcp_stream, &[1, SECURITY_TYPE_VENCRYPT], shutdown)?;
+    if read_u8(&mut tcp_stream, shutdown)? != SECURITY_TYPE_VENCRYPT {
+        return Err(invalid_data(
+            "client did not select VeNCrypt authentication",
+        ));
+    }
+
+    write_all_interruptible(&mut tcp_stream, &[0, 2], shutdown)?;
+    let mut client_version = [0u8; 2];
+    read_exact_interruptible(&mut tcp_stream, &mut client_version, shutdown)?;
+    if client_version != [0, 2] {
+        return Err(invalid_data(
+            "client selected an unsupported VeNCrypt version",
+        ));
+    }
+    write_all_interruptible(&mut tcp_stream, &[0], shutdown)?;
+    write_all_interruptible(&mut tcp_stream, &[1], shutdown)?;
+    write_all_interruptible(
+        &mut tcp_stream,
+        &VENCRYPT_SUBTYPE_X509_PLAIN.to_be_bytes(),
+        shutdown,
+    )?;
+    if read_u32(&mut tcp_stream, shutdown)? != VENCRYPT_SUBTYPE_X509_PLAIN {
+        write_all_interruptible(&mut tcp_stream, &[0], shutdown)?;
+        return Err(invalid_data("client did not select VeNCrypt X509Plain"));
+    }
+    write_all_interruptible(&mut tcp_stream, &[1], shutdown)?;
+
+    let mut connection = rustls::ServerConnection::new(Arc::clone(tls))
+        .map_err(|error| io::Error::other(format!("could not create TLS connection: {error}")))?;
+    while connection.is_handshaking() {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(shutdown_error());
+        }
+        if let Err(error) = connection.complete_io(&mut tcp_stream) {
+            if error.kind() == io::ErrorKind::TimedOut
+                || error.kind() == io::ErrorKind::WouldBlock
+                || error.kind() == io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+
+    let mut stream = ClientStream::Tls(Box::new(rustls::StreamOwned::new(connection, tcp_stream)));
+    let username_length = read_u32(&mut stream, shutdown)?;
+    let password_length = read_u32(&mut stream, shutdown)?;
+    if username_length > 1024 || password_length > 1024 {
+        return Err(invalid_data(
+            "VeNCrypt username or password exceeds 1024 bytes",
+        ));
+    }
+    let mut username = vec![0; username_length as usize];
+    let mut password = vec![0; password_length as usize];
+    read_exact_interruptible(&mut stream, &mut username, shutdown)?;
+    read_exact_interruptible(&mut stream, &mut password, shutdown)?;
+    let authenticated = constant_time_equal(&username, expected_username)
+        & constant_time_equal(&password, expected_password);
+    password.fill(0);
+    write_auth_result(&mut stream, authenticated, true, shutdown)?;
+    if !authenticated {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VeNCrypt credentials rejected",
+        ));
+    }
+    Ok(stream)
+}
+
+fn negotiate_vnc_auth(
+    stream: &mut TcpStream,
+    version: RfbVersion,
+    password: &[u8],
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    match version {
+        RfbVersion::V3_3 => {
+            write_all_interruptible(
+                stream,
+                &(u32::from(SECURITY_TYPE_VNC_AUTH)).to_be_bytes(),
+                shutdown,
+            )?;
+        }
+        RfbVersion::V3_8 => {
+            write_all_interruptible(stream, &[1, SECURITY_TYPE_VNC_AUTH], shutdown)?;
+            if read_u8(stream, shutdown)? != SECURITY_TYPE_VNC_AUTH {
+                return Err(invalid_data("client did not select VNC Authentication"));
+            }
+        }
+    }
+
+    let mut challenge = [0u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut challenge)?;
+    write_all_interruptible(stream, &challenge, shutdown)?;
+    let mut response = [0u8; 16];
+    read_exact_interruptible(stream, &mut response, shutdown)?;
+    let expected = vnc_auth_response(password, &challenge)?;
+    let authenticated = constant_time_equal(&response, &expected);
+    write_auth_result(stream, authenticated, version == RfbVersion::V3_8, shutdown)
+}
+
+fn vnc_auth_response(password: &[u8], challenge: &[u8; 16]) -> io::Result<[u8; 16]> {
+    if password.is_empty() || password.len() > 8 {
+        return Err(invalid_data("VNC password must contain 1 to 8 bytes"));
+    }
+    let mut key = [0u8; 8];
+    for (target, source) in key.iter_mut().zip(password) {
+        *target = source.reverse_bits();
+    }
+    let cipher = Des::new_from_slice(&key)
+        .map_err(|_| invalid_data("could not initialize VNC DES cipher"))?;
+    key.fill(0);
+
+    let mut response = *challenge;
+    for block_bytes in response.chunks_exact_mut(8) {
+        let mut block = GenericArray::clone_from_slice(block_bytes);
+        cipher.encrypt_block(&mut block);
+        block_bytes.copy_from_slice(&block);
+    }
+    Ok(response)
+}
+
+fn write_auth_result(
+    stream: &mut (impl Read + Write),
+    authenticated: bool,
+    include_failure_reason: bool,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    write_all_interruptible(stream, &u32::from(!authenticated).to_be_bytes(), shutdown)?;
+    if !authenticated && include_failure_reason {
+        let reason = b"authentication failed";
+        write_all_interruptible(stream, &(reason.len() as u32).to_be_bytes(), shutdown)?;
+        write_all_interruptible(stream, reason, shutdown)?;
+    }
+    Ok(())
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -1785,6 +1923,148 @@ mod tests {
         assert!(constant_time_equal(b"credential", b"credential"));
         assert!(!constant_time_equal(b"credential", b"credentiaL"));
         assert!(!constant_time_equal(b"short", b"longer"));
+    }
+
+    #[test]
+    fn vnc_auth_response_matches_des_reference_vector() {
+        let challenge = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let response = vnc_auth_response(b"password", &challenge).unwrap();
+        assert_eq!(
+            response,
+            [
+                0xb8, 0x66, 0x92, 0x41, 0x25, 0xc8, 0xee, 0xbb, 0x9d, 0xeb, 0xc1, 0xdb, 0x61, 0xc5,
+                0x38, 0xe2,
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_owner_only_vnc_password_file_formats() {
+        let path = std::env::temp_dir().join(format!(
+            "rvncserver-vnc-password-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let auth = load_vnc_authentication(&path).unwrap();
+        assert!(matches!(
+            &auth,
+            AuthenticationConfig::Vnc { password } if password.as_slice() == b"secret"
+        ));
+
+        std::fs::write(&path, b"rvnc\nsecret\n").unwrap();
+        assert!(matches!(
+            &load_vnc_authentication(&path).unwrap(),
+            AuthenticationConfig::Vnc { password } if password.as_slice() == b"secret"
+        ));
+
+        std::fs::write(&path, b"password-is-long\n").unwrap();
+        assert!(load_vnc_authentication(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&path, b"secret\n").unwrap();
+        assert_eq!(
+            load_vnc_authentication(&path).err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn vnc_auth_accepts_rfb_33_client_handshake() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(FrameStore::new());
+        store.publish(Arc::new(Frame::new(2, 2, vec![0; 16]).unwrap()));
+        let server_store = Arc::clone(&store);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            let (_clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel(1);
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+            let config = RfbConfig {
+                width: 2,
+                height: 2,
+                name: "test".to_string(),
+                input_enabled: false,
+                clipboard_enabled: false,
+                authentication: Some(Arc::new(AuthenticationConfig::Vnc {
+                    password: b"password".to_vec(),
+                })),
+            };
+            handle_client(
+                stream,
+                &server_store,
+                &config,
+                &AtomicBool::new(false),
+                Some(&input_tx),
+                &mut clipboard_rx,
+            )
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut version = [0; 12];
+        client.read_exact(&mut version).unwrap();
+        client.write_all(b"RFB 003.003\n").unwrap();
+        let mut security_type = [0; 4];
+        client.read_exact(&mut security_type).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(security_type),
+            u32::from(SECURITY_TYPE_VNC_AUTH)
+        );
+
+        let mut challenge = [0; 16];
+        client.read_exact(&mut challenge).unwrap();
+        client
+            .write_all(&vnc_auth_response(b"password", &challenge).unwrap())
+            .unwrap();
+        let mut result = [0; 4];
+        client.read_exact(&mut result).unwrap();
+        assert_eq!(u32::from_be_bytes(result), 0);
+        client.write_all(&[1]).unwrap();
+        let mut server_init = [0; 24];
+        client.read_exact(&mut server_init).unwrap();
+        assert_eq!(u16::from_be_bytes([server_init[0], server_init[1]]), 2);
+        assert_eq!(u16::from_be_bytes([server_init[2], server_init[3]]), 2);
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn vnc_auth_negotiates_rfb_38_security_type() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            negotiate_vnc_auth(
+                &mut stream,
+                RfbVersion::V3_8,
+                b"password",
+                &AtomicBool::new(false),
+            )
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut security_types = [0; 2];
+        client.read_exact(&mut security_types).unwrap();
+        assert_eq!(security_types, [1, SECURITY_TYPE_VNC_AUTH]);
+        client.write_all(&[SECURITY_TYPE_VNC_AUTH]).unwrap();
+        let mut challenge = [0; 16];
+        client.read_exact(&mut challenge).unwrap();
+        client
+            .write_all(&vnc_auth_response(b"password", &challenge).unwrap())
+            .unwrap();
+        let mut result = [0; 4];
+        client.read_exact(&mut result).unwrap();
+        assert_eq!(u32::from_be_bytes(result), 0);
+        server.join().unwrap().unwrap();
     }
 
     #[test]
