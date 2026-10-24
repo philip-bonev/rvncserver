@@ -126,10 +126,11 @@ This captures one normalized frame and writes it as a binary PPM file.
 - VeNCrypt X509Plain (TLS plus username/password authentication; default)
 - Classic VNC Authentication (RFB SecurityType 2), selectable with `--auth vnc`
 - One client at a time
-- 32-bit true-color framebuffer, little-endian BGRA byte order
-- ZRLE, Hextile, and Raw when offered by the client, selected according to the
-  client's encoding preference list. ZRLE currently uses valid Raw tiles inside
-  a persistent zlib stream.
+- 8-, 16-, and 32-bit true-color client pixel formats, including RGB332,
+  RGB565, and 24-bit color in 32-bit pixels with either byte order
+- Zlib, ZRLE, Hextile, and Raw when offered by the client, selected according
+  to its encoding preference order. CopyRect is used opportunistically when
+  the server can verify a matching source in the client's known framebuffer.
 - Keyboard keysym events and pointer motion/buttons/scroll through the
   permission-controlled RemoteDesktop portal when `--enable-input` is set
 - Bidirectional text clipboard transfer through the portal when
@@ -161,8 +162,9 @@ This captures one normalized frame and writes it as a binary PPM file.
   Latin-1 text is converted to/from UTF-8 for the desktop portal.
 - Tight and other encodings are not implemented. ZRLE currently emits Raw
   tiles, so it provides zlib compression but does not yet use its palette or
-  run-length tile modes. Hextile sends complex or noisy 16×16 tiles as Raw
-  within the Hextile rectangle.
+  run-length tile modes. CopyRect source discovery is deliberately bounded to
+  nearby regions and only runs after the client has received a full framebuffer.
+  Hextile sends complex or noisy 16×16 tiles as Raw within the Hextile rectangle.
 - DMA-BUF negotiation is requested where available, but direct FD passthrough
   is disabled. Lamco maps and copies supported linear DMA-BUFs into CPU memory;
   non-linear or non-mappable buffers may be skipped or unreadable.

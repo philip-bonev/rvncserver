@@ -7,7 +7,7 @@
 //! - VeNCrypt X509Plain with TLS and username/password authentication in
 //!   normal server operation
 //! - A single client at a time
-//! - 32-bit true-color pixel format with BGRA byte order
+//! - 8-, 16-, and 32-bit true-color formats, including both byte orders
 //! - Raw, Hextile, and ZRLE encodings, selected from the client's advertised list
 //! - Incremental update requests with damage-region Raw rectangles
 //!
@@ -39,6 +39,8 @@ const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 const SECURITY_TYPE_NONE: u32 = 1;
 const SECURITY_TYPE_VNC_AUTH: u8 = 2;
 const SECURITY_TYPE_VENCRYPT: u8 = 19;
+const ENCODING_COPY_RECT: i32 = 1;
+const ENCODING_ZLIB: i32 = 6;
 const VENCRYPT_SUBTYPE_X509_PLAIN: u32 = 262;
 const MAX_ENCODINGS: u16 = 1024;
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
@@ -271,6 +273,7 @@ pub fn load_vnc_authentication(password_path: &Path) -> io::Result<Authenticatio
 enum Encoding {
     Raw,
     Hextile,
+    Zlib,
     Zrle,
 }
 
@@ -279,6 +282,7 @@ impl Encoding {
         match self {
             Self::Raw => ENCODING_RAW,
             Self::Hextile => ENCODING_HEXTILE,
+            Self::Zlib => ENCODING_ZLIB,
             Self::Zrle => ENCODING_ZRLE,
         }
     }
@@ -286,9 +290,161 @@ impl Encoding {
 
 struct ClientUpdateState {
     encoding: Encoding,
+    copy_rect_enabled: bool,
+    pixel_format: PixelFormat,
     last_sequence: u64,
     pending_damage: Vec<DamageRect>,
     zrle_compressor: Compress,
+    zlib_compressor: Compress,
+    client_pixels: Option<Vec<[u8; 4]>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncodingPreferences {
+    preferred: Encoding,
+    copy_rect: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelFormat {
+    bits_per_pixel: u8,
+    depth: u8,
+    big_endian: bool,
+    red_max: u16,
+    green_max: u16,
+    blue_max: u16,
+    red_shift: u8,
+    green_shift: u8,
+    blue_shift: u8,
+}
+
+impl PixelFormat {
+    const DEFAULT: Self = Self {
+        bits_per_pixel: 32,
+        depth: 24,
+        big_endian: false,
+        red_max: 255,
+        green_max: 255,
+        blue_max: 255,
+        red_shift: 16,
+        green_shift: 8,
+        blue_shift: 0,
+    };
+
+    fn bytes_per_pixel(self) -> usize {
+        usize::from(self.bits_per_pixel / 8)
+    }
+
+    fn zrle_bytes_per_pixel(self) -> usize {
+        if self.bits_per_pixel == 32 && self.depth == 24 {
+            3
+        } else {
+            self.bytes_per_pixel()
+        }
+    }
+
+    fn encode(self, bgra: &[u8]) -> [u8; 4] {
+        if self == Self::DEFAULT {
+            return [bgra[0], bgra[1], bgra[2], bgra[3]];
+        }
+        let red = scale_channel(bgra[2], self.red_max) << self.red_shift;
+        let green = scale_channel(bgra[1], self.green_max) << self.green_shift;
+        let blue = scale_channel(bgra[0], self.blue_max) << self.blue_shift;
+        let value = red | green | blue;
+        let bytes = if self.big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        let mut encoded = [0; 4];
+        let pixel_bytes = self.bytes_per_pixel();
+        if self.big_endian {
+            encoded[..pixel_bytes].copy_from_slice(&bytes[4 - pixel_bytes..]);
+        } else {
+            encoded[..pixel_bytes].copy_from_slice(&bytes[..pixel_bytes]);
+        }
+        encoded
+    }
+
+    fn encode_zrle(self, bgra: &[u8]) -> [u8; 4] {
+        let encoded = self.encode(bgra);
+        if self.zrle_bytes_per_pixel() == 3 && self.big_endian {
+            [encoded[1], encoded[2], encoded[3], 0]
+        } else {
+            encoded
+        }
+    }
+
+    fn from_wire(format: &[u8; 16]) -> io::Result<Self> {
+        if format[2] > 1 || format[3] != 1 {
+            return Err(invalid_data(
+                "indexed-color pixel formats are not supported; true-color is required",
+            ));
+        }
+        let parsed = Self {
+            bits_per_pixel: format[0],
+            depth: format[1],
+            big_endian: format[2] != 0,
+            red_max: u16::from_be_bytes([format[4], format[5]]),
+            green_max: u16::from_be_bytes([format[6], format[7]]),
+            blue_max: u16::from_be_bytes([format[8], format[9]]),
+            red_shift: format[10],
+            green_shift: format[11],
+            blue_shift: format[12],
+        };
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    fn validate(self) -> io::Result<()> {
+        if !matches!(self.bits_per_pixel, 8 | 16 | 32)
+            || self.depth == 0
+            || self.depth > self.bits_per_pixel
+        {
+            return Err(invalid_data("unsupported client pixel bit depth"));
+        }
+
+        let channels = [
+            (self.red_max, self.red_shift),
+            (self.green_max, self.green_shift),
+            (self.blue_max, self.blue_shift),
+        ];
+        let mut used_bits = 0u32;
+        let mut total_depth = 0u32;
+        for (maximum, shift) in channels {
+            let channel_bits = u16::BITS - maximum.leading_zeros();
+            if maximum == 0 || maximum != ((1u32 << channel_bits) - 1) as u16 {
+                return Err(invalid_data(
+                    "true-color channel maxima must be contiguous bit masks",
+                ));
+            }
+            let end = u32::from(shift) + channel_bits;
+            if end > u32::from(self.bits_per_pixel) {
+                return Err(invalid_data("true-color channel exceeds pixel width"));
+            }
+            let mask = u32::from(maximum) << shift;
+            if used_bits & mask != 0 {
+                return Err(invalid_data("true-color channels overlap"));
+            }
+            used_bits |= mask;
+            total_depth += channel_bits;
+        }
+        if total_depth != u32::from(self.depth) {
+            return Err(invalid_data(
+                "pixel depth does not match the true-color channel widths",
+            ));
+        }
+        if self.bits_per_pixel == 32 && self.depth == 24 && used_bits != 0x00ff_ffff {
+            return Err(invalid_data(
+                "32bpp/depth-24 formats must use the low 24 bits for color",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn scale_channel(value: u8, maximum: u16) -> u32 {
+    (u32::from(value) * u32::from(maximum) + 127) / 255
 }
 
 /// Start the RFB listener thread.
@@ -441,9 +597,13 @@ fn handle_client(
 
     let mut update_state = ClientUpdateState {
         encoding: Encoding::Raw,
+        copy_rect_enabled: false,
+        pixel_format: PixelFormat::DEFAULT,
         last_sequence: 0,
         pending_damage: Vec::new(),
         zrle_compressor: Compress::new(Compression::default(), true),
+        zlib_compressor: Compress::new(Compression::default(), true),
+        client_pixels: None,
     };
     let mut input_warned = false;
     let mut held_input = if config.input_enabled {
@@ -459,8 +619,18 @@ fn handle_client(
 
         let message_type = read_message_type(&mut stream, shutdown, clipboard_rx)?;
         match message_type {
-            0 => handle_set_pixel_format(&mut stream, shutdown)?,
-            2 => update_state.encoding = handle_set_encodings(&mut stream, shutdown)?,
+            0 => {
+                update_state.pixel_format = handle_set_pixel_format(&mut stream, shutdown)?;
+                update_state.client_pixels = None;
+            }
+            2 => {
+                let preferences = handle_set_encodings(&mut stream, shutdown)?;
+                update_state.encoding = preferences.preferred;
+                if update_state.copy_rect_enabled != preferences.copy_rect {
+                    update_state.client_pixels = None;
+                }
+                update_state.copy_rect_enabled = preferences.copy_rect;
+            }
             3 => {
                 handle_update_request(
                     &mut stream,
@@ -713,19 +883,19 @@ fn write_server_init(
 fn handle_set_pixel_format(
     stream: &mut (impl Read + Write),
     shutdown: &AtomicBool,
-) -> io::Result<()> {
+) -> io::Result<PixelFormat> {
     let mut padding = [0u8; 3];
     read_exact_interruptible(stream, &mut padding, shutdown)?;
 
     let mut format = [0u8; 16];
     read_exact_interruptible(stream, &mut format, shutdown)?;
-    validate_client_pixel_format(&format)
+    PixelFormat::from_wire(&format)
 }
 
 fn handle_set_encodings(
     stream: &mut (impl Read + Write),
     shutdown: &AtomicBool,
-) -> io::Result<Encoding> {
+) -> io::Result<EncodingPreferences> {
     let mut padding = [0u8; 1];
     read_exact_interruptible(stream, &mut padding, shutdown)?;
 
@@ -739,22 +909,35 @@ fn handle_set_encodings(
     let mut encodings = vec![0u8; count as usize * 4];
     read_exact_interruptible(stream, &mut encodings, shutdown)?;
 
-    select_encoding(&encodings)
+    select_encodings(&encodings)
 }
 
-fn select_encoding(encodings: &[u8]) -> io::Result<Encoding> {
+fn select_encodings(encodings: &[u8]) -> io::Result<EncodingPreferences> {
+    let mut preferred = None;
+    let mut copy_rect = false;
     for encoding in encodings.chunks_exact(4) {
         let value = i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]);
-        match value {
-            ENCODING_HEXTILE => return Ok(Encoding::Hextile),
-            ENCODING_ZRLE => return Ok(Encoding::Zrle),
-            ENCODING_RAW => return Ok(Encoding::Raw),
-            _ => {}
+        let candidate = match value {
+            ENCODING_COPY_RECT => {
+                copy_rect = true;
+                None
+            }
+            ENCODING_HEXTILE => Some(Encoding::Hextile),
+            ENCODING_ZLIB => Some(Encoding::Zlib),
+            ENCODING_ZRLE => Some(Encoding::Zrle),
+            ENCODING_RAW => Some(Encoding::Raw),
+            _ => None,
+        };
+        if preferred.is_none() {
+            preferred = candidate;
         }
     }
-    Err(invalid_data(
-        "client did not offer a supported encoding (Raw, Hextile, or ZRLE)",
-    ))
+    preferred
+        .map(|preferred| EncodingPreferences {
+            preferred,
+            copy_rect,
+        })
+        .ok_or_else(|| invalid_data("client did not offer a supported framebuffer encoding"))
 }
 
 fn handle_update_request(
@@ -805,14 +988,7 @@ fn handle_update_request(
         state.last_sequence = changes.sequence;
 
         let updates = vec![requested];
-        send_update(
-            stream,
-            &changes.frame,
-            &updates,
-            state.encoding,
-            &mut state.zrle_compressor,
-            shutdown,
-        )?;
+        send_update(stream, &changes.frame, &updates, state, shutdown)?;
         subtract_damage(&mut state.pending_damage, requested);
         return Ok(());
     }
@@ -843,14 +1019,7 @@ fn handle_update_request(
                     .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
             };
             ensure_frame_dimensions(&frame, width, height)?;
-            send_update(
-                stream,
-                &frame,
-                &updates,
-                state.encoding,
-                &mut state.zrle_compressor,
-                shutdown,
-            )?;
+            send_update(stream, &frame, &updates, state, shutdown)?;
             subtract_damage(&mut state.pending_damage, requested);
             return Ok(());
         }
@@ -1063,8 +1232,7 @@ fn send_update(
     stream: &mut (impl Read + Write),
     frame: &Frame,
     rectangles: &[DamageRect],
-    encoding: Encoding,
-    zrle_compressor: &mut Compress,
+    state: &mut ClientUpdateState,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let frame_width = frame.width as usize;
@@ -1105,73 +1273,339 @@ fn send_update(
         let height = u16::try_from(rect.height)
             .map_err(|_| invalid_data("rectangle height exceeds RFB limit"))?;
 
+        let copy_source = if state.copy_rect_enabled {
+            state
+                .client_pixels
+                .as_deref()
+                .and_then(|shadow| find_copy_source(frame, shadow, *rect, state.pixel_format))
+        } else {
+            None
+        };
+        let rectangle_encoding = if copy_source.is_some() {
+            ENCODING_COPY_RECT
+        } else {
+            state.encoding.rfb_value()
+        };
         let mut rectangle_header = [0u8; 12];
         rectangle_header[0..2].copy_from_slice(&x.to_be_bytes());
         rectangle_header[2..4].copy_from_slice(&y.to_be_bytes());
         rectangle_header[4..6].copy_from_slice(&width.to_be_bytes());
         rectangle_header[6..8].copy_from_slice(&height.to_be_bytes());
-        rectangle_header[8..12].copy_from_slice(&encoding.rfb_value().to_be_bytes());
+        rectangle_header[8..12].copy_from_slice(&rectangle_encoding.to_be_bytes());
         write_all_interruptible(stream, &rectangle_header, shutdown)?;
 
-        if encoding == Encoding::Hextile {
-            send_hextile_rectangle(stream, frame, *rect, shutdown)?;
+        if let Some((source_x, source_y)) = copy_source {
+            write_all_interruptible(stream, &source_x.to_be_bytes(), shutdown)?;
+            write_all_interruptible(stream, &source_y.to_be_bytes(), shutdown)?;
+            if state.copy_rect_enabled {
+                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            }
             continue;
         }
 
-        if encoding == Encoding::Zrle {
-            send_zrle_rectangle(stream, frame, *rect, zrle_compressor, shutdown)?;
+        if state.encoding == Encoding::Hextile {
+            send_hextile_rectangle(stream, frame, *rect, state.pixel_format, shutdown)?;
+            if state.copy_rect_enabled {
+                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            }
             continue;
         }
 
-        let row_bytes = (width as usize)
-            .checked_mul(4)
-            .ok_or_else(|| invalid_data("rectangle is too wide"))?;
-
-        // A full-width rectangle is contiguous in the normalized framebuffer.
-        // Write it as one slice instead of making one socket write per row.
-        if rect.x == 0 && width as usize == frame_width {
-            let start = (rect.y as usize)
-                .checked_mul(frame_width)
-                .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
-            let byte_len = row_bytes
-                .checked_mul(height as usize)
-                .ok_or_else(|| invalid_data("rectangle size overflows"))?;
-            let end = start
-                .checked_add(byte_len)
-                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
-            let pixels = frame
-                .data
-                .get(start..end)
-                .ok_or_else(|| invalid_data("rectangle is outside the framebuffer"))?;
-            write_all_interruptible(stream, pixels, shutdown)?;
+        if state.encoding == Encoding::Zrle {
+            send_zrle_rectangle(
+                stream,
+                frame,
+                *rect,
+                state.pixel_format,
+                &mut state.zrle_compressor,
+                shutdown,
+            )?;
+            if state.copy_rect_enabled {
+                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            }
             continue;
         }
 
-        for row in rect.y as usize..bottom as usize {
-            let start = row
-                .checked_mul(frame_width)
-                .and_then(|pixel| pixel.checked_add(rect.x as usize))
-                .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
-            let end = start
-                .checked_add(row_bytes)
-                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
-            let pixels = frame
-                .data
-                .get(start..end)
-                .ok_or_else(|| invalid_data("rectangle is outside the framebuffer"))?;
-            write_all_interruptible(stream, pixels, shutdown)?;
+        if state.encoding == Encoding::Zlib {
+            send_zlib_rectangle(
+                stream,
+                frame,
+                *rect,
+                state.pixel_format,
+                &mut state.zlib_compressor,
+                shutdown,
+            )?;
+            if state.copy_rect_enabled {
+                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            }
+            continue;
+        }
+
+        send_raw_rectangle(stream, frame, *rect, state.pixel_format, shutdown)?;
+        if state.copy_rect_enabled {
+            update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
         }
     }
 
     Ok(())
 }
 
+fn send_raw_rectangle(
+    stream: &mut (impl Read + Write),
+    frame: &Frame,
+    rectangle: DamageRect,
+    pixel_format: PixelFormat,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let bytes_per_pixel = pixel_format.bytes_per_pixel();
+    let row_capacity = usize::try_from(rectangle.width)
+        .ok()
+        .and_then(|width| width.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| invalid_data("raw rectangle size overflows"))?;
+    for y in rectangle.y..rectangle.y + rectangle.height {
+        if pixel_format == PixelFormat::DEFAULT {
+            let start = (y as usize)
+                .checked_mul(frame.width as usize)
+                .and_then(|row| row.checked_add(rectangle.x as usize))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| invalid_data("raw rectangle offset overflows"))?;
+            let end = start
+                .checked_add(row_capacity)
+                .ok_or_else(|| invalid_data("raw rectangle offset overflows"))?;
+            let row = frame
+                .data
+                .get(start..end)
+                .ok_or_else(|| invalid_data("raw rectangle is outside the framebuffer"))?;
+            write_all_interruptible(stream, row, shutdown)?;
+            continue;
+        }
+        let mut row = Vec::with_capacity(row_capacity);
+        for x in rectangle.x..rectangle.x + rectangle.width {
+            let bgra = frame_pixel(frame, x, y)?;
+            row.extend_from_slice(&pixel_format.encode(&bgra)[..bytes_per_pixel]);
+        }
+        write_all_interruptible(stream, &row, shutdown)?;
+    }
+    Ok(())
+}
+
+fn update_client_shadow(
+    frame: &Frame,
+    rectangle: DamageRect,
+    pixel_format: PixelFormat,
+    shadow: &mut Option<Vec<[u8; 4]>>,
+) -> io::Result<()> {
+    let frame_width = frame.width as usize;
+    let frame_height = frame.height as usize;
+    if shadow.is_none()
+        && rectangle.x == 0
+        && rectangle.y == 0
+        && rectangle.width == frame.width
+        && rectangle.height == frame.height
+    {
+        let capacity = frame_width
+            .checked_mul(frame_height)
+            .ok_or_else(|| invalid_data("client framebuffer shadow size overflows"))?;
+        let mut initial = Vec::new();
+        initial.try_reserve_exact(capacity).map_err(|error| {
+            io::Error::other(format!(
+                "could not allocate client framebuffer shadow: {error}"
+            ))
+        })?;
+        for y in 0..frame.height {
+            for x in 0..frame.width {
+                initial.push(encoded_frame_pixel(frame, x, y, pixel_format)?);
+            }
+        }
+        *shadow = Some(initial);
+        return Ok(());
+    }
+
+    let Some(shadow) = shadow else {
+        return Ok(());
+    };
+    for y in rectangle.y..rectangle.y + rectangle.height {
+        for x in rectangle.x..rectangle.x + rectangle.width {
+            let index = (y as usize)
+                .checked_mul(frame_width)
+                .and_then(|row| row.checked_add(x as usize))
+                .ok_or_else(|| invalid_data("client framebuffer shadow offset overflows"))?;
+            let slot = shadow
+                .get_mut(index)
+                .ok_or_else(|| invalid_data("client framebuffer shadow is incomplete"))?;
+            *slot = encoded_frame_pixel(frame, x, y, pixel_format)?;
+        }
+    }
+    Ok(())
+}
+
+fn find_copy_source(
+    frame: &Frame,
+    shadow: &[[u8; 4]],
+    rectangle: DamageRect,
+    pixel_format: PixelFormat,
+) -> Option<(u16, u16)> {
+    const SEARCH_RADIUS: i32 = 128;
+    const MAX_CANDIDATES: usize = 65_536;
+    const MAX_COMPARE_PIXELS: usize = 1_000_000;
+
+    let frame_width = frame.width as usize;
+    let frame_height = frame.height as usize;
+    if shadow.len() != frame_width.checked_mul(frame_height)? {
+        return None;
+    }
+    let area = usize::try_from(rectangle.width)
+        .ok()?
+        .checked_mul(rectangle.height as usize)?;
+    if area == 0 || area > MAX_COMPARE_PIXELS {
+        return None;
+    }
+
+    let last_x = frame.width.checked_sub(rectangle.width)?;
+    let last_y = frame.height.checked_sub(rectangle.height)?;
+    let destination_pixel =
+        encoded_frame_pixel(frame, rectangle.x, rectangle.y, pixel_format).ok()?;
+    let mut tested = 0usize;
+    let mut comparison_budget = MAX_COMPARE_PIXELS;
+
+    for radius in 1..=SEARCH_RADIUS {
+        for offset_y in -radius..=radius {
+            for offset_x in -radius..=radius {
+                if offset_x.abs().max(offset_y.abs()) != radius {
+                    continue;
+                }
+                let source_x = i64::from(rectangle.x) + i64::from(offset_x);
+                let source_y = i64::from(rectangle.y) + i64::from(offset_y);
+                if source_x < 0 || source_y < 0 {
+                    continue;
+                }
+                let (source_x, source_y) = (source_x as u32, source_y as u32);
+                if source_x > last_x
+                    || source_y > last_y
+                    || (source_x == rectangle.x && source_y == rectangle.y)
+                {
+                    continue;
+                }
+                tested += 1;
+                if tested > MAX_CANDIDATES {
+                    return None;
+                }
+                let source_index = (source_y as usize)
+                    .checked_mul(frame_width)?
+                    .checked_add(source_x as usize)?;
+                if shadow.get(source_index).copied()? != destination_pixel {
+                    continue;
+                }
+                if area > comparison_budget {
+                    return None;
+                }
+                comparison_budget -= area;
+
+                let mut matches = true;
+                'pixels: for row in 0..rectangle.height {
+                    let target_y = rectangle.y + row;
+                    let source_row = (source_y + row) as usize * frame_width + source_x as usize;
+                    for column in 0..rectangle.width {
+                        let target = encoded_frame_pixel(
+                            frame,
+                            rectangle.x + column,
+                            target_y,
+                            pixel_format,
+                        )
+                        .ok()?;
+                        if shadow[source_row + column as usize] != target {
+                            matches = false;
+                            break 'pixels;
+                        }
+                    }
+                }
+                if matches {
+                    return Some((u16::try_from(source_x).ok()?, u16::try_from(source_y).ok()?));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn encode_rectangle_pixels(
+    frame: &Frame,
+    rectangle: DamageRect,
+    pixel_format: PixelFormat,
+) -> io::Result<Vec<u8>> {
+    let bytes_per_pixel = pixel_format.bytes_per_pixel();
+    let capacity = usize::try_from(rectangle.width)
+        .ok()
+        .and_then(|width| width.checked_mul(rectangle.height as usize))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| invalid_data("encoded rectangle size overflows"))?;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(capacity).map_err(|error| {
+        io::Error::other(format!("could not allocate encoded rectangle: {error}"))
+    })?;
+    for y in rectangle.y..rectangle.y + rectangle.height {
+        for x in rectangle.x..rectangle.x + rectangle.width {
+            let bgra = frame_pixel(frame, x, y)?;
+            pixels.extend_from_slice(&pixel_format.encode(&bgra)[..bytes_per_pixel]);
+        }
+    }
+    Ok(pixels)
+}
+
+fn send_zlib_rectangle(
+    stream: &mut (impl Read + Write),
+    frame: &Frame,
+    rectangle: DamageRect,
+    pixel_format: PixelFormat,
+    compressor: &mut Compress,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let pixels = encode_rectangle_pixels(frame, rectangle, pixel_format)?;
+    let compressed = compress_sync(compressor, &pixels)?;
+    let length = u32::try_from(compressed.len())
+        .map_err(|_| invalid_data("compressed Zlib rectangle exceeds RFB limit"))?;
+    write_all_interruptible(stream, &length.to_be_bytes(), shutdown)?;
+    write_all_interruptible(stream, &compressed, shutdown)
+}
+
+fn compress_sync(compressor: &mut Compress, input: &[u8]) -> io::Result<Vec<u8>> {
+    let mut compressed = Vec::new();
+    let mut input_offset = 0;
+    loop {
+        let mut output = [0u8; 8192];
+        let input_before = compressor.total_in();
+        let output_before = compressor.total_out();
+        let status = compressor
+            .compress(&input[input_offset..], &mut output, FlushCompress::Sync)
+            .map_err(|error| io::Error::other(format!("zlib compression failed: {error}")))?;
+        let consumed = usize::try_from(compressor.total_in() - input_before)
+            .map_err(|_| invalid_data("zlib compressor input count overflowed"))?;
+        input_offset = input_offset
+            .checked_add(consumed)
+            .ok_or_else(|| invalid_data("zlib input offset overflows"))?;
+        let produced = usize::try_from(compressor.total_out() - output_before)
+            .map_err(|_| invalid_data("zlib compressor output count overflowed"))?;
+        if produced > output.len() {
+            return Err(invalid_data("zlib compressor exceeded its output buffer"));
+        }
+        compressed.try_reserve(produced).map_err(|error| {
+            io::Error::other(format!("could not allocate compressed rectangle: {error}"))
+        })?;
+        compressed.extend_from_slice(&output[..produced]);
+        if input_offset == input.len() && status == Status::Ok {
+            return Ok(compressed);
+        }
+        if consumed == 0 && produced == 0 {
+            return Err(invalid_data("zlib compressor made no progress"));
+        }
+    }
+}
+
 fn send_zrle_rectangle(
     stream: &mut (impl Read + Write),
     frame: &Frame,
     rectangle: DamageRect,
+    pixel_format: PixelFormat,
     compressor: &mut Compress,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -1192,64 +1626,33 @@ fn send_zrle_rectangle(
         .width
         .checked_mul(rectangle.height)
         .ok_or_else(|| invalid_data("ZRLE pixel count overflows"))?;
+    let c_pixel_size = pixel_format.zrle_bytes_per_pixel();
     let capacity = usize::try_from(pixel_count)
         .ok()
-        .and_then(|pixels| pixels.checked_mul(3))
+        .and_then(|pixels| pixels.checked_mul(c_pixel_size))
         .and_then(|bytes| bytes.checked_add(tile_count as usize))
         .ok_or_else(|| invalid_data("ZRLE rectangle size overflows"))?;
-    let mut raw = Vec::with_capacity(capacity);
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(capacity)
+        .map_err(|error| io::Error::other(format!("could not allocate ZRLE rectangle: {error}")))?;
 
     for tile_y in (rectangle.y..bottom).step_by(64) {
         let tile_height = (bottom - tile_y).min(64);
         for tile_x in (rectangle.x..right).step_by(64) {
             let tile_width = (right - tile_x).min(64);
-            // ZRLE subencoding 0 is Raw. CPIXEL omits the unused high byte
-            // from our 32bpp/depth-24 little-endian true-color pixel format.
+            // ZRLE subencoding 0 is Raw.
             raw.push(0);
             for y in tile_y..tile_y + tile_height {
                 for x in tile_x..tile_x + tile_width {
-                    let offset = (y as usize)
-                        .checked_mul(frame.width as usize)
-                        .and_then(|pixel| pixel.checked_add(x as usize))
-                        .and_then(|pixel| pixel.checked_mul(4))
-                        .ok_or_else(|| invalid_data("ZRLE pixel offset overflows"))?;
-                    let pixel = frame
-                        .data
-                        .get(offset..offset + 3)
-                        .ok_or_else(|| invalid_data("ZRLE pixel is outside the framebuffer"))?;
-                    raw.extend_from_slice(pixel);
+                    let bgra = frame_pixel(frame, x, y)?;
+                    let encoded = pixel_format.encode_zrle(&bgra);
+                    raw.extend_from_slice(&encoded[..c_pixel_size]);
                 }
             }
         }
     }
 
-    let mut compressed = Vec::new();
-    let mut input_offset = 0;
-    loop {
-        let mut output = [0u8; 8192];
-        let input_before = compressor.total_in();
-        let output_before = compressor.total_out();
-        let status = compressor
-            .compress(&raw[input_offset..], &mut output, FlushCompress::Sync)
-            .map_err(|error| io::Error::other(format!("ZRLE compression failed: {error}")))?;
-        let consumed = usize::try_from(compressor.total_in() - input_before)
-            .map_err(|_| invalid_data("ZRLE compressor input count overflowed"))?;
-        input_offset = input_offset
-            .checked_add(consumed)
-            .ok_or_else(|| invalid_data("ZRLE input offset overflows"))?;
-        let output_offset = usize::try_from(compressor.total_out() - output_before)
-            .map_err(|_| invalid_data("ZRLE compressor output count overflowed"))?;
-        if output_offset > output.len() {
-            return Err(invalid_data("ZRLE compressor exceeded its output buffer"));
-        }
-        compressed.extend_from_slice(&output[..output_offset]);
-        if input_offset == raw.len() && status == Status::Ok {
-            break;
-        }
-        if consumed == 0 && output_offset == 0 {
-            return Err(invalid_data("ZRLE compressor made no progress"));
-        }
-    }
+    let compressed = compress_sync(compressor, &raw)?;
 
     let compressed_len = u32::try_from(compressed.len())
         .map_err(|_| invalid_data("compressed ZRLE rectangle exceeds RFB limit"))?;
@@ -1266,10 +1669,19 @@ struct HextileSubrect {
     color: [u8; 4],
 }
 
+#[derive(Clone, Copy)]
+struct HextileTile {
+    x: u32,
+    y: u32,
+    width: u8,
+    height: u8,
+}
+
 fn send_hextile_rectangle(
     stream: &mut (impl Read + Write),
     frame: &Frame,
     rectangle: DamageRect,
+    pixel_format: PixelFormat,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let right = rectangle.x + rectangle.width;
@@ -1282,10 +1694,13 @@ fn send_hextile_rectangle(
             send_hextile_tile(
                 stream,
                 frame,
-                tile_x,
-                tile_y,
-                tile_width,
-                tile_height,
+                HextileTile {
+                    x: tile_x,
+                    y: tile_y,
+                    width: tile_width,
+                    height: tile_height,
+                },
+                pixel_format,
                 shutdown,
             )?;
         }
@@ -1297,10 +1712,8 @@ fn send_hextile_rectangle(
 fn send_hextile_tile(
     stream: &mut (impl Read + Write),
     frame: &Frame,
-    tile_x: u32,
-    tile_y: u32,
-    tile_width: u8,
-    tile_height: u8,
+    tile: HextileTile,
+    pixel_format: PixelFormat,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     const BACKGROUND_SPECIFIED: u8 = 2;
@@ -1308,12 +1721,19 @@ fn send_hextile_tile(
     const ANY_SUBRECTS: u8 = 8;
     const SUBRECTS_COLOURED: u8 = 16;
 
+    let HextileTile {
+        x: tile_x,
+        y: tile_y,
+        width: tile_width,
+        height: tile_height,
+    } = tile;
+    let bytes_per_pixel = pixel_format.bytes_per_pixel();
     let mut frequencies = HashMap::<[u8; 4], usize>::with_capacity(16);
     let mut background = [0u8; 4];
     let mut most_frequent = 0usize;
     for y in 0..u32::from(tile_height) {
         for x in 0..u32::from(tile_width) {
-            let color = frame_pixel(frame, tile_x + x, tile_y + y)?;
+            let color = encoded_frame_pixel(frame, tile_x + x, tile_y + y, pixel_format)?;
             let count = frequencies.entry(color).or_default();
             *count += 1;
             if *count > most_frequent {
@@ -1327,7 +1747,12 @@ fn send_hextile_tile(
     for y in 0..tile_height {
         let mut x = 0u8;
         while x < tile_width {
-            let color = frame_pixel(frame, tile_x + u32::from(x), tile_y + u32::from(y))?;
+            let color = encoded_frame_pixel(
+                frame,
+                tile_x + u32::from(x),
+                tile_y + u32::from(y),
+                pixel_format,
+            )?;
             if color == background {
                 x += 1;
                 continue;
@@ -1336,7 +1761,12 @@ fn send_hextile_tile(
             let run_start = x;
             x += 1;
             while x < tile_width
-                && frame_pixel(frame, tile_x + u32::from(x), tile_y + u32::from(y))? == color
+                && encoded_frame_pixel(
+                    frame,
+                    tile_x + u32::from(x),
+                    tile_y + u32::from(y),
+                    pixel_format,
+                )? == color
             {
                 x += 1;
             }
@@ -1351,15 +1781,7 @@ fn send_hextile_tile(
                 previous.height += 1;
             } else {
                 if subrects.len() == u8::MAX as usize {
-                    return send_raw_hextile_tile(
-                        stream,
-                        frame,
-                        tile_x,
-                        tile_y,
-                        tile_width,
-                        tile_height,
-                        shutdown,
-                    );
+                    return send_raw_hextile_tile(stream, frame, tile, pixel_format, shutdown);
                 }
                 subrects.push(HextileSubrect {
                     x: run_start,
@@ -1381,18 +1803,10 @@ fn send_hextile_tile(
         + usize::from(!subrects.is_empty())
         + subrects.len() * bytes_per_subrect
         + if single_foreground { 4 } else { 0 };
-    let raw_size = 1 + usize::from(tile_width) * usize::from(tile_height) * 4;
+    let raw_size = 1 + usize::from(tile_width) * usize::from(tile_height) * bytes_per_pixel;
 
     if !subrects.is_empty() && encoded_size >= raw_size {
-        return send_raw_hextile_tile(
-            stream,
-            frame,
-            tile_x,
-            tile_y,
-            tile_width,
-            tile_height,
-            shutdown,
-        );
+        return send_raw_hextile_tile(stream, frame, tile, pixel_format, shutdown);
     }
 
     let mut flags = BACKGROUND_SPECIFIED;
@@ -1405,11 +1819,15 @@ fn send_hextile_tile(
         }
     }
     write_all_interruptible(stream, &[flags], shutdown)?;
-    write_all_interruptible(stream, &background, shutdown)?;
+    write_all_interruptible(stream, &background[..bytes_per_pixel], shutdown)?;
 
     if !subrects.is_empty() {
         if single_foreground {
-            write_all_interruptible(stream, &foreground.unwrap_or([0; 4]), shutdown)?;
+            write_all_interruptible(
+                stream,
+                &foreground.unwrap_or([0; 4])[..bytes_per_pixel],
+                shutdown,
+            )?;
         }
         write_all_interruptible(stream, &[subrects.len() as u8], shutdown)?;
         for subrect in subrects {
@@ -1420,7 +1838,7 @@ fn send_hextile_tile(
                 shutdown,
             )?;
             if !single_foreground {
-                write_all_interruptible(stream, &subrect.color, shutdown)?;
+                write_all_interruptible(stream, &subrect.color[..bytes_per_pixel], shutdown)?;
             }
         }
     }
@@ -1431,28 +1849,22 @@ fn send_hextile_tile(
 fn send_raw_hextile_tile(
     stream: &mut (impl Read + Write),
     frame: &Frame,
-    tile_x: u32,
-    tile_y: u32,
-    tile_width: u8,
-    tile_height: u8,
+    tile: HextileTile,
+    pixel_format: PixelFormat,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
+    let HextileTile {
+        x: tile_x,
+        y: tile_y,
+        width: tile_width,
+        height: tile_height,
+    } = tile;
     write_all_interruptible(stream, &[1], shutdown)?; // Raw tile subencoding
-    let row_bytes = usize::from(tile_width) * 4;
     for row in 0..u32::from(tile_height) {
-        let start = ((tile_y + row) as usize)
-            .checked_mul(frame.width as usize)
-            .and_then(|pixel| pixel.checked_add(tile_x as usize))
-            .and_then(|pixel| pixel.checked_mul(4))
-            .ok_or_else(|| invalid_data("Hextile tile offset overflows"))?;
-        let end = start
-            .checked_add(row_bytes)
-            .ok_or_else(|| invalid_data("Hextile tile offset overflows"))?;
-        let pixels = frame
-            .data
-            .get(start..end)
-            .ok_or_else(|| invalid_data("Hextile tile is outside the framebuffer"))?;
-        write_all_interruptible(stream, pixels, shutdown)?;
+        for column in 0..u32::from(tile_width) {
+            let pixel = encoded_frame_pixel(frame, tile_x + column, tile_y + row, pixel_format)?;
+            write_all_interruptible(stream, &pixel[..pixel_format.bytes_per_pixel()], shutdown)?;
+        }
     }
     Ok(())
 }
@@ -1471,6 +1883,15 @@ fn frame_pixel(frame: &Frame, x: u32, y: u32) -> io::Result<[u8; 4]> {
         .get(start..end)
         .ok_or_else(|| invalid_data("Hextile pixel is outside the framebuffer"))?;
     Ok([pixel[0], pixel[1], pixel[2], pixel[3]])
+}
+
+fn encoded_frame_pixel(
+    frame: &Frame,
+    x: u32,
+    y: u32,
+    pixel_format: PixelFormat,
+) -> io::Result<[u8; 4]> {
+    Ok(pixel_format.encode(&frame_pixel(frame, x, y)?))
 }
 
 /// Tracks held remote inputs so a client disconnect can release them.
@@ -1649,37 +2070,6 @@ fn parse_version_component(bytes: &[u8]) -> Option<u32> {
     )
 }
 
-fn validate_client_pixel_format(format: &[u8; 16]) -> io::Result<()> {
-    let bits_per_pixel = format[0];
-    let depth = format[1];
-    let big_endian = format[2];
-    let true_color = format[3];
-    let red_max = u16::from_be_bytes([format[4], format[5]]);
-    let green_max = u16::from_be_bytes([format[6], format[7]]);
-    let blue_max = u16::from_be_bytes([format[8], format[9]]);
-    let red_shift = format[10];
-    let green_shift = format[11];
-    let blue_shift = format[12];
-
-    if bits_per_pixel != 32
-        || depth != 24
-        || big_endian != 0
-        || true_color != 1
-        || red_max != 255
-        || green_max != 255
-        || blue_max != 255
-        || red_shift != 16
-        || green_shift != 8
-        || blue_shift != 0
-    {
-        return Err(invalid_data(
-            "unsupported client pixel format; 32bpp little-endian BGRA is required",
-        ));
-    }
-
-    Ok(())
-}
-
 fn server_pixel_format() -> [u8; 16] {
     [
         32,  // bits per pixel
@@ -1821,6 +2211,19 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
+
+    fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> ClientUpdateState {
+        ClientUpdateState {
+            encoding,
+            copy_rect_enabled,
+            pixel_format: PixelFormat::DEFAULT,
+            last_sequence: 0,
+            pending_damage: Vec::new(),
+            zrle_compressor: Compress::new(Compression::default(), true),
+            zlib_compressor: Compress::new(Compression::default(), true),
+            client_pixels: None,
+        }
+    }
 
     #[test]
     fn accepts_rfb_38_and_sends_raw_update() {
@@ -2248,15 +2651,70 @@ mod tests {
 
     #[test]
     fn validates_pixel_formats() {
-        assert!(validate_client_pixel_format(&server_pixel_format()).is_ok());
+        assert!(PixelFormat::from_wire(&server_pixel_format()).is_ok());
 
-        let mut wrong = server_pixel_format();
-        wrong[0] = 16;
-        assert!(validate_client_pixel_format(&wrong).is_err());
+        let mut rgb565 = server_pixel_format();
+        rgb565[0] = 16;
+        rgb565[1] = 16;
+        rgb565[4..10].copy_from_slice(&[0, 31, 0, 63, 0, 31]);
+        rgb565[10..13].copy_from_slice(&[11, 5, 0]);
+        assert!(PixelFormat::from_wire(&rgb565).is_ok());
 
         let mut wrong = server_pixel_format();
         wrong[10] = 0;
-        assert!(validate_client_pixel_format(&wrong).is_err());
+        assert!(PixelFormat::from_wire(&wrong).is_err());
+    }
+
+    #[test]
+    fn converts_pixels_for_rgb565_and_rgb332_formats() {
+        let rgb565 = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian: false,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
+        rgb565.validate().unwrap();
+        assert_eq!(&rgb565.encode(&[255, 128, 0, 255])[..2], &[0x1f, 0x04]);
+
+        let rgb565_be = PixelFormat {
+            big_endian: true,
+            ..rgb565
+        };
+        assert_eq!(&rgb565_be.encode(&[255, 128, 0, 255])[..2], &[0x04, 0x1f]);
+
+        let rgb888_be = PixelFormat {
+            bits_per_pixel: 32,
+            depth: 24,
+            big_endian: true,
+            red_max: 255,
+            green_max: 255,
+            blue_max: 255,
+            red_shift: 16,
+            green_shift: 8,
+            blue_shift: 0,
+        };
+        assert_eq!(
+            &rgb888_be.encode_zrle(&[255, 128, 0, 255])[..3],
+            &[0, 128, 255]
+        );
+
+        let rgb332 = PixelFormat {
+            bits_per_pixel: 8,
+            depth: 8,
+            big_endian: false,
+            red_max: 7,
+            green_max: 7,
+            blue_max: 3,
+            red_shift: 5,
+            green_shift: 2,
+            blue_shift: 0,
+        };
+        assert_eq!(rgb332.encode(&[255, 255, 255, 255])[0], 0xff);
     }
 
     #[test]
@@ -2299,18 +2757,37 @@ mod tests {
         let mut offered = Vec::new();
         offered.extend_from_slice(&hextile);
         offered.extend_from_slice(&raw);
-        assert_eq!(select_encoding(&offered).unwrap(), Encoding::Hextile);
+        assert_eq!(
+            select_encodings(&offered).unwrap().preferred,
+            Encoding::Hextile
+        );
 
         offered.clear();
         offered.extend_from_slice(&ENCODING_ZRLE.to_be_bytes());
         offered.extend_from_slice(&hextile);
-        assert_eq!(select_encoding(&offered).unwrap(), Encoding::Zrle);
+        assert_eq!(
+            select_encodings(&offered).unwrap().preferred,
+            Encoding::Zrle
+        );
 
         offered.clear();
         offered.extend_from_slice(&raw);
         offered.extend_from_slice(&hextile);
-        assert_eq!(select_encoding(&offered).unwrap(), Encoding::Raw);
-        assert!(select_encoding(&42i32.to_be_bytes()).is_err());
+        assert_eq!(select_encodings(&offered).unwrap().preferred, Encoding::Raw);
+
+        offered.clear();
+        offered.extend_from_slice(&ENCODING_ZLIB.to_be_bytes());
+        offered.extend_from_slice(&ENCODING_ZRLE.to_be_bytes());
+        offered.extend_from_slice(&ENCODING_COPY_RECT.to_be_bytes());
+        offered.extend_from_slice(&raw);
+        assert_eq!(
+            select_encodings(&offered).unwrap(),
+            EncodingPreferences {
+                preferred: Encoding::Zlib,
+                copy_rect: true,
+            }
+        );
+        assert!(select_encodings(&42i32.to_be_bytes()).is_err());
     }
 
     #[test]
@@ -2331,6 +2808,7 @@ mod tests {
                 &mut stream,
                 &frame,
                 rectangle,
+                PixelFormat::DEFAULT,
                 &mut compressor,
                 &AtomicBool::new(false),
             )
@@ -2339,6 +2817,7 @@ mod tests {
                 &mut stream,
                 &frame,
                 rectangle,
+                PixelFormat::DEFAULT,
                 &mut compressor,
                 &AtomicBool::new(false),
             )
@@ -2364,6 +2843,115 @@ mod tests {
     }
 
     #[test]
+    fn zlib_encodes_raw_pixels_in_one_persistent_stream() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let frame = Frame::new(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255]).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut compressor = Compress::new(Compression::default(), true);
+            let rectangle = DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            };
+            for _ in 0..2 {
+                send_zlib_rectangle(
+                    &mut stream,
+                    &frame,
+                    rectangle,
+                    PixelFormat::DEFAULT,
+                    &mut compressor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            }
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut decompressor = flate2::Decompress::new(true);
+        for _ in 0..2 {
+            let mut length = [0; 4];
+            client.read_exact(&mut length).unwrap();
+            let mut compressed = vec![0; u32::from_be_bytes(length) as usize];
+            client.read_exact(&mut compressed).unwrap();
+            let mut decoded = [0; 8];
+            let before = decompressor.total_out();
+            decompressor
+                .decompress(&compressed, &mut decoded, flate2::FlushDecompress::Sync)
+                .unwrap();
+            let written = (decompressor.total_out() - before) as usize;
+            assert_eq!(&decoded[..written], &[1, 2, 3, 255, 4, 5, 6, 255]);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sends_copyrect_only_from_known_client_pixels() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let old_frame = Frame::new(
+            4,
+            1,
+            vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        )
+        .unwrap();
+        let new_frame = Frame::new(
+            4,
+            1,
+            vec![1, 2, 3, 255, 1, 2, 3, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        )
+        .unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut state = test_update_state(Encoding::Raw, true);
+            send_update(
+                &mut stream,
+                &old_frame,
+                &[DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                }],
+                &mut state,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            send_update(
+                &mut stream,
+                &new_frame,
+                &[DamageRect {
+                    x: 1,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                }],
+                &mut state,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut initial = [0; 32];
+        client.read_exact(&mut initial).unwrap();
+        assert_eq!(
+            i32::from_be_bytes(initial[12..16].try_into().unwrap()),
+            ENCODING_RAW
+        );
+        let mut update = [0; 20];
+        client.read_exact(&mut update).unwrap();
+        assert_eq!(
+            i32::from_be_bytes(update[12..16].try_into().unwrap()),
+            ENCODING_COPY_RECT
+        );
+        assert_eq!(&update[16..], &[0, 0, 0, 0]);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn hextile_encodes_solid_and_subrect_tiles() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -2371,6 +2959,7 @@ mod tests {
         let solid_frame = Frame::new(2, 2, solid_pixels).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut state = test_update_state(Encoding::Hextile, false);
             send_update(
                 &mut stream,
                 &solid_frame,
@@ -2380,8 +2969,7 @@ mod tests {
                     width: 2,
                     height: 2,
                 }],
-                Encoding::Hextile,
-                &mut Compress::new(Compression::default(), true),
+                &mut state,
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -2405,6 +2993,7 @@ mod tests {
         let frame = Frame::new(4, 4, pixels).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let mut state = test_update_state(Encoding::Hextile, false);
             send_update(
                 &mut stream,
                 &frame,
@@ -2414,8 +3003,7 @@ mod tests {
                     width: 4,
                     height: 4,
                 }],
-                Encoding::Hextile,
-                &mut Compress::new(Compression::default(), true),
+                &mut state,
                 &AtomicBool::new(false),
             )
             .unwrap();
