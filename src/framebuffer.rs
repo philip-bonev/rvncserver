@@ -4,6 +4,7 @@
 //! The RFB implementation only sees this type, so it does not depend on
 //! PipeWire formats, strides, crops, or buffer orientation.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -26,6 +27,45 @@ pub struct Frame {
     pub height: u32,
     /// Tightly packed BGRA pixel data.
     pub data: Arc<Vec<u8>>,
+    /// Damage in normalized framebuffer coordinates. `Full` means damage
+    /// metadata was unavailable and consumers must refresh the whole frame.
+    pub damage: FrameDamage,
+    /// Optional PipeWire sequence number used to detect dropped frames.
+    pub source_sequence: Option<u64>,
+}
+
+/// A rectangle in normalized framebuffer coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    /// Left edge in pixels.
+    pub x: u32,
+    /// Top edge in pixels.
+    pub y: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// Capture damage information associated with a frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameDamage {
+    /// No reliable damage metadata; refresh the full framebuffer.
+    Full,
+    /// Regions known to have changed. An empty vector means no visible pixels
+    /// changed in this frame.
+    Regions(Vec<DamageRect>),
+}
+
+/// Latest frame and accumulated damage since a caller's prior sequence.
+#[derive(Debug, Clone)]
+pub struct FrameChanges {
+    /// Latest publication sequence represented by this snapshot.
+    pub sequence: u64,
+    /// Latest complete framebuffer image.
+    pub frame: Arc<Frame>,
+    /// Damage accumulated since the requested sequence.
+    pub damage: FrameDamage,
 }
 
 impl Frame {
@@ -47,6 +87,8 @@ impl Frame {
             width,
             height,
             data: Arc::new(data),
+            damage: FrameDamage::Full,
+            source_sequence: None,
         })
     }
 
@@ -138,11 +180,25 @@ impl Frame {
             && frame.stride as usize == output_stride
             && matches!(frame.format, PixelFormat::BGRA | PixelFormat::BGRx);
 
+        let bottom_up = frame.is_bottom_up();
+        let mut damage = normalize_damage(frame, crop_x, crop_y, output_width, output_height);
+        if frame
+            .meta
+            .header
+            .as_ref()
+            .is_none_or(|header| header.is_discont())
+        {
+            damage = FrameDamage::Full;
+        }
+        let source_sequence = frame.meta.header.as_ref().map(|header| header.seq);
+
         if is_fast_path {
             return Ok(Self {
                 width: output_width,
                 height: output_height,
                 data: Arc::clone(data),
+                damage,
+                source_sequence,
             });
         }
 
@@ -154,7 +210,7 @@ impl Frame {
 
         for row in 0..output_height_usize {
             let source_row = crop_y as usize + row;
-            let source_row = if frame.is_bottom_up() {
+            let source_row = if bottom_up {
                 source_height
                     .checked_sub(1 + source_row)
                     .ok_or(FrameError::InvalidCrop)?
@@ -206,6 +262,8 @@ impl Frame {
             width: output_width,
             height: output_height,
             data: Arc::new(output),
+            damage,
+            source_sequence,
         })
     }
 
@@ -309,6 +367,58 @@ fn expected_len(width: u32, height: u32) -> Result<usize, FrameError> {
         .ok_or(FrameError::InvalidDimensions)
 }
 
+fn normalize_damage(
+    frame: &VideoFrame,
+    crop_x: u32,
+    crop_y: u32,
+    output_width: u32,
+    output_height: u32,
+) -> FrameDamage {
+    // SPA video-damage rectangles are expressed in logical frame coordinates;
+    // bottom-up chunk layout affects pixel storage, not these coordinates.
+    if frame.meta.damage.is_empty() {
+        return FrameDamage::Full;
+    }
+    const MAX_CAPTURE_DAMAGE_REGIONS: usize = 512;
+    if frame.meta.damage.len() > MAX_CAPTURE_DAMAGE_REGIONS {
+        return FrameDamage::Full;
+    }
+
+    let crop_left = i64::from(crop_x);
+    let crop_top = i64::from(crop_y);
+    let crop_right = crop_left + i64::from(output_width);
+    let crop_bottom = crop_top + i64::from(output_height);
+    let mut regions = Vec::with_capacity(frame.meta.damage.len());
+
+    for damage in &frame.meta.damage {
+        if damage.width == 0 || damage.height == 0 {
+            continue;
+        }
+
+        let left = i64::from(damage.x).max(crop_left);
+        let top = i64::from(damage.y).max(crop_top);
+        let right = (i64::from(damage.x) + i64::from(damage.width)).min(crop_right);
+        let bottom = (i64::from(damage.y) + i64::from(damage.height)).min(crop_bottom);
+        if left >= right || top >= bottom {
+            continue;
+        }
+
+        let x = (left - crop_left) as u32;
+        let y = (top - crop_top) as u32;
+        let width = (right - left) as u32;
+        let height = (bottom - top) as u32;
+
+        regions.push(DamageRect {
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+
+    FrameDamage::Regions(regions)
+}
+
 /// Shared latest-frame store used to decouple capture from network clients.
 ///
 /// The capture loop publishes frames only while at least one client is
@@ -322,8 +432,12 @@ pub struct FrameStore {
 #[derive(Debug, Default)]
 struct FrameStoreInner {
     latest: Option<(u64, Arc<Frame>)>,
+    damage_history: VecDeque<(u64, FrameDamage)>,
+    last_source_sequence: Option<u64>,
     clients: usize,
 }
+
+const DAMAGE_HISTORY_LIMIT: usize = 128;
 
 impl FrameStore {
     /// Create an empty store.
@@ -338,6 +452,22 @@ impl FrameStore {
             .latest
             .as_ref()
             .map_or(1, |(sequence, _)| sequence + 1);
+        let mut damage = frame.damage.clone();
+        if let Some(source_sequence) = frame.source_sequence {
+            if inner
+                .last_source_sequence
+                .is_some_and(|previous| source_sequence != previous.wrapping_add(1))
+            {
+                damage = FrameDamage::Full;
+            }
+            inner.last_source_sequence = Some(source_sequence);
+        } else {
+            inner.last_source_sequence = None;
+        }
+        inner.damage_history.push_back((sequence, damage));
+        while inner.damage_history.len() > DAMAGE_HISTORY_LIMIT {
+            inner.damage_history.pop_front();
+        }
         inner.latest = Some((sequence, frame));
         self.ready.notify_all();
         sequence
@@ -349,6 +479,52 @@ impl FrameStore {
             .latest
             .as_ref()
             .map(|(sequence, frame)| (*sequence, Arc::clone(frame)))
+    }
+
+    /// Get the latest frame and damage accumulated after `last_sequence`.
+    ///
+    /// Returns `None` if no newer publication exists. A fresh client or a
+    /// sequence older than retained history receives `FrameDamage::Full`.
+    pub fn changes_since(&self, last_sequence: u64) -> Option<FrameChanges> {
+        let inner = self.lock();
+        let (sequence, frame) = inner.latest.as_ref()?;
+        if *sequence <= last_sequence {
+            return None;
+        }
+
+        let first_retained = inner.damage_history.front().map(|(seq, _)| *seq);
+        let history_missing =
+            first_retained.is_none_or(|first| last_sequence.saturating_add(1) < first);
+        let mut damage = if last_sequence == 0 || history_missing {
+            FrameDamage::Full
+        } else {
+            FrameDamage::Regions(Vec::new())
+        };
+
+        if damage != FrameDamage::Full {
+            for (entry_sequence, entry_damage) in &inner.damage_history {
+                if *entry_sequence <= last_sequence {
+                    continue;
+                }
+                match entry_damage {
+                    FrameDamage::Full => {
+                        damage = FrameDamage::Full;
+                        break;
+                    }
+                    FrameDamage::Regions(regions) => {
+                        if let FrameDamage::Regions(accumulated) = &mut damage {
+                            accumulated.extend(regions.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(FrameChanges {
+            sequence: *sequence,
+            frame: Arc::clone(frame),
+            damage,
+        })
     }
 
     /// Wait for a frame newer than `last_sequence`.
@@ -497,6 +673,65 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_damage_through_crop_and_bottom_up_storage() {
+        let data = vec![0u8; 3 * 2 * 4];
+        let mut source = video_frame(3, 2, 12, PixelFormat::BGRA, data);
+        source.meta.crop = Some(lamco_pipewire::CropRegion {
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 2,
+        });
+        source.meta.chunk_stride = -12;
+        source.meta.damage = vec![
+            lamco_pipewire::DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            lamco_pipewire::DamageRect {
+                x: 2,
+                y: 1,
+                width: 1,
+                height: 1,
+            },
+        ];
+        source.meta.header = Some(lamco_pipewire::HeaderMeta {
+            pts: 0,
+            dts_offset: 0,
+            seq: 1,
+            flags: 0,
+        });
+
+        let frame = Frame::from_video_frame(&source).unwrap();
+        assert_eq!(
+            frame.damage,
+            FrameDamage::Regions(vec![
+                DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                DamageRect {
+                    x: 1,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                },
+            ])
+        );
+
+        let mut without_sequence = source.clone();
+        without_sequence.meta.header = None;
+        assert_eq!(
+            Frame::from_video_frame(&without_sequence).unwrap().damage,
+            FrameDamage::Full
+        );
+    }
+
+    #[test]
     fn rejects_invalid_inputs() {
         let source = video_frame(0, 1, 0, PixelFormat::BGRA, vec![]);
         assert_eq!(
@@ -564,5 +799,74 @@ mod tests {
         assert!(!store.has_clients());
         store.client_disconnected();
         assert!(!store.has_clients());
+    }
+
+    #[test]
+    fn frame_store_accumulates_damage_since_sequence() {
+        let store = FrameStore::new();
+        let mut first = Frame::new(4, 4, vec![0; 4 * 4 * 4]).unwrap();
+        first.damage = FrameDamage::Regions(vec![DamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]);
+        assert_eq!(store.publish(Arc::new(first)), 1);
+
+        let mut second = Frame::new(4, 4, vec![0; 4 * 4 * 4]).unwrap();
+        second.damage = FrameDamage::Regions(vec![DamageRect {
+            x: 2,
+            y: 2,
+            width: 1,
+            height: 1,
+        }]);
+        assert_eq!(store.publish(Arc::new(second)), 2);
+
+        let changes = store.changes_since(1).unwrap();
+        assert_eq!(changes.sequence, 2);
+        assert_eq!(
+            changes.damage,
+            FrameDamage::Regions(vec![DamageRect {
+                x: 2,
+                y: 2,
+                width: 1,
+                height: 1,
+            }])
+        );
+        assert_eq!(store.changes_since(0).unwrap().damage, FrameDamage::Full);
+    }
+
+    #[test]
+    fn frame_store_invalidates_damage_after_capture_sequence_gap() {
+        let store = FrameStore::new();
+        let mut first = Frame::new(1, 1, vec![0; 4]).unwrap();
+        first.damage = FrameDamage::Regions(Vec::new());
+        first.source_sequence = Some(40);
+        store.publish(Arc::new(first));
+
+        let mut second = Frame::new(1, 1, vec![0; 4]).unwrap();
+        second.damage = FrameDamage::Regions(vec![DamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]);
+        second.source_sequence = Some(42);
+        store.publish(Arc::new(second));
+
+        assert_eq!(store.changes_since(1).unwrap().damage, FrameDamage::Full);
+    }
+
+    #[test]
+    fn frame_store_falls_back_to_full_after_history_overflow() {
+        let store = FrameStore::new();
+        for _ in 0..=DAMAGE_HISTORY_LIMIT + 1 {
+            let mut frame = Frame::new(1, 1, vec![0; 4]).unwrap();
+            frame.damage = FrameDamage::Regions(Vec::new());
+            store.publish(Arc::new(frame));
+        }
+
+        assert_eq!(store.changes_since(0).unwrap().damage, FrameDamage::Full);
+        assert_eq!(store.changes_since(1).unwrap().damage, FrameDamage::Full);
     }
 }

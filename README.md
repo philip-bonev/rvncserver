@@ -52,12 +52,15 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 ## Supported RFB behavior
 
-- RFB 3.8 version negotiation
+- RFB 3.3 and 3.8 version negotiation
 - Security type `None`
 - One client at a time
 - 32-bit true-color framebuffer, little-endian BGRA byte order
 - Raw encoding
-- Full-frame `FramebufferUpdate` responses
+- Full responses for non-incremental requests and damage-region rectangles for
+  incremental requests when PipeWire supplies reliable damage metadata
+- Bounded damage history; missed or unavailable damage falls back to a full
+  framebuffer region to preserve correctness
 - Clean handling of client disconnects and partial socket reads/writes
 
 ## Current limitations
@@ -72,15 +75,16 @@ This captures one normalized frame and writes it as a binary PPM file.
 - Keyboard, pointer, and clipboard messages are consumed but ignored.
 - Only Raw encoding is supported. Tight, ZRLE, Hextile, and other encodings
   are not implemented.
-- Updates are full-frame; damage-region and incremental encoding are not
-  implemented yet.
+- Raw is the only pixel encoding; incremental updates still transmit uncompressed
+  pixel rectangles.
 - DMA-BUF capture is disabled. The server uses CPU-mapped memory frames.
 - Non-identity buffer transforms are rejected rather than displayed
   incorrectly.
 - The framebuffer dimensions are fixed at startup. A later display resolution
   change causes the client connection to be closed rather than resized.
-- Portal permission persistence is disabled, so the permission dialog may
-  appear on each run.
+- The server requests application-scoped portal permission persistence. If the
+  backend explicitly rejects persistence, it reports the fallback and retries
+  capture with non-persistent permissions. Other portal errors are not retried.
 - The portal source type is left to the backend default. This is required for
   COSMIC's combined RemoteDesktop session; other portal backends may interpret
   an empty source-type mask differently.
@@ -89,7 +93,8 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 - COSMIC Wayland session on Pop!_OS, with `xdg-desktop-portal-cosmic`,
   PipeWire 1.6.8, and a 1920x1080 output. Capture and a full 1920x1080 Raw
-  framebuffer update were verified with a local RFB protocol client.
+  framebuffer update were verified with a local RFB protocol client. COSMIC
+  rejects application-scoped persistence; the non-persistent fallback works.
 - GNOME, KDE Plasma, Sway, and Hyprland have not been tested yet. A graphical
   VNC client has not been tested yet.
 

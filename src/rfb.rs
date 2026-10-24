@@ -1,13 +1,14 @@
-//! Minimal RFB 3.8 server.
+//! Minimal RFB 3.3/3.8 server.
 //!
 //! This module intentionally depends only on the normalized [`Frame`] type and
 //! the standard library. It currently supports:
 //!
-//! - RFB 3.8 version negotiation
+//! - RFB 3.3 and 3.8 version negotiation
 //! - Security type `None` (unencrypted)
 //! - A single client at a time
 //! - 32-bit true-color pixel format with BGRA byte order
 //! - Raw encoding only
+//! - Incremental update requests with damage-region Raw rectangles
 //!
 //! Keyboard, pointer, and clipboard messages are consumed but not acted upon.
 //! The server does not claim support for encodings or extensions that are not
@@ -20,9 +21,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::framebuffer::{Frame, FrameStore};
+use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
+const SECURITY_TYPE_NONE: u32 = 1;
 const MAX_ENCODINGS: u16 = 1024;
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -30,6 +32,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const INCREMENTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_SLICE: Duration = Duration::from_millis(250);
+const MAX_UPDATE_RECTS: usize = 128;
 
 /// Start the RFB listener thread.
 ///
@@ -114,18 +117,27 @@ fn handle_client(
 
     let mut version = [0u8; 12];
     read_exact_interruptible(&mut stream, &mut version, shutdown)?;
-    parse_client_version(&version)?;
+    let version = parse_client_version(&version)?;
 
-    // Security types: one type, None.
-    write_all_interruptible(&mut stream, &[1, 1], shutdown)?;
-    let security_type = read_u8(&mut stream, shutdown)?;
-    if security_type != 1 {
-        return Err(invalid_data(format!(
-            "client selected unsupported security type {security_type}"
-        )));
+    match version {
+        RfbVersion::V3_3 => {
+            // RFB 3.3 sends a single 32-bit security type. Security type None
+            // has no client selection or SecurityResult message.
+            write_all_interruptible(&mut stream, &SECURITY_TYPE_NONE.to_be_bytes(), shutdown)?;
+        }
+        RfbVersion::V3_8 => {
+            // RFB 3.7+ sends a count and list of supported security types.
+            write_all_interruptible(&mut stream, &[1, SECURITY_TYPE_NONE as u8], shutdown)?;
+            let security_type = read_u8(&mut stream, shutdown)?;
+            if u32::from(security_type) != SECURITY_TYPE_NONE {
+                return Err(invalid_data(format!(
+                    "client selected unsupported security type {security_type}"
+                )));
+            }
+
+            write_all_interruptible(&mut stream, &0u32.to_be_bytes(), shutdown)?;
+        }
     }
-
-    write_all_interruptible(&mut stream, &0u32.to_be_bytes(), shutdown)?;
 
     // ClientInit: shared flag. The initial server supports one client, so the
     // flag does not change behavior.
@@ -135,6 +147,7 @@ fn handle_client(
 
     let mut last_sequence = 0u64;
     let mut input_warned = false;
+    let mut pending_damage = Vec::new();
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -152,6 +165,7 @@ fn handle_client(
                     width,
                     height,
                     &mut last_sequence,
+                    &mut pending_damage,
                     shutdown,
                 )?;
             }
@@ -253,6 +267,7 @@ fn handle_update_request(
     width: u16,
     height: u16,
     last_sequence: &mut u64,
+    pending_damage: &mut Vec<DamageRect>,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let incremental = read_u8(stream, shutdown)? != 0;
@@ -263,37 +278,81 @@ fn handle_update_request(
 
     validate_rectangle(x, y, rectangle_width, rectangle_height, width, height)?;
 
-    let frame = if incremental {
-        wait_for_frame(store, *last_sequence, INCREMENTAL_TIMEOUT, shutdown)?
-    } else {
-        match store.latest() {
-            Some(frame) => Some(frame),
-            None => wait_for_frame(store, 0, INITIAL_FRAME_TIMEOUT, shutdown)?,
-        }
+    let requested = DamageRect {
+        x: u32::from(x),
+        y: u32::from(y),
+        width: u32::from(rectangle_width),
+        height: u32::from(rectangle_height),
     };
 
-    match frame {
-        Some((sequence, frame)) => {
-            if frame.width != u32::from(width) || frame.height != u32::from(height) {
-                return Err(invalid_data(format!(
-                    "captured frame is {}x{}, but the RFB session is {}x{}",
-                    frame.width, frame.height, width, height
-                )));
-            }
+    if !incremental {
+        let changes = match store.changes_since(*last_sequence) {
+            Some(changes) => changes,
+            None => match store.latest() {
+                Some((sequence, frame)) => crate::framebuffer::FrameChanges {
+                    sequence,
+                    frame,
+                    damage: FrameDamage::Regions(Vec::new()),
+                },
+                None => match wait_for_frame(store, 0, INITIAL_FRAME_TIMEOUT, shutdown)? {
+                    Some(changes) => changes,
+                    None => return send_empty_update(stream, shutdown),
+                },
+            },
+        };
+        ensure_frame_dimensions(&changes.frame, width, height)?;
+        accumulate_damage(
+            pending_damage,
+            changes.damage,
+            u32::from(width),
+            u32::from(height),
+        );
+        *last_sequence = changes.sequence;
 
-            send_update(
-                stream,
-                &frame,
-                x,
-                y,
-                rectangle_width,
-                rectangle_height,
-                shutdown,
-            )?;
-            *last_sequence = sequence;
-            Ok(())
+        let updates = vec![requested];
+        send_update(stream, &changes.frame, &updates, shutdown)?;
+        subtract_damage(pending_damage, requested);
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + INCREMENTAL_TIMEOUT;
+    loop {
+        let mut changed_frame = None;
+        if let Some(changes) = store.changes_since(*last_sequence) {
+            ensure_frame_dimensions(&changes.frame, width, height)?;
+            accumulate_damage(
+                pending_damage,
+                changes.damage,
+                u32::from(width),
+                u32::from(height),
+            );
+            *last_sequence = changes.sequence;
+            changed_frame = Some(changes.frame);
         }
-        None => send_empty_update(stream, shutdown),
+
+        let updates = damage_within(pending_damage, requested);
+        if !updates.is_empty() {
+            let updates = bounded_updates(updates, requested);
+            let frame = match changed_frame {
+                Some(frame) => frame,
+                None => store
+                    .latest()
+                    .map(|(_, frame)| frame)
+                    .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
+            };
+            ensure_frame_dimensions(&frame, width, height)?;
+            send_update(stream, &frame, &updates, shutdown)?;
+            subtract_damage(pending_damage, requested);
+            return Ok(());
+        }
+
+        if shutdown.load(Ordering::Acquire) {
+            return Err(shutdown_error());
+        }
+        if Instant::now() >= deadline {
+            return send_empty_update(stream, shutdown);
+        }
+        let _ = store.wait_next(*last_sequence, WAIT_SLICE);
     }
 }
 
@@ -302,7 +361,7 @@ fn wait_for_frame(
     last_sequence: u64,
     timeout: Duration,
     shutdown: &AtomicBool,
-) -> io::Result<Option<(u64, Arc<Frame>)>> {
+) -> io::Result<Option<crate::framebuffer::FrameChanges>> {
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -310,9 +369,11 @@ fn wait_for_frame(
             return Err(shutdown_error());
         }
 
-        if let Some(frame) = store.wait_next(last_sequence, WAIT_SLICE) {
-            return Ok(Some(frame));
+        if let Some(changes) = store.changes_since(last_sequence) {
+            return Ok(Some(changes));
         }
+
+        let _ = store.wait_next(last_sequence, WAIT_SLICE);
 
         if Instant::now() >= deadline {
             return Ok(None);
@@ -320,62 +381,245 @@ fn wait_for_frame(
     }
 }
 
+fn ensure_frame_dimensions(frame: &Frame, width: u16, height: u16) -> io::Result<()> {
+    if frame.width != u32::from(width) || frame.height != u32::from(height) {
+        return Err(invalid_data(format!(
+            "captured frame is {}x{}, but the RFB session is {}x{}",
+            frame.width, frame.height, width, height
+        )));
+    }
+    Ok(())
+}
+
+fn accumulate_damage(
+    pending: &mut Vec<DamageRect>,
+    damage: FrameDamage,
+    frame_width: u32,
+    frame_height: u32,
+) {
+    match damage {
+        FrameDamage::Full => {
+            pending.clear();
+            pending.push(DamageRect {
+                x: 0,
+                y: 0,
+                width: frame_width,
+                height: frame_height,
+            });
+        }
+        FrameDamage::Regions(regions) => {
+            if pending.len().saturating_add(regions.len()) > MAX_UPDATE_RECTS {
+                pending.clear();
+                pending.push(DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: frame_width,
+                    height: frame_height,
+                });
+                return;
+            }
+            pending.extend(regions.into_iter().filter_map(|rect| {
+                intersection(
+                    rect,
+                    DamageRect {
+                        x: 0,
+                        y: 0,
+                        width: frame_width,
+                        height: frame_height,
+                    },
+                )
+            }));
+        }
+    }
+    merge_rectangles(pending);
+}
+
+fn damage_within(pending: &[DamageRect], requested: DamageRect) -> Vec<DamageRect> {
+    let mut updates: Vec<_> = pending
+        .iter()
+        .filter_map(|rect| intersection(*rect, requested))
+        .collect();
+    merge_rectangles(&mut updates);
+    updates
+}
+
+fn bounded_updates(mut updates: Vec<DamageRect>, requested: DamageRect) -> Vec<DamageRect> {
+    if updates.len() > MAX_UPDATE_RECTS {
+        updates.clear();
+        updates.push(requested);
+    }
+    updates
+}
+
+fn subtract_damage(pending: &mut Vec<DamageRect>, served: DamageRect) {
+    let mut remainder = Vec::with_capacity(pending.len().saturating_mul(2));
+    for rect in pending.drain(..) {
+        let Some(overlap) = intersection(rect, served) else {
+            remainder.push(rect);
+            continue;
+        };
+
+        let rect_right = rect.x + rect.width;
+        let rect_bottom = rect.y + rect.height;
+        let overlap_right = overlap.x + overlap.width;
+        let overlap_bottom = overlap.y + overlap.height;
+
+        if overlap.y > rect.y {
+            remainder.push(DamageRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: overlap.y - rect.y,
+            });
+        }
+        if overlap_bottom < rect_bottom {
+            remainder.push(DamageRect {
+                x: rect.x,
+                y: overlap_bottom,
+                width: rect.width,
+                height: rect_bottom - overlap_bottom,
+            });
+        }
+        if overlap.x > rect.x {
+            remainder.push(DamageRect {
+                x: rect.x,
+                y: overlap.y,
+                width: overlap.x - rect.x,
+                height: overlap.height,
+            });
+        }
+        if overlap_right < rect_right {
+            remainder.push(DamageRect {
+                x: overlap_right,
+                y: overlap.y,
+                width: rect_right - overlap_right,
+                height: overlap.height,
+            });
+        }
+    }
+    *pending = remainder;
+    merge_rectangles(pending);
+}
+
+fn intersection(left: DamageRect, right: DamageRect) -> Option<DamageRect> {
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let right_edge = left
+        .x
+        .checked_add(left.width)?
+        .min(right.x.checked_add(right.width)?);
+    let bottom_edge = left
+        .y
+        .checked_add(left.height)?
+        .min(right.y.checked_add(right.height)?);
+    if x >= right_edge || y >= bottom_edge {
+        return None;
+    }
+    Some(DamageRect {
+        x,
+        y,
+        width: right_edge - x,
+        height: bottom_edge - y,
+    })
+}
+
+fn merge_rectangles(rectangles: &mut Vec<DamageRect>) {
+    let mut index = 0;
+    while index < rectangles.len() {
+        let mut other = index + 1;
+        while other < rectangles.len() {
+            if intersection(rectangles[index], rectangles[other]).is_some() {
+                let left = rectangles[index];
+                let right = rectangles.remove(other);
+                let x = left.x.min(right.x);
+                let y = left.y.min(right.y);
+                let right_edge = (left.x + left.width).max(right.x + right.width);
+                let bottom_edge = (left.y + left.height).max(right.y + right.height);
+                rectangles[index] = DamageRect {
+                    x,
+                    y,
+                    width: right_edge - x,
+                    height: bottom_edge - y,
+                };
+                other = index + 1;
+            } else {
+                other += 1;
+            }
+        }
+        index += 1;
+    }
+}
+
 fn send_update(
     stream: &mut TcpStream,
     frame: &Frame,
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
+    rectangles: &[DamageRect],
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
-    let mut header = [0u8; 16];
-    header[0] = 0; // FramebufferUpdate
-    header[1] = 0; // padding
-    header[2..4].copy_from_slice(&1u16.to_be_bytes()); // one rectangle
-    header[4..6].copy_from_slice(&x.to_be_bytes());
-    header[6..8].copy_from_slice(&y.to_be_bytes());
-    header[8..10].copy_from_slice(&width.to_be_bytes());
-    header[10..12].copy_from_slice(&height.to_be_bytes());
-    header[12..16].copy_from_slice(&0i32.to_be_bytes()); // Raw encoding
-
-    write_all_interruptible(stream, &header, shutdown)?;
-
     let frame_width = frame.width as usize;
     let frame_height = frame.height as usize;
-    let x = x as usize;
-    let y = y as usize;
-    let width = width as usize;
-    let height = height as usize;
-
-    let right = x
-        .checked_add(width)
-        .ok_or_else(|| invalid_data("rectangle overflows"))?;
-    let bottom = y
-        .checked_add(height)
-        .ok_or_else(|| invalid_data("rectangle overflows"))?;
-    if right > frame_width || bottom > frame_height {
-        return Err(invalid_data("rectangle is outside the framebuffer"));
+    if rectangles.len() > MAX_UPDATE_RECTS {
+        return Err(invalid_data("too many rectangles in framebuffer update"));
     }
 
-    let row_bytes = width
-        .checked_mul(4)
-        .ok_or_else(|| invalid_data("rectangle is too wide"))?;
+    let mut header = [0u8; 4];
+    header[0] = 0; // FramebufferUpdate
+    header[1] = 0; // padding
+    header[2..4].copy_from_slice(&(rectangles.len() as u16).to_be_bytes());
+    write_all_interruptible(stream, &header, shutdown)?;
 
-    for row in 0..height {
-        let start = (y + row)
-            .checked_mul(frame_width)
-            .and_then(|pixel| pixel.checked_add(x))
-            .and_then(|pixel| pixel.checked_mul(4))
-            .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
-        let end = start
-            .checked_add(row_bytes)
-            .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
-        let pixels = frame
-            .data
-            .get(start..end)
-            .ok_or_else(|| invalid_data("rectangle is outside the framebuffer"))?;
-        write_all_interruptible(stream, pixels, shutdown)?;
+    for rect in rectangles {
+        let right = rect
+            .x
+            .checked_add(rect.width)
+            .ok_or_else(|| invalid_data("rectangle overflows"))?;
+        let bottom = rect
+            .y
+            .checked_add(rect.height)
+            .ok_or_else(|| invalid_data("rectangle overflows"))?;
+        if rect.width == 0
+            || rect.height == 0
+            || right > frame.width
+            || bottom > frame.height
+            || right > frame_width as u32
+            || bottom > frame_height as u32
+        {
+            return Err(invalid_data("rectangle is outside the framebuffer"));
+        }
+
+        let x = u16::try_from(rect.x).map_err(|_| invalid_data("rectangle x exceeds RFB limit"))?;
+        let y = u16::try_from(rect.y).map_err(|_| invalid_data("rectangle y exceeds RFB limit"))?;
+        let width = u16::try_from(rect.width)
+            .map_err(|_| invalid_data("rectangle width exceeds RFB limit"))?;
+        let height = u16::try_from(rect.height)
+            .map_err(|_| invalid_data("rectangle height exceeds RFB limit"))?;
+
+        let mut rectangle_header = [0u8; 12];
+        rectangle_header[0..2].copy_from_slice(&x.to_be_bytes());
+        rectangle_header[2..4].copy_from_slice(&y.to_be_bytes());
+        rectangle_header[4..6].copy_from_slice(&width.to_be_bytes());
+        rectangle_header[6..8].copy_from_slice(&height.to_be_bytes());
+        rectangle_header[8..12].copy_from_slice(&0i32.to_be_bytes()); // Raw encoding
+        write_all_interruptible(stream, &rectangle_header, shutdown)?;
+
+        let row_bytes = (width as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invalid_data("rectangle is too wide"))?;
+        for row in rect.y as usize..bottom as usize {
+            let start = row
+                .checked_mul(frame_width)
+                .and_then(|pixel| pixel.checked_add(rect.x as usize))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
+            let end = start
+                .checked_add(row_bytes)
+                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
+            let pixels = frame
+                .data
+                .get(start..end)
+                .ok_or_else(|| invalid_data("rectangle is outside the framebuffer"))?;
+            write_all_interruptible(stream, pixels, shutdown)?;
+        }
     }
 
     Ok(())
@@ -408,7 +652,13 @@ fn validate_rectangle(
     Ok(())
 }
 
-fn parse_client_version(version: &[u8; 12]) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RfbVersion {
+    V3_3,
+    V3_8,
+}
+
+fn parse_client_version(version: &[u8; 12]) -> io::Result<RfbVersion> {
     if &version[0..4] != b"RFB " || version[11] != b'\n' {
         return Err(invalid_data("malformed RFB version string"));
     }
@@ -418,13 +668,19 @@ fn parse_client_version(version: &[u8; 12]) -> io::Result<()> {
     let minor = parse_version_component(&version[8..11])
         .ok_or_else(|| invalid_data("malformed RFB minor version"))?;
 
-    if major != 3 || minor != 8 {
+    if major != 3 {
         return Err(invalid_data(format!(
-            "unsupported RFB version {major}.{minor}; RFB 3.8 is required"
+            "unsupported RFB version {major}.{minor}"
         )));
     }
 
-    Ok(())
+    match minor {
+        3 => Ok(RfbVersion::V3_3),
+        8 => Ok(RfbVersion::V3_8),
+        _ => Err(invalid_data(format!(
+            "unsupported RFB version {major}.{minor}; supported versions are 3.3 and 3.8"
+        ))),
+    }
 }
 
 fn parse_version_component(bytes: &[u8]) -> Option<u32> {
@@ -719,6 +975,47 @@ mod tests {
         client.read_exact(&mut second_pixels).unwrap();
         assert_eq!(second_pixels, pixels);
 
+        let incremental_request = [3u8, 1, 0, 0, 0, 0, 0, 2, 0, 2];
+        client.write_all(&incremental_request).unwrap();
+        let mut changed_pixels = pixels.clone();
+        changed_pixels[4..8].copy_from_slice(&[21, 22, 23, 255]);
+        let mut changed_frame = Frame::new(2, 2, changed_pixels).unwrap();
+        changed_frame.damage = FrameDamage::Regions(vec![DamageRect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]);
+        store.publish(Arc::new(changed_frame));
+
+        let mut incremental_header = [0u8; 16];
+        client.read_exact(&mut incremental_header).unwrap();
+        assert_eq!(incremental_header[0], 0);
+        assert_eq!(
+            u16::from_be_bytes([incremental_header[2], incremental_header[3]]),
+            1
+        );
+        assert_eq!(
+            u16::from_be_bytes([incremental_header[4], incremental_header[5]]),
+            1
+        );
+        assert_eq!(
+            u16::from_be_bytes([incremental_header[6], incremental_header[7]]),
+            0
+        );
+        assert_eq!(
+            u16::from_be_bytes([incremental_header[8], incremental_header[9]]),
+            1
+        );
+        assert_eq!(
+            u16::from_be_bytes([incremental_header[10], incremental_header[11]]),
+            1
+        );
+        assert_eq!(&incremental_header[12..16], &[0, 0, 0, 0]);
+        let mut incremental_pixels = [0u8; 4];
+        client.read_exact(&mut incremental_pixels).unwrap();
+        assert_eq!(incremental_pixels, [21, 22, 23, 255]);
+
         drop(client);
         server.join().unwrap();
         assert!(!shutdown.load(Ordering::Acquire));
@@ -726,12 +1023,68 @@ mod tests {
 
     #[test]
     fn parses_supported_versions() {
-        assert!(parse_client_version(b"RFB 003.008\n").is_ok());
+        assert_eq!(
+            parse_client_version(b"RFB 003.003\n").unwrap(),
+            RfbVersion::V3_3
+        );
+        assert_eq!(
+            parse_client_version(b"RFB 003.008\n").unwrap(),
+            RfbVersion::V3_8
+        );
         assert!(parse_client_version(b"RFB 003.007\n").is_err());
         assert!(parse_client_version(b"RFB 003.009\n").is_err());
         assert!(parse_client_version(b"RFB 004.000\n").is_err());
         assert!(parse_client_version(b"RFB 003.00x\n").is_err());
         assert!(parse_client_version(b"NOT 003.008\n").is_err());
+    }
+
+    #[test]
+    fn accepts_rfb_33_security_none_handshake() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = FrameStore::new();
+        let store = Arc::new(store);
+        store.publish(Arc::new(Frame::new(2, 2, vec![0; 2 * 2 * 4]).unwrap()));
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_store = Arc::clone(&store);
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            let _ = handle_client(stream, &server_store, 2, 2, "test", &server_shutdown);
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let mut server_version = [0u8; 12];
+        client.read_exact(&mut server_version).unwrap();
+        assert_eq!(&server_version, RFB_VERSION);
+        client.write_all(b"RFB 003.003\n").unwrap();
+
+        let mut security_type = [0u8; 4];
+        client.read_exact(&mut security_type).unwrap();
+        assert_eq!(u32::from_be_bytes(security_type), SECURITY_TYPE_NONE);
+
+        // In RFB 3.3 None security, the next message is ClientInit; there is
+        // no client security selection or SecurityResult.
+        client.write_all(&[1]).unwrap();
+        let mut server_init = [0u8; 24];
+        client.read_exact(&mut server_init).unwrap();
+        assert_eq!(u16::from_be_bytes([server_init[0], server_init[1]]), 2);
+        assert_eq!(u16::from_be_bytes([server_init[2], server_init[3]]), 2);
+        assert_eq!(&server_init[4..20], &server_pixel_format());
+
+        let name_len = u32::from_be_bytes(server_init[20..24].try_into().unwrap()) as usize;
+        let mut name = vec![0u8; name_len];
+        client.read_exact(&mut name).unwrap();
+        assert_eq!(name, b"test");
+
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]
@@ -760,5 +1113,71 @@ mod tests {
         let shutdown = AtomicBool::new(true);
         let error = wait_for_frame(&store, 0, Duration::from_secs(1), &shutdown).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn damage_helpers_clip_merge_and_preserve_unserved_regions() {
+        let mut pending = vec![
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+            },
+            DamageRect {
+                x: 2,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+        ];
+        merge_rectangles(&mut pending);
+        assert_eq!(
+            pending,
+            vec![DamageRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 3,
+            }]
+        );
+
+        let served = DamageRect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 1,
+        };
+        assert_eq!(damage_within(&pending, served), vec![served]);
+        subtract_damage(&mut pending, served);
+        assert_eq!(
+            pending,
+            vec![
+                DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                DamageRect {
+                    x: 0,
+                    y: 2,
+                    width: 4,
+                    height: 1,
+                },
+                DamageRect {
+                    x: 0,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                },
+                DamageRect {
+                    x: 3,
+                    y: 1,
+                    width: 1,
+                    height: 1,
+                },
+            ]
+        );
     }
 }

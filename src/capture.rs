@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use ashpd::desktop::PersistMode;
 use lamco_pipewire::{
     PipeWireThreadCommand, PipeWireThreadManager, PwStreamState, StreamConfig, VideoFrame,
 };
-use lamco_portal::{PortalConfig, PortalManager, PortalSessionHandle};
+use lamco_portal::{PortalConfig, PortalError, PortalManager, PortalSessionHandle};
 use tokio::sync::Notify;
 
 use crate::error::AppError;
@@ -60,24 +61,29 @@ impl CaptureSession {
         // Capture only: request no input devices and no source-type
         // restriction. COSMIC's portal returns no streams when a combined
         // RemoteDesktop session requests Monitor|Window sources, so let the
-        // backend choose its default source type. Persistence is disabled so
-        // the portal asks for permission each time; this also avoids the
-        // portal rejecting a persisted RemoteDesktop session.
-        let portal_config = PortalConfig {
-            allow_multiple: false,
-            source_type: Default::default(),
-            devices: Default::default(),
-            persist_mode: Default::default(),
-            ..PortalConfig::default()
+        // backend choose its default source type.
+        let manager = PortalManager::new(portal_config(PersistMode::Application)).await?;
+        let (manager, (session, restore_token)) = match manager
+            .create_session("rvncserver".to_string(), None)
+            .await
+        {
+            Ok(result) => (manager, result),
+            Err(error) if persistence_is_unsupported(&error) => {
+                eprintln!(
+                    "capture: portal does not support persisted permissions; retrying without persistence"
+                );
+                drop(manager);
+                let manager = PortalManager::new(portal_config(PersistMode::DoNot)).await?;
+                let result = manager
+                    .create_session("rvncserver".to_string(), None)
+                    .await?;
+                (manager, result)
+            }
+            Err(error) => return Err(error.into()),
         };
 
-        let manager = PortalManager::new(portal_config).await?;
-        let (session, restore_token) = manager
-            .create_session("rvncserver".to_string(), None)
-            .await?;
-
         if restore_token.is_some() {
-            eprintln!("capture: portal returned a restore token (not persisted)");
+            eprintln!("capture: portal returned a restore token");
         }
 
         let stream = session.streams().first().ok_or_else(|| {
@@ -240,5 +246,43 @@ impl CaptureSession {
         if let Err(error) = self.pipewire.shutdown() {
             eprintln!("capture: PipeWire shutdown failed: {error}");
         }
+    }
+}
+
+fn portal_config(persist_mode: PersistMode) -> PortalConfig {
+    PortalConfig {
+        allow_multiple: false,
+        source_type: Default::default(),
+        devices: Default::default(),
+        persist_mode,
+        ..PortalConfig::default()
+    }
+}
+
+fn persistence_is_unsupported(error: &PortalError) -> bool {
+    match error {
+        PortalError::SessionCreation(message) => {
+            message.to_ascii_lowercase().contains("cannot persist")
+        }
+        PortalError::PortalRequest(error) => error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("cannot persist"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_falls_back_for_explicit_persistence_rejection() {
+        assert!(persistence_is_unsupported(&PortalError::SessionCreation(
+            "Source selection: InvalidArgument: Remote desktop sessions cannot persist".into()
+        )));
+        assert!(!persistence_is_unsupported(&PortalError::SessionCreation(
+            "User denied permission".into()
+        )));
     }
 }
