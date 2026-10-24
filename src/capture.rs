@@ -22,6 +22,9 @@ use crate::error::AppError;
 use crate::framebuffer::Frame;
 use crate::input::ClientEvent;
 
+const HELD_POINTER_BUTTON_MASK: u8 = 0b0110_0111;
+const WHEEL_BUTTON_MASK: u8 = 0b0001_1000;
+
 /// Capture configuration.
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
@@ -230,6 +233,16 @@ impl CaptureSession {
                         pressed,
                     )
                     .await?;
+                eprintln!(
+                    "input: portal keyboard key {} forwarded",
+                    if pressed { "press" } else { "release" }
+                );
+                if matches!(keysym, 0xffe1..=0xffee) {
+                    eprintln!(
+                        "input: portal modifier keysym {keysym:#x} {}",
+                        if pressed { "pressed" } else { "released" }
+                    );
+                }
             }
             ClientEvent::Pointer { x, y, buttons } => {
                 let stream = self.session.streams.first().ok_or_else(|| {
@@ -266,6 +279,10 @@ impl CaptureSession {
                                 pressed,
                             )
                             .await?;
+                        eprintln!(
+                            "input: portal pointer button {evdev_button:#x} {}",
+                            if pressed { "pressed" } else { "released" }
+                        );
                         if pressed {
                             self.pointer_buttons |= bit;
                         } else {
@@ -284,8 +301,7 @@ impl CaptureSession {
                             .await?;
                     }
                 }
-                self.pointer_buttons =
-                    (self.pointer_buttons & 0b0110_0000) | (buttons & 0b0001_1000);
+                self.pointer_buttons = merge_pointer_button_mask(self.pointer_buttons, buttons);
             }
             ClientEvent::Clipboard(data) => {
                 let clipboard = self.clipboard.as_ref().ok_or_else(|| {
@@ -456,6 +472,10 @@ fn portal_config(persist_mode: PersistMode, enable_input: bool) -> PortalConfig 
     }
 }
 
+fn merge_pointer_button_mask(current: u8, event: u8) -> u8 {
+    (current & HELD_POINTER_BUTTON_MASK) | (event & WHEEL_BUTTON_MASK)
+}
+
 fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
     let mut text = String::with_capacity(data.len());
     for byte in data {
@@ -500,6 +520,18 @@ mod tests {
     fn converts_rfb_latin1_and_portal_utf8_clipboard_text() {
         assert_eq!(latin1_to_utf8(&[b'A', 0xe9]), "Aé".as_bytes());
         assert_eq!(utf8_to_latin1("Aé€".as_bytes()), [b'A', 0xe9, b'?']);
+    }
+
+    #[test]
+    fn pointer_mask_retains_button_state_until_release() {
+        let pressed = merge_pointer_button_mask(0b0000_0001, 0b0000_0001);
+        assert_eq!(pressed & 0b0000_0111, 0b0000_0001);
+
+        let released = merge_pointer_button_mask(0, 0);
+        assert_eq!(released & 0b0000_0111, 0);
+
+        let with_wheel = merge_pointer_button_mask(0b0100_0010, 0b0001_1000);
+        assert_eq!(with_wheel, 0b0101_1010);
     }
 
     #[test]

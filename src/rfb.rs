@@ -46,7 +46,6 @@ const MAX_ENCODINGS: u16 = 1024;
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-const INCREMENTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_SLICE: Duration = Duration::from_millis(250);
 const MAX_UPDATE_RECTS: usize = 128;
@@ -294,6 +293,7 @@ struct ClientUpdateState {
     pixel_format: PixelFormat,
     last_sequence: u64,
     pending_damage: Vec<DamageRect>,
+    pending_update: Option<DamageRect>,
     zrle_compressor: Compress,
     zlib_compressor: Compress,
     client_pixels: Option<Vec<[u8; 4]>>,
@@ -350,7 +350,20 @@ impl PixelFormat {
         let red = scale_channel(bgra[2], self.red_max) << self.red_shift;
         let green = scale_channel(bgra[1], self.green_max) << self.green_shift;
         let blue = scale_channel(bgra[0], self.blue_max) << self.blue_shift;
-        let value = red | green | blue;
+        let mut value = red | green | blue;
+        let used_bits = (u32::from(self.red_max) << self.red_shift)
+            | (u32::from(self.green_max) << self.green_shift)
+            | (u32::from(self.blue_max) << self.blue_shift);
+        if self.bits_per_pixel == 32 && used_bits.count_ones() == 24 {
+            if let Some(padding_shift) = (0..4)
+                .map(|byte| byte * 8)
+                .find(|shift| used_bits & (0xff << shift) == 0)
+            {
+                // Preserve captured alpha in a wholly unused byte. Some
+                // 32-bit clients treat this padding byte as an alpha channel.
+                value |= u32::from(bgra[3]) << padding_shift;
+            }
+        }
         let bytes = if self.big_endian {
             value.to_be_bytes()
         } else {
@@ -410,7 +423,6 @@ impl PixelFormat {
             (self.blue_max, self.blue_shift),
         ];
         let mut used_bits = 0u32;
-        let mut total_depth = 0u32;
         for (maximum, shift) in channels {
             let channel_bits = u16::BITS - maximum.leading_zeros();
             if maximum == 0 || maximum != ((1u32 << channel_bits) - 1) as u16 {
@@ -427,16 +439,14 @@ impl PixelFormat {
                 return Err(invalid_data("true-color channels overlap"));
             }
             used_bits |= mask;
-            total_depth += channel_bits;
         }
-        if total_depth != u32::from(self.depth) {
+        // Some clients report a nominal depth that differs from the number
+        // of channel bits. Channel maxima and shifts define the actual
+        // packed value, so validate the layout rather than rejecting that
+        // metadata mismatch. ZRLE still needs its omitted high byte unused.
+        if self.bits_per_pixel == 32 && self.depth == 24 && used_bits & 0xff00_0000 != 0 {
             return Err(invalid_data(
-                "pixel depth does not match the true-color channel widths",
-            ));
-        }
-        if self.bits_per_pixel == 32 && self.depth == 24 && used_bits != 0x00ff_ffff {
-            return Err(invalid_data(
-                "32bpp/depth-24 formats must use the low 24 bits for color",
+                "32bpp/depth-24 formats must leave the most significant byte unused",
             ));
         }
         Ok(())
@@ -601,11 +611,14 @@ fn handle_client(
         pixel_format: PixelFormat::DEFAULT,
         last_sequence: 0,
         pending_damage: Vec::new(),
+        pending_update: None,
         zrle_compressor: Compress::new(Compression::default(), true),
         zlib_compressor: Compress::new(Compression::default(), true),
         client_pixels: None,
     };
-    let mut input_warned = false;
+    let mut keyboard_input_warned = false;
+    let mut pointer_input_warned = false;
+    let mut received_button_mask = 0u8;
     let mut held_input = if config.input_enabled {
         input_tx.map(ClientInputGuard::new)
     } else {
@@ -617,11 +630,40 @@ fn handle_client(
             return Err(shutdown_error());
         }
 
-        let message_type = read_message_type(&mut stream, shutdown, clipboard_rx)?;
+        if update_state.pending_update.is_some() {
+            service_pending_update(
+                &mut stream,
+                store,
+                config.width,
+                config.height,
+                &mut update_state,
+                shutdown,
+            )?;
+        }
+
+        let Some(message_type) = read_message_type(&mut stream, shutdown, clipboard_rx)? else {
+            continue;
+        };
         match message_type {
             0 => {
                 update_state.pixel_format = handle_set_pixel_format(&mut stream, shutdown)?;
                 update_state.client_pixels = None;
+                eprintln!(
+                    "rfb: client pixel format: {}bpp depth {} {}-endian, RGB max=({},{},{}), shifts=({},{},{})",
+                    update_state.pixel_format.bits_per_pixel,
+                    update_state.pixel_format.depth,
+                    if update_state.pixel_format.big_endian {
+                        "big"
+                    } else {
+                        "little"
+                    },
+                    update_state.pixel_format.red_max,
+                    update_state.pixel_format.green_max,
+                    update_state.pixel_format.blue_max,
+                    update_state.pixel_format.red_shift,
+                    update_state.pixel_format.green_shift,
+                    update_state.pixel_format.blue_shift,
+                );
             }
             2 => {
                 let preferences = handle_set_encodings(&mut stream, shutdown)?;
@@ -630,6 +672,15 @@ fn handle_client(
                     update_state.client_pixels = None;
                 }
                 update_state.copy_rect_enabled = preferences.copy_rect;
+                eprintln!(
+                    "rfb: client encoding preference: {:?}, CopyRect {}",
+                    preferences.preferred,
+                    if preferences.copy_rect {
+                        "enabled"
+                    } else {
+                        "not offered"
+                    },
+                );
             }
             3 => {
                 handle_update_request(
@@ -646,6 +697,18 @@ fn handle_client(
                 let mut padding = [0u8; 2];
                 read_exact_interruptible(&mut stream, &mut padding, shutdown)?;
                 let keysym = read_u32(&mut stream, shutdown)?;
+                // Avoid logging keysyms or typed values, but expose whether
+                // ordinary keys (for example, the C in Ctrl+C) reach RFB.
+                eprintln!(
+                    "rfb: received keyboard key {}",
+                    if down { "pressed" } else { "released" }
+                );
+                if is_modifier_keysym(keysym) {
+                    eprintln!(
+                        "rfb: received modifier keysym {keysym:#x} {}",
+                        if down { "down" } else { "up" }
+                    );
+                }
                 if keysym > i32::MAX as u32 {
                     return Err(invalid_data(format!(
                         "RFB keysym {keysym:#x} exceeds the portal keysym range"
@@ -653,9 +716,9 @@ fn handle_client(
                 }
                 if let Some(held_input) = &mut held_input {
                     held_input.key(keysym, down)?;
-                } else if !input_warned {
+                } else if !keyboard_input_warned {
                     eprintln!("rfb: keyboard input is disabled; event ignored");
-                    input_warned = true;
+                    keyboard_input_warned = true;
                 }
             }
             5 => {
@@ -665,11 +728,17 @@ fn handle_client(
                 let buttons = event[0];
                 let x = u16::from_be_bytes([event[1], event[2]]);
                 let y = u16::from_be_bytes([event[3], event[4]]);
+                if buttons != received_button_mask {
+                    eprintln!(
+                        "rfb: received pointer button mask {received_button_mask:#04x} -> {buttons:#04x}"
+                    );
+                    received_button_mask = buttons;
+                }
                 if let Some(held_input) = &mut held_input {
                     held_input.pointer(x, y, buttons)?;
-                } else if !input_warned {
+                } else if !pointer_input_warned {
                     eprintln!("rfb: pointer input is disabled; event ignored");
-                    input_warned = true;
+                    pointer_input_warned = true;
                 }
             }
             6 => {
@@ -963,6 +1032,12 @@ fn handle_update_request(
         height: u32::from(rectangle_height),
     };
 
+    if state.pending_update.take().is_some() {
+        // A client should normally wait for its outstanding incremental
+        // request, but finish the previous request safely if it pipelines one.
+        send_empty_update(stream, shutdown)?;
+    }
+
     if !incremental {
         let changes = match store.changes_since(state.last_sequence) {
             Some(changes) => changes,
@@ -993,45 +1068,55 @@ fn handle_update_request(
         return Ok(());
     }
 
-    let deadline = Instant::now() + INCREMENTAL_TIMEOUT;
-    loop {
-        let mut changed_frame = None;
-        if let Some(changes) = store.changes_since(state.last_sequence) {
-            ensure_frame_dimensions(&changes.frame, width, height)?;
-            accumulate_damage(
-                &mut state.pending_damage,
-                changes.damage,
-                u32::from(width),
-                u32::from(height),
-            );
-            state.last_sequence = changes.sequence;
-            changed_frame = Some(changes.frame);
-        }
+    state.pending_update = Some(requested);
+    service_pending_update(stream, store, width, height, state, shutdown)
+}
 
-        let updates = damage_within(&state.pending_damage, requested);
-        if !updates.is_empty() {
-            let updates = bounded_updates(updates, requested);
-            let frame = match changed_frame {
-                Some(frame) => frame,
-                None => store
-                    .latest()
-                    .map(|(_, frame)| frame)
-                    .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
-            };
-            ensure_frame_dimensions(&frame, width, height)?;
-            send_update(stream, &frame, &updates, state, shutdown)?;
-            subtract_damage(&mut state.pending_damage, requested);
-            return Ok(());
-        }
+fn service_pending_update(
+    stream: &mut (impl Read + Write),
+    store: &FrameStore,
+    width: u16,
+    height: u16,
+    state: &mut ClientUpdateState,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let requested = match state.pending_update {
+        Some(requested) => requested,
+        None => return Ok(()),
+    };
 
-        if shutdown.load(Ordering::Acquire) {
-            return Err(shutdown_error());
-        }
-        if Instant::now() >= deadline {
-            return send_empty_update(stream, shutdown);
-        }
-        let _ = store.wait_next(state.last_sequence, WAIT_SLICE);
+    let changed_frame = if let Some(changes) = store.changes_since(state.last_sequence) {
+        ensure_frame_dimensions(&changes.frame, width, height)?;
+        accumulate_damage(
+            &mut state.pending_damage,
+            changes.damage,
+            u32::from(width),
+            u32::from(height),
+        );
+        state.last_sequence = changes.sequence;
+        Some(changes.frame)
+    } else {
+        None
+    };
+
+    let updates = damage_within(&state.pending_damage, requested);
+    if updates.is_empty() {
+        return Ok(());
     }
+
+    let updates = bounded_updates(updates, requested);
+    let frame = match changed_frame {
+        Some(frame) => frame,
+        None => store
+            .latest()
+            .map(|(_, frame)| frame)
+            .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
+    };
+    ensure_frame_dimensions(&frame, width, height)?;
+    send_update(stream, &frame, &updates, state, shutdown)?;
+    subtract_damage(&mut state.pending_damage, requested);
+    state.pending_update = None;
+    Ok(())
 }
 
 fn wait_for_frame(
@@ -1486,6 +1571,19 @@ fn find_copy_source(
                 {
                     continue;
                 }
+                let source_right = source_x + rectangle.width;
+                let source_bottom = source_y + rectangle.height;
+                let destination_right = rectangle.x + rectangle.width;
+                let destination_bottom = rectangle.y + rectangle.height;
+                if source_x < destination_right
+                    && source_right > rectangle.x
+                    && source_y < destination_bottom
+                    && source_bottom > rectangle.y
+                {
+                    // Overlapping copies have client-dependent behavior; use
+                    // the negotiated pixel encoding rather than risk a smear.
+                    continue;
+                }
                 tested += 1;
                 if tested > MAX_CANDIDATES {
                     return None;
@@ -1914,6 +2012,16 @@ impl<'a> ClientInputGuard<'a> {
         self.sender
             .blocking_send(ClientEvent::Key { keysym, pressed })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
+        eprintln!(
+            "rfb: keyboard key {} queued for portal",
+            if pressed { "press" } else { "release" }
+        );
+        if is_modifier_keysym(keysym) {
+            eprintln!(
+                "rfb: modifier keysym {keysym:#x} {}",
+                if pressed { "down" } else { "up" }
+            );
+        }
         if pressed {
             self.pressed_keys.insert(keysym);
         } else {
@@ -1923,12 +2031,25 @@ impl<'a> ClientInputGuard<'a> {
     }
 
     fn pointer(&mut self, x: u16, y: u16, buttons: u8) -> io::Result<()> {
+        let previous_buttons = self.pointer.map_or(0, |(_, _, buttons)| buttons);
         self.sender
             .blocking_send(ClientEvent::Pointer { x, y, buttons })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
+        if previous_buttons != buttons {
+            eprintln!("rfb: pointer button mask {previous_buttons:#04x} -> {buttons:#04x}");
+        }
         self.pointer = Some((x, y, buttons));
         Ok(())
     }
+}
+
+fn is_modifier_keysym(keysym: u32) -> bool {
+    matches!(
+        keysym,
+        0xff7e // Mode_switch
+            | 0xff7f // Num_Lock
+            | 0xffe1..=0xffee // Shift, Control, Caps, Meta, Alt, Super, Hyper
+    )
 }
 
 impl Drop for ClientInputGuard<'_> {
@@ -1957,7 +2078,7 @@ fn read_message_type(
     stream: &mut (impl Read + Write),
     shutdown: &AtomicBool,
     clipboard_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-) -> io::Result<u8> {
+) -> io::Result<Option<u8>> {
     loop {
         while let Ok(text) = clipboard_rx.try_recv() {
             send_server_cut_text(stream, &text, shutdown)?;
@@ -1974,14 +2095,14 @@ fn read_message_type(
                     "client disconnected",
                 ));
             }
-            Ok(_) => return Ok(message_type[0]),
+            Ok(_) => return Ok(Some(message_type[0])),
             Err(error)
                 if error.kind() == io::ErrorKind::WouldBlock
-                    || error.kind() == io::ErrorKind::TimedOut
-                    || error.kind() == io::ErrorKind::Interrupted =>
+                    || error.kind() == io::ErrorKind::TimedOut =>
             {
-                continue;
+                return Ok(None);
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
@@ -2219,6 +2340,7 @@ mod tests {
             pixel_format: PixelFormat::DEFAULT,
             last_sequence: 0,
             pending_damage: Vec::new(),
+            pending_update: None,
             zrle_compressor: Compress::new(Compression::default(), true),
             zlib_compressor: Compress::new(Compression::default(), true),
             client_pixels: None,
@@ -2375,6 +2497,46 @@ mod tests {
 
         let incremental_request = [3u8, 1, 0, 0, 0, 0, 0, 2, 0, 2];
         client.write_all(&incremental_request).unwrap();
+
+        // Input must keep flowing while an incremental framebuffer request is
+        // waiting for new damage.
+        client.write_all(&[5, 1, 0, 0, 0, 0]).unwrap(); // left button down
+        client.write_all(&[5, 0, 0, 0, 0, 0]).unwrap(); // left button up
+        client.write_all(&[4, 1, 0, 0, 0, 0, 0xff, 0xe1]).unwrap(); // Shift_L down
+        client.write_all(&[4, 1, 0, 0, 0, 0, 0xff, 0xe3]).unwrap(); // Control_L down
+        client.write_all(&[4, 0, 0, 0, 0, 0, 0xff, 0xe3]).unwrap(); // Control_L up
+        client.write_all(&[4, 0, 0, 0, 0, 0, 0xff, 0xe1]).unwrap(); // Shift_L up
+        for expected in [
+            ClientEvent::Pointer {
+                x: 0,
+                y: 0,
+                buttons: 1,
+            },
+            ClientEvent::Pointer {
+                x: 0,
+                y: 0,
+                buttons: 0,
+            },
+            ClientEvent::Key {
+                keysym: 0xffe1,
+                pressed: true,
+            },
+            ClientEvent::Key {
+                keysym: 0xffe3,
+                pressed: true,
+            },
+            ClientEvent::Key {
+                keysym: 0xffe3,
+                pressed: false,
+            },
+            ClientEvent::Key {
+                keysym: 0xffe1,
+                pressed: false,
+            },
+        ] {
+            assert_eq!(input_rx.blocking_recv(), Some(expected));
+        }
+
         let mut changed_pixels = pixels.clone();
         changed_pixels[4..8].copy_from_slice(&[21, 22, 23, 255]);
         let mut changed_frame = Frame::new(2, 2, changed_pixels).unwrap();
@@ -2660,6 +2822,11 @@ mod tests {
         rgb565[10..13].copy_from_slice(&[11, 5, 0]);
         assert!(PixelFormat::from_wire(&rgb565).is_ok());
 
+        let mut nominal_depth_mismatch = rgb565;
+        nominal_depth_mismatch[0] = 32;
+        nominal_depth_mismatch[1] = 24;
+        assert!(PixelFormat::from_wire(&nominal_depth_mismatch).is_ok());
+
         let mut wrong = server_pixel_format();
         wrong[10] = 0;
         assert!(PixelFormat::from_wire(&wrong).is_err());
@@ -2702,6 +2869,14 @@ mod tests {
             &rgb888_be.encode_zrle(&[255, 128, 0, 255])[..3],
             &[0, 128, 255]
         );
+        assert_eq!(rgb888_be.encode(&[255, 128, 0, 255]), [255, 0, 128, 255]);
+
+        let rgb888_32 = PixelFormat {
+            depth: 32,
+            big_endian: false,
+            ..rgb888_be
+        };
+        assert_eq!(rgb888_32.encode(&[255, 128, 0, 255]), [255, 128, 0, 255]);
 
         let rgb332 = PixelFormat {
             bits_per_pixel: 8,
