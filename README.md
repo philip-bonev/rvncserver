@@ -127,8 +127,9 @@ This captures one normalized frame and writes it as a binary PPM file.
 - Classic VNC Authentication (RFB SecurityType 2), selectable with `--auth vnc`
 - One client at a time
 - 32-bit true-color framebuffer, little-endian BGRA byte order
-- Hextile when offered by the client, with Raw fallback according to the
-  client's encoding preference list
+- ZRLE, Hextile, and Raw when offered by the client, selected according to the
+  client's encoding preference list. ZRLE currently uses valid Raw tiles inside
+  a persistent zlib stream.
 - Keyboard keysym events and pointer motion/buttons/scroll through the
   permission-controlled RemoteDesktop portal when `--enable-input` is set
 - Bidirectional text clipboard transfer through the portal when
@@ -158,8 +159,10 @@ This captures one normalized frame and writes it as a binary PPM file.
 - Input and clipboard forwarding are disabled by default and require explicit
   CLI opt-in and portal permission. Clipboard support is text-only; RFB's
   Latin-1 text is converted to/from UTF-8 for the desktop portal.
-- Tight, ZRLE, and other encodings are not implemented. Hextile sends complex
-  or noisy 16×16 tiles as Raw within the Hextile rectangle.
+- Tight and other encodings are not implemented. ZRLE currently emits Raw
+  tiles, so it provides zlib compression but does not yet use its palette or
+  run-length tile modes. Hextile sends complex or noisy 16×16 tiles as Raw
+  within the Hextile rectangle.
 - DMA-BUF negotiation is requested where available, but direct FD passthrough
   is disabled. Lamco maps and copies supported linear DMA-BUFs into CPU memory;
   non-linear or non-mappable buffers may be skipped or unreadable.

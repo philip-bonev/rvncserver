@@ -8,7 +8,7 @@
 //!   normal server operation
 //! - A single client at a time
 //! - 32-bit true-color pixel format with BGRA byte order
-//! - Raw and Hextile encodings, selected from the client's advertised list
+//! - Raw, Hextile, and ZRLE encodings, selected from the client's advertised list
 //! - Incremental update requests with damage-region Raw rectangles
 //!
 //! Remote input and text clipboard transfer are enabled only when explicitly
@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use flate2::{Compress, Compression, FlushCompress, Status};
 
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
 use crate::input::ClientEvent;
@@ -50,6 +51,7 @@ const MAX_UPDATE_RECTS: usize = 128;
 
 const ENCODING_RAW: i32 = 0;
 const ENCODING_HEXTILE: i32 = 5;
+const ENCODING_ZRLE: i32 = 16;
 
 /// Protocol settings and optional capability gates for an RFB listener.
 pub struct RfbConfig {
@@ -269,6 +271,7 @@ pub fn load_vnc_authentication(password_path: &Path) -> io::Result<Authenticatio
 enum Encoding {
     Raw,
     Hextile,
+    Zrle,
 }
 
 impl Encoding {
@@ -276,15 +279,16 @@ impl Encoding {
         match self {
             Self::Raw => ENCODING_RAW,
             Self::Hextile => ENCODING_HEXTILE,
+            Self::Zrle => ENCODING_ZRLE,
         }
     }
 }
 
-#[derive(Debug)]
 struct ClientUpdateState {
     encoding: Encoding,
     last_sequence: u64,
     pending_damage: Vec<DamageRect>,
+    zrle_compressor: Compress,
 }
 
 /// Start the RFB listener thread.
@@ -439,6 +443,7 @@ fn handle_client(
         encoding: Encoding::Raw,
         last_sequence: 0,
         pending_damage: Vec::new(),
+        zrle_compressor: Compress::new(Compression::default(), true),
     };
     let mut input_warned = false;
     let mut held_input = if config.input_enabled {
@@ -742,12 +747,13 @@ fn select_encoding(encodings: &[u8]) -> io::Result<Encoding> {
         let value = i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]);
         match value {
             ENCODING_HEXTILE => return Ok(Encoding::Hextile),
+            ENCODING_ZRLE => return Ok(Encoding::Zrle),
             ENCODING_RAW => return Ok(Encoding::Raw),
             _ => {}
         }
     }
     Err(invalid_data(
-        "client did not offer a supported encoding (Raw or Hextile)",
+        "client did not offer a supported encoding (Raw, Hextile, or ZRLE)",
     ))
 }
 
@@ -799,7 +805,14 @@ fn handle_update_request(
         state.last_sequence = changes.sequence;
 
         let updates = vec![requested];
-        send_update(stream, &changes.frame, &updates, state.encoding, shutdown)?;
+        send_update(
+            stream,
+            &changes.frame,
+            &updates,
+            state.encoding,
+            &mut state.zrle_compressor,
+            shutdown,
+        )?;
         subtract_damage(&mut state.pending_damage, requested);
         return Ok(());
     }
@@ -830,7 +843,14 @@ fn handle_update_request(
                     .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
             };
             ensure_frame_dimensions(&frame, width, height)?;
-            send_update(stream, &frame, &updates, state.encoding, shutdown)?;
+            send_update(
+                stream,
+                &frame,
+                &updates,
+                state.encoding,
+                &mut state.zrle_compressor,
+                shutdown,
+            )?;
             subtract_damage(&mut state.pending_damage, requested);
             return Ok(());
         }
@@ -1044,6 +1064,7 @@ fn send_update(
     frame: &Frame,
     rectangles: &[DamageRect],
     encoding: Encoding,
+    zrle_compressor: &mut Compress,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
     let frame_width = frame.width as usize;
@@ -1097,6 +1118,11 @@ fn send_update(
             continue;
         }
 
+        if encoding == Encoding::Zrle {
+            send_zrle_rectangle(stream, frame, *rect, zrle_compressor, shutdown)?;
+            continue;
+        }
+
         let row_bytes = (width as usize)
             .checked_mul(4)
             .ok_or_else(|| invalid_data("rectangle is too wide"))?;
@@ -1140,6 +1166,95 @@ fn send_update(
     }
 
     Ok(())
+}
+
+fn send_zrle_rectangle(
+    stream: &mut (impl Read + Write),
+    frame: &Frame,
+    rectangle: DamageRect,
+    compressor: &mut Compress,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let right = rectangle
+        .x
+        .checked_add(rectangle.width)
+        .ok_or_else(|| invalid_data("ZRLE rectangle overflows"))?;
+    let bottom = rectangle
+        .y
+        .checked_add(rectangle.height)
+        .ok_or_else(|| invalid_data("ZRLE rectangle overflows"))?;
+    let tile_count = rectangle
+        .width
+        .div_ceil(64)
+        .checked_mul(rectangle.height.div_ceil(64))
+        .ok_or_else(|| invalid_data("ZRLE tile count overflows"))?;
+    let pixel_count = rectangle
+        .width
+        .checked_mul(rectangle.height)
+        .ok_or_else(|| invalid_data("ZRLE pixel count overflows"))?;
+    let capacity = usize::try_from(pixel_count)
+        .ok()
+        .and_then(|pixels| pixels.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(tile_count as usize))
+        .ok_or_else(|| invalid_data("ZRLE rectangle size overflows"))?;
+    let mut raw = Vec::with_capacity(capacity);
+
+    for tile_y in (rectangle.y..bottom).step_by(64) {
+        let tile_height = (bottom - tile_y).min(64);
+        for tile_x in (rectangle.x..right).step_by(64) {
+            let tile_width = (right - tile_x).min(64);
+            // ZRLE subencoding 0 is Raw. CPIXEL omits the unused high byte
+            // from our 32bpp/depth-24 little-endian true-color pixel format.
+            raw.push(0);
+            for y in tile_y..tile_y + tile_height {
+                for x in tile_x..tile_x + tile_width {
+                    let offset = (y as usize)
+                        .checked_mul(frame.width as usize)
+                        .and_then(|pixel| pixel.checked_add(x as usize))
+                        .and_then(|pixel| pixel.checked_mul(4))
+                        .ok_or_else(|| invalid_data("ZRLE pixel offset overflows"))?;
+                    let pixel = frame
+                        .data
+                        .get(offset..offset + 3)
+                        .ok_or_else(|| invalid_data("ZRLE pixel is outside the framebuffer"))?;
+                    raw.extend_from_slice(pixel);
+                }
+            }
+        }
+    }
+
+    let mut compressed = Vec::new();
+    let mut input_offset = 0;
+    loop {
+        let mut output = [0u8; 8192];
+        let input_before = compressor.total_in();
+        let output_before = compressor.total_out();
+        let status = compressor
+            .compress(&raw[input_offset..], &mut output, FlushCompress::Sync)
+            .map_err(|error| io::Error::other(format!("ZRLE compression failed: {error}")))?;
+        let consumed = usize::try_from(compressor.total_in() - input_before)
+            .map_err(|_| invalid_data("ZRLE compressor input count overflowed"))?;
+        input_offset = input_offset
+            .checked_add(consumed)
+            .ok_or_else(|| invalid_data("ZRLE input offset overflows"))?;
+        let output_offset = usize::try_from(compressor.total_out() - output_before)
+            .map_err(|_| invalid_data("ZRLE compressor output count overflowed"))?;
+        if output_offset > output.len() {
+            return Err(invalid_data("ZRLE compressor exceeded its output buffer"));
+        }
+        compressed.extend_from_slice(&output[..output_offset]);
+        if input_offset == raw.len() && status == Status::Ok {
+            break;
+        }
+        if consumed == 0 && output_offset == 0 {
+            return Err(invalid_data("ZRLE compressor made no progress"));
+        }
+    }
+
+    let compressed_len = u32::try_from(compressed.len())
+        .map_err(|_| invalid_data("compressed ZRLE rectangle exceeds RFB limit"))?;
+    write_all_interruptible(stream, &compressed_len.to_be_bytes(), shutdown)?;
+    write_all_interruptible(stream, &compressed, shutdown)
 }
 
 #[derive(Clone, Copy)]
@@ -2187,10 +2302,65 @@ mod tests {
         assert_eq!(select_encoding(&offered).unwrap(), Encoding::Hextile);
 
         offered.clear();
+        offered.extend_from_slice(&ENCODING_ZRLE.to_be_bytes());
+        offered.extend_from_slice(&hextile);
+        assert_eq!(select_encoding(&offered).unwrap(), Encoding::Zrle);
+
+        offered.clear();
         offered.extend_from_slice(&raw);
         offered.extend_from_slice(&hextile);
         assert_eq!(select_encoding(&offered).unwrap(), Encoding::Raw);
         assert!(select_encoding(&42i32.to_be_bytes()).is_err());
+    }
+
+    #[test]
+    fn zrle_encodes_raw_tiles_in_one_persistent_zlib_stream() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let frame = Frame::new(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255]).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut compressor = Compress::new(Compression::default(), true);
+            let rectangle = DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 1,
+            };
+            send_zrle_rectangle(
+                &mut stream,
+                &frame,
+                rectangle,
+                &mut compressor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            send_zrle_rectangle(
+                &mut stream,
+                &frame,
+                rectangle,
+                &mut compressor,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut decompressor = flate2::Decompress::new(true);
+        for _ in 0..2 {
+            let mut length = [0; 4];
+            client.read_exact(&mut length).unwrap();
+            let mut compressed = vec![0; u32::from_be_bytes(length) as usize];
+            client.read_exact(&mut compressed).unwrap();
+            let mut decoded = [0; 7];
+            let before = decompressor.total_out();
+            decompressor
+                .decompress(&compressed, &mut decoded, flate2::FlushDecompress::Sync)
+                .unwrap();
+            let written = (decompressor.total_out() - before) as usize;
+            assert_eq!(&decoded[..written], &[0, 1, 2, 3, 4, 5, 6]);
+        }
+        server.join().unwrap();
     }
 
     #[test]
@@ -2211,6 +2381,7 @@ mod tests {
                     height: 2,
                 }],
                 Encoding::Hextile,
+                &mut Compress::new(Compression::default(), true),
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -2244,6 +2415,7 @@ mod tests {
                     height: 4,
                 }],
                 Encoding::Hextile,
+                &mut Compress::new(Compression::default(), true),
                 &AtomicBool::new(false),
             )
             .unwrap();
