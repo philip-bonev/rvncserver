@@ -605,6 +605,28 @@ fn send_update(
         let row_bytes = (width as usize)
             .checked_mul(4)
             .ok_or_else(|| invalid_data("rectangle is too wide"))?;
+
+        // A full-width rectangle is contiguous in the normalized framebuffer.
+        // Write it as one slice instead of making one socket write per row.
+        if rect.x == 0 && width as usize == frame_width {
+            let start = (rect.y as usize)
+                .checked_mul(frame_width)
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
+            let byte_len = row_bytes
+                .checked_mul(height as usize)
+                .ok_or_else(|| invalid_data("rectangle size overflows"))?;
+            let end = start
+                .checked_add(byte_len)
+                .ok_or_else(|| invalid_data("rectangle offset overflows"))?;
+            let pixels = frame
+                .data
+                .get(start..end)
+                .ok_or_else(|| invalid_data("rectangle is outside the framebuffer"))?;
+            write_all_interruptible(stream, pixels, shutdown)?;
+            continue;
+        }
+
         for row in rect.y as usize..bottom as usize {
             let start = row
                 .checked_mul(frame_width)
