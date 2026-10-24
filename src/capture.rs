@@ -25,8 +25,8 @@ pub struct CaptureConfig {
     pub framerate: u32,
     /// Number of PipeWire buffers requested.
     pub buffer_count: u32,
-    /// Whether to request DMA-BUF buffers. The initial implementation only
-    /// consumes CPU-mapped memory, so this defaults to `false`.
+    /// Whether to negotiate DMA-BUF buffers. Lamco maps and copies supported
+    /// linear DMA-BUFs into CPU memory; direct FD passthrough remains disabled.
     pub use_dmabuf: bool,
 }
 
@@ -35,7 +35,7 @@ impl Default for CaptureConfig {
         Self {
             framerate: 30,
             buffer_count: 3,
-            use_dmabuf: false,
+            use_dmabuf: true,
         }
     }
 }
@@ -181,8 +181,17 @@ impl CaptureSession {
 
         loop {
             while let Some(video_frame) = self.pipewire.try_recv_frame() {
+                let buffer_type = match video_frame.meta.buffer_type {
+                    1 => "MemPtr",
+                    2 => "MemFd",
+                    3 => "DMA-BUF",
+                    _ => "unknown",
+                };
                 match Frame::from_video_frame(&video_frame) {
-                    Ok(frame) => return Ok(frame),
+                    Ok(frame) => {
+                        eprintln!("capture: first usable PipeWire buffer type: {buffer_type}");
+                        return Ok(frame);
+                    }
                     Err(error) => {
                         if last_error_log.elapsed() >= Duration::from_secs(5) {
                             eprintln!("capture: skipping unusable frame: {error}");
@@ -275,6 +284,12 @@ fn persistence_is_unsupported(error: &PortalError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_to_dmabuf_negotiation_without_fd_passthrough() {
+        assert!(CaptureConfig::default().use_dmabuf);
+        assert!(!StreamConfig::new("test").dmabuf_passthrough);
+    }
 
     #[test]
     fn only_falls_back_for_explicit_persistence_rejection() {

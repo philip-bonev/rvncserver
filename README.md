@@ -77,7 +77,9 @@ This captures one normalized frame and writes it as a binary PPM file.
   are not implemented.
 - Raw is the only pixel encoding; incremental updates still transmit uncompressed
   pixel rectangles.
-- DMA-BUF capture is disabled. The server uses CPU-mapped memory frames.
+- DMA-BUF negotiation is requested where available, but direct FD passthrough
+  is disabled. Lamco maps and copies supported linear DMA-BUFs into CPU memory;
+  non-linear or non-mappable buffers may be skipped or unreadable.
 - Non-identity buffer transforms are rejected rather than displayed
   incorrectly.
 - The framebuffer dimensions are fixed at startup. A later display resolution
