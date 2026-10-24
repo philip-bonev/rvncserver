@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use lamco_pipewire::PwStreamState;
+use tokio::sync::mpsc;
 
 use crate::capture::{CaptureConfig, CaptureSession};
 use crate::cli::Config;
 use crate::error::AppError;
 use crate::framebuffer::{Frame, FrameStore};
+use crate::input::ClientEvent;
 use crate::rfb;
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
@@ -27,8 +29,18 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             "warning: listening on a non-loopback address; VNC traffic is unencrypted and unauthenticated"
         );
     }
+    if config.enable_input || config.enable_clipboard {
+        eprintln!(
+            "warning: RFB has no authentication or encryption; any connected client can use enabled input/clipboard features"
+        );
+    }
 
-    let mut capture = CaptureSession::start(CaptureConfig::default()).await?;
+    let capture_config = CaptureConfig {
+        enable_input: config.enable_input,
+        enable_clipboard: config.enable_clipboard,
+        ..CaptureConfig::default()
+    };
+    let mut capture = CaptureSession::start(capture_config).await?;
 
     eprintln!("capture: waiting for the first frame...");
     let first_frame = capture.wait_for_first_frame(FIRST_FRAME_TIMEOUT).await?;
@@ -51,13 +63,30 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     eprintln!("rfb: listening on {address}");
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    let mut has_remote_events = config.enable_input || config.enable_clipboard;
+    let (client_event_tx, mut client_event_rx) = mpsc::channel::<ClientEvent>(256);
+    let (server_clipboard_tx, server_clipboard_rx) = mpsc::channel::<Vec<u8>>(4);
+    let (mut selection_transfer_rx, mut clipboard_owner_rx) = if config.enable_clipboard {
+        let (transfer, owner) = capture.start_clipboard_listeners().await?;
+        (Some(transfer), Some(owner))
+    } else {
+        (None, None)
+    };
+
     let rfb_thread = rfb::spawn(
         listener,
         Arc::clone(&store),
-        width,
-        height,
-        "rvncserver".to_string(),
+        rfb::RfbConfig {
+            width,
+            height,
+            name: "rvncserver".to_string(),
+            input_enabled: config.enable_input,
+            clipboard_enabled: config.enable_clipboard,
+        },
         Arc::clone(&shutdown),
+        has_remote_events.then_some(client_event_tx),
+        server_clipboard_rx,
     )
     .map_err(|error| AppError::Network(format!("failed to start RFB listener: {error}")))?;
 
@@ -105,6 +134,41 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         tokio::select! {
             _ = notify.notified() => {}
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            event = client_event_rx.recv(), if has_remote_events => {
+                if let Some(event) = event {
+                    if let Err(error) = capture.handle_client_event(event).await {
+                        eprintln!("input: portal rejected client event: {error}");
+                    }
+                } else {
+                    has_remote_events = false;
+                }
+            }
+            transfer = recv_optional(&mut selection_transfer_rx), if config.enable_clipboard => {
+                if let Some(transfer) = transfer {
+                    if let Err(error) = capture.handle_selection_transfer(transfer).await {
+                        eprintln!("clipboard: could not provide remote text: {error}");
+                    }
+                } else {
+                    eprintln!("clipboard: transfer listener ended");
+                    selection_transfer_rx = None;
+                }
+            }
+            owner = recv_optional(&mut clipboard_owner_rx), if config.enable_clipboard => {
+                if let Some(mime_types) = owner {
+                    match capture.read_local_clipboard(&mime_types).await {
+                        Ok(Some(text)) => {
+                            if server_clipboard_tx.try_send(text).is_err() {
+                                eprintln!("clipboard: client update queue is full; dropping update");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("clipboard: could not read local text: {error}"),
+                    }
+                } else {
+                    eprintln!("clipboard: owner-change listener ended");
+                    clipboard_owner_rx = None;
+                }
+            }
             result = &mut ctrl_c => {
                 if let Err(error) = result {
                     eprintln!("server: could not listen for Ctrl+C: {error}");
@@ -123,4 +187,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     capture.shutdown();
     Ok(())
+}
+
+async fn recv_optional<T>(receiver: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }

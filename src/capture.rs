@@ -9,14 +9,18 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use ashpd::desktop::PersistMode;
+use ashpd::desktop::remote_desktop::DeviceType;
 use lamco_pipewire::{
     PipeWireThreadCommand, PipeWireThreadManager, PwStreamState, StreamConfig, VideoFrame,
 };
-use lamco_portal::{PortalConfig, PortalError, PortalManager, PortalSessionHandle};
-use tokio::sync::Notify;
+use lamco_portal::{
+    ClipboardManager, PortalConfig, PortalError, PortalManager, PortalSessionHandle,
+};
+use tokio::sync::{Notify, mpsc as tokio_mpsc};
 
 use crate::error::AppError;
 use crate::framebuffer::Frame;
+use crate::input::ClientEvent;
 
 /// Capture configuration.
 #[derive(Debug, Clone)]
@@ -28,6 +32,10 @@ pub struct CaptureConfig {
     /// Whether to negotiate DMA-BUF buffers. Lamco maps and copies supported
     /// linear DMA-BUFs into CPU memory; direct FD passthrough remains disabled.
     pub use_dmabuf: bool,
+    /// Request keyboard and pointer injection permission from the portal.
+    pub enable_input: bool,
+    /// Request clipboard permission and enable text clipboard forwarding.
+    pub enable_clipboard: bool,
 }
 
 impl Default for CaptureConfig {
@@ -36,6 +44,8 @@ impl Default for CaptureConfig {
             framerate: 30,
             buffer_count: 3,
             use_dmabuf: true,
+            enable_input: false,
+            enable_clipboard: false,
         }
     }
 }
@@ -48,8 +58,11 @@ pub struct CaptureSession {
     // Keep PipeWire first so its Drop runs before the portal session is
     // released.
     pipewire: PipeWireThreadManager,
-    _session: PortalSessionHandle,
-    _manager: PortalManager,
+    session: PortalSessionHandle,
+    manager: PortalManager,
+    clipboard: Option<Arc<ClipboardManager>>,
+    remote_clipboard: Vec<u8>,
+    pointer_buttons: u8,
     stream_id: u32,
     stream_size: (u32, u32),
 }
@@ -58,13 +71,19 @@ impl CaptureSession {
     /// Create a portal session and connect the first advertised screen stream
     /// to a PipeWire stream.
     pub async fn start(config: CaptureConfig) -> Result<Self, AppError> {
-        // Capture only: request no input devices and no source-type
-        // restriction. COSMIC's portal returns no streams when a combined
-        // RemoteDesktop session requests Monitor|Window sources, so let the
-        // backend choose its default source type.
-        let manager = PortalManager::new(portal_config(PersistMode::Application)).await?;
+        // Keep the source-type mask unrestricted. COSMIC's portal returns no
+        // streams when a combined RemoteDesktop session requests Monitor|Window
+        // sources, so let the backend choose its default source type.
+        let clipboard = if config.enable_clipboard {
+            Some(Arc::new(ClipboardManager::new().await?))
+        } else {
+            None
+        };
+        let manager =
+            PortalManager::new(portal_config(PersistMode::Application, config.enable_input))
+                .await?;
         let (manager, (session, restore_token)) = match manager
-            .create_session("rvncserver".to_string(), None)
+            .create_session("rvncserver".to_string(), clipboard.as_deref())
             .await
         {
             Ok(result) => (manager, result),
@@ -73,9 +92,11 @@ impl CaptureSession {
                     "capture: portal does not support persisted permissions; retrying without persistence"
                 );
                 drop(manager);
-                let manager = PortalManager::new(portal_config(PersistMode::DoNot)).await?;
+                let manager =
+                    PortalManager::new(portal_config(PersistMode::DoNot, config.enable_input))
+                        .await?;
                 let result = manager
-                    .create_session("rvncserver".to_string(), None)
+                    .create_session("rvncserver".to_string(), clipboard.as_deref())
                     .await?;
                 (manager, result)
             }
@@ -142,8 +163,11 @@ impl CaptureSession {
 
         Ok(Self {
             pipewire,
-            _session: session,
-            _manager: manager,
+            session,
+            manager,
+            clipboard,
+            remote_clipboard: Vec::new(),
+            pointer_buttons: 0,
             stream_id: 0,
             stream_size,
         })
@@ -167,6 +191,166 @@ impl CaptureSession {
     /// Size reported by the portal for the selected stream.
     pub fn stream_size(&self) -> (u32, u32) {
         self.stream_size
+    }
+
+    /// Start portal clipboard signal listeners for an enabled clipboard session.
+    pub async fn start_clipboard_listeners(
+        &self,
+    ) -> Result<
+        (
+            tokio_mpsc::UnboundedReceiver<lamco_portal::clipboard::SelectionTransferEvent>,
+            tokio_mpsc::UnboundedReceiver<Vec<String>>,
+        ),
+        AppError,
+    > {
+        let clipboard = self
+            .clipboard
+            .as_ref()
+            .ok_or_else(|| AppError::Capture("clipboard support is disabled".to_string()))?;
+        let (transfer_tx, transfer_rx) = tokio_mpsc::unbounded_channel();
+        let (owner_tx, owner_rx) = tokio_mpsc::unbounded_channel();
+        clipboard
+            .start_selection_transfer_listener(transfer_tx)
+            .await?;
+        clipboard.start_owner_changed_listener(owner_tx).await?;
+        Ok((transfer_rx, owner_rx))
+    }
+
+    /// Forward an RFB event through the permission-controlled portal session.
+    pub async fn handle_client_event(&mut self, event: ClientEvent) -> Result<(), AppError> {
+        match event {
+            ClientEvent::Key { keysym, pressed } => {
+                self.manager
+                    .remote_desktop()
+                    .notify_keyboard_keysym(
+                        self.session.ashpd_session(),
+                        i32::try_from(keysym).map_err(|_| {
+                            AppError::Capture(format!("RFB keysym {keysym:#x} is out of range"))
+                        })?,
+                        pressed,
+                    )
+                    .await?;
+            }
+            ClientEvent::Pointer { x, y, buttons } => {
+                let stream = self.session.streams.first().ok_or_else(|| {
+                    AppError::Capture("portal session has no input target stream".to_string())
+                })?;
+                let x = x.min(self.stream_size.0.saturating_sub(1) as u16);
+                let y = y.min(self.stream_size.1.saturating_sub(1) as u16);
+                let old_buttons = self.pointer_buttons;
+                self.manager
+                    .remote_desktop()
+                    .notify_pointer_motion_absolute(
+                        self.session.ashpd_session(),
+                        stream.node_id,
+                        f64::from(x),
+                        f64::from(y),
+                    )
+                    .await?;
+
+                for (rfb_bit, evdev_button) in [
+                    (0, 0x110), // BTN_LEFT
+                    (1, 0x112), // BTN_MIDDLE
+                    (2, 0x111), // BTN_RIGHT
+                    (5, 0x113), // BTN_SIDE
+                    (6, 0x114), // BTN_EXTRA
+                ] {
+                    let bit = 1 << rfb_bit;
+                    if (buttons ^ self.pointer_buttons) & bit != 0 {
+                        let pressed = buttons & bit != 0;
+                        self.manager
+                            .remote_desktop()
+                            .notify_pointer_button(
+                                self.session.ashpd_session(),
+                                evdev_button,
+                                pressed,
+                            )
+                            .await?;
+                        if pressed {
+                            self.pointer_buttons |= bit;
+                        } else {
+                            self.pointer_buttons &= !bit;
+                        }
+                    }
+                }
+
+                // RFB represents wheel ticks as transient button presses.
+                for (rfb_bit, dy) in [(3, -1.0), (4, 1.0)] {
+                    let bit = 1 << rfb_bit;
+                    if buttons & bit != 0 && old_buttons & bit == 0 {
+                        self.manager
+                            .remote_desktop()
+                            .notify_pointer_axis(self.session.ashpd_session(), 0.0, dy)
+                            .await?;
+                    }
+                }
+                self.pointer_buttons =
+                    (self.pointer_buttons & 0b0110_0000) | (buttons & 0b0001_1000);
+            }
+            ClientEvent::Clipboard(data) => {
+                let clipboard = self.clipboard.as_ref().ok_or_else(|| {
+                    AppError::Capture("clipboard support is disabled".to_string())
+                })?;
+                self.remote_clipboard = latin1_to_utf8(&data);
+                clipboard
+                    .announce_rdp_formats(
+                        self.session.ashpd_session(),
+                        vec![
+                            "text/plain;charset=utf-8".to_string(),
+                            "text/plain".to_string(),
+                        ],
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Provide remote-owned text when the local clipboard portal requests it.
+    pub async fn handle_selection_transfer(
+        &self,
+        event: lamco_portal::clipboard::SelectionTransferEvent,
+    ) -> Result<(), AppError> {
+        let clipboard = self
+            .clipboard
+            .as_ref()
+            .ok_or_else(|| AppError::Capture("clipboard support is disabled".to_string()))?;
+        if event.mime_type != "text/plain" && event.mime_type != "text/plain;charset=utf-8" {
+            clipboard
+                .write_selection_data(self.session.ashpd_session(), event.serial, Vec::new())
+                .await?;
+            return Ok(());
+        }
+        clipboard
+            .write_selection_data(
+                self.session.ashpd_session(),
+                event.serial,
+                self.remote_clipboard.clone(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read local text for delivery to the connected RFB client.
+    pub async fn read_local_clipboard(
+        &self,
+        mime_types: &[String],
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let Some(clipboard) = &self.clipboard else {
+            return Ok(None);
+        };
+        let mime_type = ["text/plain;charset=utf-8", "text/plain"]
+            .into_iter()
+            .find(|supported| mime_types.iter().any(|mime| mime == supported));
+        let Some(mime_type) = mime_type else {
+            return Ok(None);
+        };
+        let data = clipboard
+            .read_local_clipboard(self.session.ashpd_session(), mime_type)
+            .await?;
+        let mut text = utf8_to_latin1(&data);
+        text.truncate(1024 * 1024);
+        Ok(Some(text))
     }
 
     /// Wait for the first usable frame, normalizing it before returning.
@@ -258,14 +442,33 @@ impl CaptureSession {
     }
 }
 
-fn portal_config(persist_mode: PersistMode) -> PortalConfig {
+fn portal_config(persist_mode: PersistMode, enable_input: bool) -> PortalConfig {
     PortalConfig {
         allow_multiple: false,
         source_type: Default::default(),
-        devices: Default::default(),
+        devices: if enable_input {
+            DeviceType::Keyboard | DeviceType::Pointer
+        } else {
+            Default::default()
+        },
         persist_mode,
         ..PortalConfig::default()
     }
+}
+
+fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
+    let mut text = String::with_capacity(data.len());
+    for byte in data {
+        text.push(char::from(*byte));
+    }
+    text.into_bytes()
+}
+
+fn utf8_to_latin1(data: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(data)
+        .chars()
+        .map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?'))
+        .collect()
 }
 
 fn persistence_is_unsupported(error: &PortalError) -> bool {
@@ -288,7 +491,15 @@ mod tests {
     #[test]
     fn defaults_to_dmabuf_negotiation_without_fd_passthrough() {
         assert!(CaptureConfig::default().use_dmabuf);
+        assert!(!CaptureConfig::default().enable_input);
+        assert!(!CaptureConfig::default().enable_clipboard);
         assert!(!StreamConfig::new("test").dmabuf_passthrough);
+    }
+
+    #[test]
+    fn converts_rfb_latin1_and_portal_utf8_clipboard_text() {
+        assert_eq!(latin1_to_utf8(&[b'A', 0xe9]), "Aé".as_bytes());
+        assert_eq!(utf8_to_latin1("Aé€".as_bytes()), [b'A', 0xe9, b'?']);
     }
 
     #[test]

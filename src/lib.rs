@@ -13,5 +13,6 @@ pub mod capture;
 pub mod cli;
 pub mod error;
 pub mod framebuffer;
+pub mod input;
 pub mod rfb;
 pub mod server;

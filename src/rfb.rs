@@ -10,10 +10,11 @@
 //! - Raw encoding only
 //! - Incremental update requests with damage-region Raw rectangles
 //!
-//! Keyboard, pointer, and clipboard messages are consumed but not acted upon.
-//! The server does not claim support for encodings or extensions that are not
-//! implemented here.
+//! Remote input and text clipboard transfer are enabled only when explicitly
+//! requested and granted by the XDG Desktop Portal. The server does not claim
+//! support for encodings or extensions that are not implemented here.
 
+use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
+use crate::input::ClientEvent;
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 const SECURITY_TYPE_NONE: u32 = 1;
@@ -34,6 +36,21 @@ const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WAIT_SLICE: Duration = Duration::from_millis(250);
 const MAX_UPDATE_RECTS: usize = 128;
 
+/// Protocol settings and optional capability gates for an RFB listener.
+#[derive(Debug, Clone)]
+pub struct RfbConfig {
+    /// Framebuffer dimensions.
+    pub width: u16,
+    /// Framebuffer height.
+    pub height: u16,
+    /// Name announced during ServerInit.
+    pub name: String,
+    /// Whether keyboard and pointer input are enabled.
+    pub input_enabled: bool,
+    /// Whether clipboard messages are enabled.
+    pub clipboard_enabled: bool,
+}
+
 /// Start the RFB listener thread.
 ///
 /// The listener is put into non-blocking mode so shutdown can be observed
@@ -41,25 +58,25 @@ const MAX_UPDATE_RECTS: usize = 128;
 pub fn spawn(
     listener: TcpListener,
     store: Arc<FrameStore>,
-    width: u16,
-    height: u16,
-    name: String,
+    config: RfbConfig,
     shutdown: Arc<AtomicBool>,
+    input_tx: Option<tokio::sync::mpsc::Sender<ClientEvent>>,
+    clipboard_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
 
     thread::Builder::new()
         .name("rfb-listener".to_string())
-        .spawn(move || run_listener(listener, store, width, height, name, shutdown))
+        .spawn(move || run_listener(listener, store, config, shutdown, input_tx, clipboard_rx))
 }
 
 fn run_listener(
     listener: TcpListener,
     store: Arc<FrameStore>,
-    width: u16,
-    height: u16,
-    name: String,
+    config: RfbConfig,
     shutdown: Arc<AtomicBool>,
+    input_tx: Option<tokio::sync::mpsc::Sender<ClientEvent>>,
+    mut clipboard_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
@@ -75,7 +92,14 @@ fn run_listener(
                 }
 
                 store.client_connected();
-                let result = handle_client(stream, &store, width, height, &name, &shutdown);
+                let result = handle_client(
+                    stream,
+                    &store,
+                    &config,
+                    &shutdown,
+                    input_tx.as_ref(),
+                    &mut clipboard_rx,
+                );
                 store.client_disconnected();
 
                 match result {
@@ -108,10 +132,10 @@ fn configure_stream(stream: &TcpStream) -> io::Result<()> {
 fn handle_client(
     mut stream: TcpStream,
     store: &FrameStore,
-    width: u16,
-    height: u16,
-    name: &str,
+    config: &RfbConfig,
     shutdown: &AtomicBool,
+    input_tx: Option<&tokio::sync::mpsc::Sender<ClientEvent>>,
+    clipboard_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<()> {
     write_all_interruptible(&mut stream, RFB_VERSION, shutdown)?;
 
@@ -143,18 +167,29 @@ fn handle_client(
     // flag does not change behavior.
     let _shared = read_u8(&mut stream, shutdown)?;
 
-    write_server_init(&mut stream, width, height, name, shutdown)?;
+    write_server_init(
+        &mut stream,
+        config.width,
+        config.height,
+        &config.name,
+        shutdown,
+    )?;
 
     let mut last_sequence = 0u64;
     let mut input_warned = false;
     let mut pending_damage = Vec::new();
+    let mut held_input = if config.input_enabled {
+        input_tx.map(ClientInputGuard::new)
+    } else {
+        None
+    };
 
     loop {
         if shutdown.load(Ordering::Acquire) {
             return Err(shutdown_error());
         }
 
-        let message_type = read_u8(&mut stream, shutdown)?;
+        let message_type = read_message_type(&mut stream, shutdown, clipboard_rx)?;
         match message_type {
             0 => handle_set_pixel_format(&mut stream, shutdown)?,
             2 => handle_set_encodings(&mut stream, shutdown)?,
@@ -162,27 +197,41 @@ fn handle_client(
                 handle_update_request(
                     &mut stream,
                     store,
-                    width,
-                    height,
+                    config.width,
+                    config.height,
                     &mut last_sequence,
                     &mut pending_damage,
                     shutdown,
                 )?;
             }
             4 => {
-                let mut event = [0u8; 7];
-                read_exact_interruptible(&mut stream, &mut event, shutdown)?;
-                if !input_warned {
-                    eprintln!("rfb: keyboard input is not supported yet; event ignored");
+                let down = read_u8(&mut stream, shutdown)? != 0;
+                let mut padding = [0u8; 2];
+                read_exact_interruptible(&mut stream, &mut padding, shutdown)?;
+                let keysym = read_u32(&mut stream, shutdown)?;
+                if keysym > i32::MAX as u32 {
+                    return Err(invalid_data(format!(
+                        "RFB keysym {keysym:#x} exceeds the portal keysym range"
+                    )));
+                }
+                if let Some(held_input) = &mut held_input {
+                    held_input.key(keysym, down)?;
+                } else if !input_warned {
+                    eprintln!("rfb: keyboard input is disabled; event ignored");
                     input_warned = true;
                 }
             }
             5 => {
                 // PointerEvent: button-mask (1), padding (2), x (2), y (2).
-                let mut event = [0u8; 7];
+                let mut event = [0u8; 5];
                 read_exact_interruptible(&mut stream, &mut event, shutdown)?;
-                if !input_warned {
-                    eprintln!("rfb: pointer input is not supported yet; event ignored");
+                let buttons = event[0];
+                let x = u16::from_be_bytes([event[1], event[2]]);
+                let y = u16::from_be_bytes([event[3], event[4]]);
+                if let Some(held_input) = &mut held_input {
+                    held_input.pointer(x, y, buttons)?;
+                } else if !input_warned {
+                    eprintln!("rfb: pointer input is disabled; event ignored");
                     input_warned = true;
                 }
             }
@@ -195,7 +244,20 @@ fn handle_client(
                         "client cut text length {length} exceeds the limit"
                     )));
                 }
-                discard_exact(&mut stream, length as usize, shutdown)?;
+                if config.clipboard_enabled {
+                    let input_tx = input_tx.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "clipboard handler unavailable")
+                    })?;
+                    let mut text = vec![0u8; length as usize];
+                    read_exact_interruptible(&mut stream, &mut text, shutdown)?;
+                    input_tx
+                        .blocking_send(ClientEvent::Clipboard(text))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped")
+                        })?;
+                } else {
+                    discard_exact(&mut stream, length as usize, shutdown)?;
+                }
             }
             other => {
                 return Err(invalid_data(format!(
@@ -647,8 +709,114 @@ fn send_update(
     Ok(())
 }
 
+/// Tracks held remote inputs so a client disconnect can release them.
+struct ClientInputGuard<'a> {
+    sender: &'a tokio::sync::mpsc::Sender<ClientEvent>,
+    pressed_keys: HashSet<u32>,
+    pointer: Option<(u16, u16, u8)>,
+}
+
+impl<'a> ClientInputGuard<'a> {
+    fn new(sender: &'a tokio::sync::mpsc::Sender<ClientEvent>) -> Self {
+        Self {
+            sender,
+            pressed_keys: HashSet::new(),
+            pointer: None,
+        }
+    }
+
+    fn key(&mut self, keysym: u32, pressed: bool) -> io::Result<()> {
+        self.sender
+            .blocking_send(ClientEvent::Key { keysym, pressed })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
+        if pressed {
+            self.pressed_keys.insert(keysym);
+        } else {
+            self.pressed_keys.remove(&keysym);
+        }
+        Ok(())
+    }
+
+    fn pointer(&mut self, x: u16, y: u16, buttons: u8) -> io::Result<()> {
+        self.sender
+            .blocking_send(ClientEvent::Pointer { x, y, buttons })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
+        self.pointer = Some((x, y, buttons));
+        Ok(())
+    }
+}
+
+impl Drop for ClientInputGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((x, y, buttons)) = self.pointer {
+            if buttons != 0 {
+                let _ = self
+                    .sender
+                    .try_send(ClientEvent::Pointer { x, y, buttons: 0 });
+            }
+        }
+        for keysym in self.pressed_keys.drain() {
+            let _ = self.sender.try_send(ClientEvent::Key {
+                keysym,
+                pressed: false,
+            });
+        }
+    }
+}
+
 fn send_empty_update(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<()> {
     write_all_interruptible(stream, &[0, 0, 0, 0], shutdown)
+}
+
+fn read_message_type(
+    stream: &mut TcpStream,
+    shutdown: &AtomicBool,
+    clipboard_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> io::Result<u8> {
+    loop {
+        while let Ok(text) = clipboard_rx.try_recv() {
+            send_server_cut_text(stream, &text, shutdown)?;
+        }
+        if shutdown.load(Ordering::Acquire) {
+            return Err(shutdown_error());
+        }
+
+        let mut message_type = [0u8; 1];
+        match stream.read(&mut message_type) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client disconnected",
+                ));
+            }
+            Ok(_) => return Ok(message_type[0]),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn send_server_cut_text(
+    stream: &mut TcpStream,
+    text: &[u8],
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    if text.len() > MAX_CUT_TEXT as usize {
+        return Err(invalid_data("server clipboard text exceeds the size limit"));
+    }
+    let length = u32::try_from(text.len())
+        .map_err(|_| invalid_data("server clipboard text exceeds the RFB limit"))?;
+    let mut header = [0u8; 8];
+    header[0] = 3; // ServerCutText
+    header[4..8].copy_from_slice(&length.to_be_bytes());
+    write_all_interruptible(stream, &header, shutdown)?;
+    write_all_interruptible(stream, text, shutdown)
 }
 
 fn validate_rectangle(
@@ -902,12 +1070,27 @@ mod tests {
         store.publish(Arc::new(Frame::new(2, 2, pixels.clone()).unwrap()));
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(16);
         let server_store = Arc::clone(&store);
         let server_shutdown = Arc::clone(&shutdown);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             configure_stream(&stream).unwrap();
-            let _ = handle_client(stream, &server_store, 2, 2, "test", &server_shutdown);
+            let (_clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel(1);
+            let _ = handle_client(
+                stream,
+                &server_store,
+                &RfbConfig {
+                    width: 2,
+                    height: 2,
+                    name: "test".to_string(),
+                    input_enabled: true,
+                    clipboard_enabled: true,
+                },
+                &server_shutdown,
+                Some(&input_tx),
+                &mut clipboard_rx,
+            );
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -981,7 +1164,32 @@ mod tests {
         assert_eq!(received, pixels);
 
         // A pointer event must be consumed without desynchronizing the stream.
-        client.write_all(&[5, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        client.write_all(&[5, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            input_rx.blocking_recv(),
+            Some(ClientEvent::Pointer {
+                x: 0,
+                y: 0,
+                buttons: 0
+            })
+        );
+        client.write_all(&[4, 1, 0, 0, 0, 0, 0, 0x61]).unwrap();
+        assert_eq!(
+            input_rx.blocking_recv(),
+            Some(ClientEvent::Key {
+                keysym: 0x61,
+                pressed: true
+            })
+        );
+        let text = b"hello";
+        let mut cut_text = vec![6, 0, 0, 0];
+        cut_text.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        cut_text.extend_from_slice(text);
+        client.write_all(&cut_text).unwrap();
+        assert_eq!(
+            input_rx.blocking_recv(),
+            Some(ClientEvent::Clipboard(text.to_vec()))
+        );
 
         let mut second_request = vec![3u8, 0];
         for value in [0u16, 0, 2, 2] {
@@ -1074,7 +1282,21 @@ mod tests {
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             configure_stream(&stream).unwrap();
-            let _ = handle_client(stream, &server_store, 2, 2, "test", &server_shutdown);
+            let (_clipboard_tx, mut clipboard_rx) = tokio::sync::mpsc::channel(1);
+            let _ = handle_client(
+                stream,
+                &server_store,
+                &RfbConfig {
+                    width: 2,
+                    height: 2,
+                    name: "test".to_string(),
+                    input_enabled: false,
+                    clipboard_enabled: false,
+                },
+                &server_shutdown,
+                None,
+                &mut clipboard_rx,
+            );
         });
 
         let mut client = TcpStream::connect(address).unwrap();
@@ -1135,6 +1357,65 @@ mod tests {
         let shutdown = AtomicBool::new(true);
         let error = wait_for_frame(&store, 0, Duration::from_secs(1), &shutdown).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn sends_server_cut_text_message() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            send_server_cut_text(&mut stream, b"hello", &AtomicBool::new(false)).unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut message = [0u8; 13];
+        client.read_exact(&mut message).unwrap();
+        assert_eq!(&message[..4], &[3, 0, 0, 0]);
+        assert_eq!(u32::from_be_bytes(message[4..8].try_into().unwrap()), 5);
+        assert_eq!(&message[8..], b"hello");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn releases_held_remote_inputs_when_client_guard_drops() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        {
+            let mut guard = ClientInputGuard::new(&sender);
+            guard.key(0x61, true).unwrap();
+            guard.pointer(12, 34, 1).unwrap();
+        }
+
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(ClientEvent::Key {
+                keysym: 0x61,
+                pressed: true
+            })
+        );
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(ClientEvent::Pointer {
+                x: 12,
+                y: 34,
+                buttons: 1
+            })
+        );
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(ClientEvent::Pointer {
+                x: 12,
+                y: 34,
+                buttons: 0
+            })
+        );
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(ClientEvent::Key {
+                keysym: 0x61,
+                pressed: false
+            })
+        );
     }
 
     #[test]

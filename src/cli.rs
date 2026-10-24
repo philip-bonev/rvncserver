@@ -26,6 +26,10 @@ pub struct Config {
     /// If set, capture one frame to this PPM path and exit instead of serving
     /// RFB clients.
     pub capture_probe: Option<PathBuf>,
+    /// Request portal permission for remote keyboard and pointer input.
+    pub enable_input: bool,
+    /// Request portal permission for bidirectional clipboard sharing.
+    pub enable_clipboard: bool,
 }
 
 /// Parsed command-line command.
@@ -56,6 +60,8 @@ pub enum CliError {
     DuplicateOption(&'static str),
     /// An argument was not valid UTF-8.
     InvalidUtf8,
+    /// Mutually exclusive or meaningless options were combined.
+    IncompatibleOptions(&'static str),
 }
 
 impl fmt::Display for CliError {
@@ -86,6 +92,7 @@ impl fmt::Display for CliError {
                 write!(f, "{option} was specified more than once")
             }
             Self::InvalidUtf8 => write!(f, "arguments must be valid UTF-8"),
+            Self::IncompatibleOptions(message) => write!(f, "{message}"),
         }
     }
 }
@@ -103,10 +110,14 @@ where
     let mut listen = DEFAULT_LISTEN;
     let mut port = DEFAULT_PORT;
     let mut capture_probe = None;
+    let mut enable_input = false;
+    let mut enable_clipboard = false;
 
     let mut listen_set = false;
     let mut port_set = false;
     let mut capture_probe_set = false;
+    let mut enable_input_set = false;
+    let mut enable_clipboard_set = false;
 
     let mut args = args.into_iter();
     while let Some(raw) = args.next() {
@@ -159,14 +170,42 @@ where
                 let value = take_value(inline_value, &mut args, "--capture-probe")?;
                 capture_probe = Some(PathBuf::from(value));
             }
+            "--enable-input" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if enable_input_set {
+                    return Err(CliError::DuplicateOption("--enable-input"));
+                }
+                enable_input_set = true;
+                enable_input = true;
+            }
+            "--enable-clipboard" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if enable_clipboard_set {
+                    return Err(CliError::DuplicateOption("--enable-clipboard"));
+                }
+                enable_clipboard_set = true;
+                enable_clipboard = true;
+            }
             _ => return Err(CliError::UnknownArgument(raw)),
         }
+    }
+
+    if capture_probe.is_some() && (enable_input || enable_clipboard) {
+        return Err(CliError::IncompatibleOptions(
+            "--enable-input and --enable-clipboard require server mode and cannot be used with --capture-probe",
+        ));
     }
 
     Ok(Command::Run(Config {
         listen,
         port,
         capture_probe,
+        enable_input,
+        enable_clipboard,
     }))
 }
 
@@ -206,11 +245,15 @@ Options:
   --listen <ADDRESS>       IP address to bind (default: 127.0.0.1)
   --port <PORT>            TCP port to bind (default: 5900)
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
+  --enable-input           Request portal permission for keyboard/pointer control
+  --enable-clipboard       Request portal permission for clipboard sharing
   -h, --help               Print this help
   -V, --version            Print the application version
 
 The captured screen source is selected in the desktop portal dialog.
-The default address is loopback only; VNC traffic is not encrypted.
+Input and clipboard are disabled unless explicitly enabled. RFB is
+unauthenticated and unencrypted; connected clients can use enabled capabilities.
+The default address is loopback only.
 In capture-probe mode, --listen and --port are accepted but unused.
 ",
         version = env!("CARGO_PKG_VERSION")
@@ -238,6 +281,8 @@ mod tests {
         assert_eq!(config.listen, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(config.port, 5900);
         assert_eq!(config.capture_probe, None);
+        assert!(!config.enable_input);
+        assert!(!config.enable_clipboard);
     }
 
     #[test]
@@ -260,6 +305,23 @@ mod tests {
         assert_eq!(
             config.capture_probe,
             Some(PathBuf::from("/tmp/capture.ppm"))
+        );
+    }
+
+    #[test]
+    fn parses_input_and_clipboard_flags() {
+        let config = config(&["--enable-input", "--enable-clipboard"]);
+        assert!(config.enable_input);
+        assert!(config.enable_clipboard);
+    }
+
+    #[test]
+    fn rejects_input_options_with_capture_probe() {
+        assert_eq!(
+            parse(&["--capture-probe", "/tmp/frame.ppm", "--enable-input"]),
+            Err(CliError::IncompatibleOptions(
+                "--enable-input and --enable-clipboard require server mode and cannot be used with --capture-probe"
+            ))
         );
     }
 
@@ -352,6 +414,14 @@ mod tests {
                 "/tmp/b.ppm"
             ]),
             Err(CliError::DuplicateOption("--capture-probe"))
+        );
+        assert_eq!(
+            parse(&["--enable-input", "--enable-input"]),
+            Err(CliError::DuplicateOption("--enable-input"))
+        );
+        assert_eq!(
+            parse(&["--enable-clipboard", "--enable-clipboard"]),
+            Err(CliError::DuplicateOption("--enable-clipboard"))
         );
     }
 

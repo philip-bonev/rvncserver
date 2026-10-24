@@ -38,6 +38,17 @@ Defaults:
 ./target/release/rvncserver --listen 127.0.0.1 --port 5900
 ```
 
+Remote input and clipboard sharing are disabled by default. Enable either
+capability explicitly when needed:
+
+```sh
+./target/release/rvncserver --enable-input --enable-clipboard
+```
+
+The desktop portal requests permission for enabled capabilities. RFB is
+unauthenticated and unencrypted, so every connected client can use enabled
+input or clipboard capabilities. Listening beyond loopback is especially risky.
+
 Use `--help` for the complete command-line interface.
 
 ### Capture probe
@@ -57,6 +68,10 @@ This captures one normalized frame and writes it as a binary PPM file.
 - One client at a time
 - 32-bit true-color framebuffer, little-endian BGRA byte order
 - Raw encoding
+- Keyboard keysym events and pointer motion/buttons/scroll through the
+  permission-controlled RemoteDesktop portal when `--enable-input` is set
+- Bidirectional text clipboard transfer through the portal when
+  `--enable-clipboard` is set
 - Full responses for non-incremental requests and damage-region rectangles for
   incremental requests when PipeWire supplies reliable damage metadata
 - Bounded damage history; missed or unavailable damage falls back to a full
@@ -70,9 +85,9 @@ This captures one normalized frame and writes it as a binary PPM file.
 - Only the first stream advertised by the portal is used. Multi-monitor
   selection is not implemented.
 - The cursor is not embedded in the captured image.
-- The portal session is created for capture only; no input devices are
-  requested.
-- Keyboard, pointer, and clipboard messages are consumed but ignored.
+- Input and clipboard forwarding are disabled by default and require explicit
+  CLI opt-in and portal permission. Clipboard support is text-only; RFB's
+  Latin-1 text is converted to/from UTF-8 for the desktop portal.
 - Only Raw encoding is supported. Tight, ZRLE, Hextile, and other encodings
   are not implemented.
 - Raw is the only pixel encoding; incremental updates still transmit uncompressed
