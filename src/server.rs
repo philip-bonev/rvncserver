@@ -20,20 +20,37 @@ const FRAME_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Run the capture and RFB server until Ctrl+C.
 pub async fn run(config: Config) -> Result<(), AppError> {
+    if config.tls_cert.is_none() || config.tls_key.is_none() || config.password_file.is_none() {
+        return Err(AppError::Network(
+            "TLS authentication is required; configure tls_cert, tls_key, and password_file in config.json or pass their CLI options".to_string(),
+        ));
+    }
+
     let address = SocketAddr::new(config.listen, config.port);
     let listener = TcpListener::bind(address)
         .map_err(|error| AppError::Network(format!("failed to bind {address}: {error}")))?;
 
-    if !config.listen.is_loopback() {
-        eprintln!(
-            "warning: listening on a non-loopback address; VNC traffic is unencrypted and unauthenticated"
-        );
-    }
     if config.enable_input || config.enable_clipboard {
-        eprintln!(
-            "warning: RFB has no authentication or encryption; any connected client can use enabled input/clipboard features"
-        );
+        eprintln!("warning: any authenticated client can use enabled input/clipboard features");
     }
+
+    let authentication = match (
+        config.tls_cert.as_deref(),
+        config.tls_key.as_deref(),
+        config.password_file.as_deref(),
+    ) {
+        (Some(certificate), Some(key), Some(password)) => Some(Arc::new(
+            rfb::load_authentication(certificate, key, password).map_err(|error| {
+                AppError::Network(format!("failed to initialize TLS authentication: {error}"))
+            })?,
+        )),
+        (None, None, None) => None,
+        _ => {
+            return Err(AppError::Network(
+                "TLS authentication requires certificate, key, and password file".to_string(),
+            ));
+        }
+    };
 
     let capture_config = CaptureConfig {
         enable_input: config.enable_input,
@@ -83,6 +100,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             name: "rvncserver".to_string(),
             input_enabled: config.enable_input,
             clipboard_enabled: config.enable_clipboard,
+            authentication,
         },
         Arc::clone(&shutdown),
         has_remote_events.then_some(client_event_tx),

@@ -22,12 +22,17 @@ cargo build --release
 
 ## Run
 
+Create the default TLS configuration and credentials described below before
+the first server start. TLS authentication is required; without the TLS
+settings, the server exits.
+
 ```sh
 ./target/release/rvncserver
 ```
 
 On startup the desktop portal asks which screen source to share. The server
-then waits for the first captured frame and listens for a VNC client.
+then waits for the first captured frame and listens for an authenticated VNC
+client.
 
 Defaults:
 
@@ -39,15 +44,58 @@ Defaults:
 ```
 
 Remote input and clipboard sharing are disabled by default. Enable either
-capability explicitly when needed:
+capability explicitly when needed. TLS authentication is required to start the
+server:
 
 ```sh
 ./target/release/rvncserver --enable-input --enable-clipboard
 ```
 
-The desktop portal requests permission for enabled capabilities. RFB is
-unauthenticated and unencrypted, so every connected client can use enabled
-input or clipboard capabilities. Listening beyond loopback is especially risky.
+By default, settings are loaded from `$XDG_CONFIG_HOME/rvncserver/config.json`
+or `~/.config/rvncserver/config.json`. Pass `--config <PATH>` to select another
+file. Command-line options override values from JSON. Paths in the JSON file are
+relative to that file's directory; command-line paths are relative to the
+current directory.
+
+Example configuration:
+
+```json
+{
+  "listen": "127.0.0.1",
+  "port": 5900,
+  "capture_probe": null,
+  "enable_input": false,
+  "enable_clipboard": false,
+  "tls_cert": "server.crt",
+  "tls_key": "server.key",
+  "password_file": "credentials.txt"
+}
+```
+
+Generate a server certificate/key and the owner-only credentials file (replace
+the sample password with a long unique value):
+
+```sh
+mkdir -p ~/.config/rvncserver
+openssl req -x509 -newkey rsa:3072 -nodes -days 365 \
+  -keyout ~/.config/rvncserver/server.key \
+  -out ~/.config/rvncserver/server.crt \
+  -subj '/CN=rvncserver' \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1'
+printf 'rvnc\nreplace-this-with-a-long-unique-password\n' \
+  > ~/.config/rvncserver/credentials.txt
+chmod 600 ~/.config/rvncserver/server.key ~/.config/rvncserver/credentials.txt
+```
+
+Add the generated `server.crt` to the VNC client's trusted certificates. For
+remote access, issue a certificate with the actual DNS name/IP in its subject
+alternative names and keep the private key and credential file private.
+
+TLS uses VeNCrypt `X509Plain`; clients must support that security subtype and
+trust the configured server certificate. The password file must be accessible
+only to its owner (`chmod 600`) and contain the username and password on
+separate lines. The desktop portal requests permission for enabled input and
+clipboard capabilities. Authenticated clients can use any enabled capability.
 
 Use `--help` for the complete command-line interface.
 
@@ -63,8 +111,9 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 ## Supported RFB behavior
 
-- RFB 3.3 and 3.8 version negotiation
-- Security type `None`
+- RFB 3.8 version negotiation for authenticated server sessions
+- VeNCrypt X509Plain (TLS plus username/password authentication; required for
+  normal server startup)
 - One client at a time
 - 32-bit true-color framebuffer, little-endian BGRA byte order
 - Hextile when offered by the client, with Raw fallback according to the
@@ -81,8 +130,13 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 ## Current limitations
 
-- VNC traffic is unencrypted and unauthenticated. The default listener is
-  loopback-only. Do not expose it to an untrusted network.
+- TLS certificate trust must be configured on each VNC client. Protect the
+  private key and credential file; the server rejects either file if it has
+  group/other permission bits set.
+- RFB 3.3 clients are not accepted in authenticated server mode. The old
+  SecurityType None negotiation remains only as an internal protocol-test path.
+- VeNCrypt X509Plain client compatibility varies; use a client that supports
+  this subtype. Authentication attempts are not currently rate-limited.
 - Only the first stream advertised by the portal is used. Multi-monitor
   selection is not implemented.
 - The cursor is not embedded in the captured image.

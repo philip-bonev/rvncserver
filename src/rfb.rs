@@ -4,7 +4,8 @@
 //! the standard library. It currently supports:
 //!
 //! - RFB 3.3 and 3.8 version negotiation
-//! - Security type `None` (unencrypted)
+//! - VeNCrypt X509Plain with TLS and username/password authentication in
+//!   normal server operation
 //! - A single client at a time
 //! - 32-bit true-color pixel format with BGRA byte order
 //! - Raw and Hextile encodings, selected from the client's advertised list
@@ -16,8 +17,12 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::BufReader;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -28,6 +33,8 @@ use crate::input::ClientEvent;
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 const SECURITY_TYPE_NONE: u32 = 1;
+const SECURITY_TYPE_VENCRYPT: u8 = 19;
+const VENCRYPT_SUBTYPE_X509_PLAIN: u32 = 262;
 const MAX_ENCODINGS: u16 = 1024;
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -41,7 +48,6 @@ const ENCODING_RAW: i32 = 0;
 const ENCODING_HEXTILE: i32 = 5;
 
 /// Protocol settings and optional capability gates for an RFB listener.
-#[derive(Debug, Clone)]
 pub struct RfbConfig {
     /// Framebuffer dimensions.
     pub width: u16,
@@ -53,6 +59,148 @@ pub struct RfbConfig {
     pub input_enabled: bool,
     /// Whether clipboard messages are enabled.
     pub clipboard_enabled: bool,
+    /// Optional TLS/VeNCrypt authentication settings.
+    pub authentication: Option<Arc<AuthenticationConfig>>,
+}
+
+/// TLS server identity and VeNCrypt credentials. Secret values are deliberately
+/// not formatted with `Debug`.
+pub struct AuthenticationConfig {
+    tls: Arc<rustls::ServerConfig>,
+    username: Vec<u8>,
+    password: Vec<u8>,
+}
+
+impl Drop for AuthenticationConfig {
+    fn drop(&mut self) {
+        self.username.fill(0);
+        self.password.fill(0);
+    }
+}
+
+enum ClientStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+/// Load a TLS certificate/key pair and a private username/password file.
+pub fn load_authentication(
+    certificate_path: &Path,
+    key_path: &Path,
+    password_path: &Path,
+) -> io::Result<AuthenticationConfig> {
+    let password_file = File::open(password_path)?;
+    let metadata = password_file.metadata()?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "password file must not be accessible by group or other users (chmod 600)",
+        ));
+    }
+
+    let mut certificate_reader = BufReader::new(File::open(certificate_path)?);
+    let certificates =
+        rustls_pemfile::certs(&mut certificate_reader).collect::<Result<Vec<_>, _>>()?;
+    if certificates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS certificate file contains no certificates",
+        ));
+    }
+
+    let key_file = File::open(key_path)?;
+    if key_file.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "TLS private key must not be accessible by group or other users (chmod 600)",
+        ));
+    }
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS key file contains no private key",
+        )
+    })?;
+
+    let mut password_contents = Vec::with_capacity(2050);
+    password_file
+        .take(2051)
+        .read_to_end(&mut password_contents)?;
+    if password_contents.len() > 2050 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "password file exceeds the 2050-byte limit",
+        ));
+    }
+    if password_contents.last() == Some(&b'\n') {
+        password_contents.pop();
+    }
+    if password_contents.last() == Some(&b'\r') {
+        password_contents.pop();
+    }
+    let Some(separator) = password_contents.iter().position(|byte| *byte == b'\n') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "password file must contain username and password on separate lines",
+        ));
+    };
+    let username_end = if password_contents.get(separator.wrapping_sub(1)) == Some(&b'\r') {
+        separator - 1
+    } else {
+        separator
+    };
+    let username = password_contents[..username_end].to_vec();
+    let password = password_contents[separator + 1..].to_vec();
+    password_contents.fill(0);
+    if username.is_empty() || password.is_empty() || username.len() > 1024 || password.len() > 1024
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "username and password must each contain 1 to 1024 bytes",
+        ));
+    }
+
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid TLS identity: {error}"),
+            )
+        })?;
+
+    Ok(AuthenticationConfig {
+        tls: Arc::new(tls),
+        username,
+        password,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,38 +304,131 @@ fn configure_stream(stream: &TcpStream) -> io::Result<()> {
 }
 
 fn handle_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     store: &FrameStore,
     config: &RfbConfig,
     shutdown: &AtomicBool,
     input_tx: Option<&tokio::sync::mpsc::Sender<ClientEvent>>,
     clipboard_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<()> {
-    write_all_interruptible(&mut stream, RFB_VERSION, shutdown)?;
+    let mut tcp_stream = stream;
+    write_all_interruptible(&mut tcp_stream, RFB_VERSION, shutdown)?;
 
     let mut version = [0u8; 12];
-    read_exact_interruptible(&mut stream, &mut version, shutdown)?;
+    read_exact_interruptible(&mut tcp_stream, &mut version, shutdown)?;
     let version = parse_client_version(&version)?;
 
-    match version {
-        RfbVersion::V3_3 => {
-            // RFB 3.3 sends a single 32-bit security type. Security type None
-            // has no client selection or SecurityResult message.
-            write_all_interruptible(&mut stream, &SECURITY_TYPE_NONE.to_be_bytes(), shutdown)?;
+    let mut stream = if let Some(authentication) = &config.authentication {
+        if version != RfbVersion::V3_8 {
+            return Err(invalid_data(
+                "VeNCrypt authentication requires RFB 3.7 or newer",
+            ));
         }
-        RfbVersion::V3_8 => {
-            // RFB 3.7+ sends a count and list of supported security types.
-            write_all_interruptible(&mut stream, &[1, SECURITY_TYPE_NONE as u8], shutdown)?;
-            let security_type = read_u8(&mut stream, shutdown)?;
-            if u32::from(security_type) != SECURITY_TYPE_NONE {
-                return Err(invalid_data(format!(
-                    "client selected unsupported security type {security_type}"
-                )));
-            }
+        write_all_interruptible(&mut tcp_stream, &[1, SECURITY_TYPE_VENCRYPT], shutdown)?;
+        let selected = read_u8(&mut tcp_stream, shutdown)?;
+        if selected != SECURITY_TYPE_VENCRYPT {
+            return Err(invalid_data(
+                "client did not select VeNCrypt authentication",
+            ));
+        }
 
-            write_all_interruptible(&mut stream, &0u32.to_be_bytes(), shutdown)?;
+        // VeNCrypt version negotiation: protocol version 0.2.
+        write_all_interruptible(&mut tcp_stream, &[0, 2], shutdown)?;
+        let mut client_vencrypt_version = [0u8; 2];
+        read_exact_interruptible(&mut tcp_stream, &mut client_vencrypt_version, shutdown)?;
+        if client_vencrypt_version != [0, 2] {
+            return Err(invalid_data(
+                "client selected an unsupported VeNCrypt version",
+            ));
         }
-    }
+        write_all_interruptible(&mut tcp_stream, &[0], shutdown)?; // version accepted
+        write_all_interruptible(&mut tcp_stream, &[1], shutdown)?;
+        write_all_interruptible(
+            &mut tcp_stream,
+            &VENCRYPT_SUBTYPE_X509_PLAIN.to_be_bytes(),
+            shutdown,
+        )?;
+        if read_u32(&mut tcp_stream, shutdown)? != VENCRYPT_SUBTYPE_X509_PLAIN {
+            write_all_interruptible(&mut tcp_stream, &[0], shutdown)?;
+            return Err(invalid_data("client did not select VeNCrypt X509Plain"));
+        }
+        write_all_interruptible(&mut tcp_stream, &[1], shutdown)?; // subtype accepted; begin TLS
+
+        let mut connection = rustls::ServerConnection::new(Arc::clone(&authentication.tls))
+            .map_err(|error| {
+                io::Error::other(format!("could not create TLS connection: {error}"))
+            })?;
+        while connection.is_handshaking() {
+            if shutdown.load(Ordering::Acquire) {
+                return Err(shutdown_error());
+            }
+            if let Err(error) = connection.complete_io(&mut tcp_stream) {
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+        let mut tls_stream =
+            ClientStream::Tls(Box::new(rustls::StreamOwned::new(connection, tcp_stream)));
+        let username_length = read_u32(&mut tls_stream, shutdown)?;
+        let password_length = read_u32(&mut tls_stream, shutdown)?;
+        if username_length > 1024 || password_length > 1024 {
+            return Err(invalid_data(
+                "VeNCrypt username or password exceeds 1024 bytes",
+            ));
+        }
+        let mut username = vec![0; username_length as usize];
+        let mut password = vec![0; password_length as usize];
+        read_exact_interruptible(&mut tls_stream, &mut username, shutdown)?;
+        read_exact_interruptible(&mut tls_stream, &mut password, shutdown)?;
+        let authenticated = constant_time_equal(&username, &authentication.username)
+            & constant_time_equal(&password, &authentication.password);
+        password.fill(0);
+        write_all_interruptible(
+            &mut tls_stream,
+            &u32::from(!authenticated).to_be_bytes(),
+            shutdown,
+        )?;
+        if !authenticated {
+            let reason = b"VeNCrypt credentials rejected";
+            write_all_interruptible(
+                &mut tls_stream,
+                &(reason.len() as u32).to_be_bytes(),
+                shutdown,
+            )?;
+            write_all_interruptible(&mut tls_stream, reason, shutdown)?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "VeNCrypt credentials rejected",
+            ));
+        }
+        tls_stream
+    } else {
+        match version {
+            RfbVersion::V3_3 => {
+                write_all_interruptible(
+                    &mut tcp_stream,
+                    &SECURITY_TYPE_NONE.to_be_bytes(),
+                    shutdown,
+                )?;
+            }
+            RfbVersion::V3_8 => {
+                write_all_interruptible(&mut tcp_stream, &[1, SECURITY_TYPE_NONE as u8], shutdown)?;
+                let security_type = read_u8(&mut tcp_stream, shutdown)?;
+                if u32::from(security_type) != SECURITY_TYPE_NONE {
+                    return Err(invalid_data(format!(
+                        "client selected unsupported security type {security_type}"
+                    )));
+                }
+                write_all_interruptible(&mut tcp_stream, &0u32.to_be_bytes(), shutdown)?;
+            }
+        }
+        ClientStream::Plain(tcp_stream)
+    };
 
     // ClientInit: shared flag. The initial server supports one client, so the
     // flag does not change behavior.
@@ -296,8 +537,19 @@ fn handle_client(
     }
 }
 
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
 fn write_server_init(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     width: u16,
     height: u16,
     name: &str,
@@ -315,7 +567,10 @@ fn write_server_init(
     Ok(())
 }
 
-fn handle_set_pixel_format(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<()> {
+fn handle_set_pixel_format(
+    stream: &mut (impl Read + Write),
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
     let mut padding = [0u8; 3];
     read_exact_interruptible(stream, &mut padding, shutdown)?;
 
@@ -324,7 +579,10 @@ fn handle_set_pixel_format(stream: &mut TcpStream, shutdown: &AtomicBool) -> io:
     validate_client_pixel_format(&format)
 }
 
-fn handle_set_encodings(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<Encoding> {
+fn handle_set_encodings(
+    stream: &mut (impl Read + Write),
+    shutdown: &AtomicBool,
+) -> io::Result<Encoding> {
     let mut padding = [0u8; 1];
     read_exact_interruptible(stream, &mut padding, shutdown)?;
 
@@ -356,7 +614,7 @@ fn select_encoding(encodings: &[u8]) -> io::Result<Encoding> {
 }
 
 fn handle_update_request(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     store: &FrameStore,
     width: u16,
     height: u16,
@@ -644,7 +902,7 @@ fn merge_rectangles(rectangles: &mut Vec<DamageRect>) {
 }
 
 fn send_update(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     frame: &Frame,
     rectangles: &[DamageRect],
     encoding: Encoding,
@@ -756,7 +1014,7 @@ struct HextileSubrect {
 }
 
 fn send_hextile_rectangle(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     frame: &Frame,
     rectangle: DamageRect,
     shutdown: &AtomicBool,
@@ -784,7 +1042,7 @@ fn send_hextile_rectangle(
 }
 
 fn send_hextile_tile(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     frame: &Frame,
     tile_x: u32,
     tile_y: u32,
@@ -918,7 +1176,7 @@ fn send_hextile_tile(
 }
 
 fn send_raw_hextile_tile(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     frame: &Frame,
     tile_x: u32,
     tile_y: u32,
@@ -1017,12 +1275,12 @@ impl Drop for ClientInputGuard<'_> {
     }
 }
 
-fn send_empty_update(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<()> {
+fn send_empty_update(stream: &mut (impl Read + Write), shutdown: &AtomicBool) -> io::Result<()> {
     write_all_interruptible(stream, &[0, 0, 0, 0], shutdown)
 }
 
 fn read_message_type(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     shutdown: &AtomicBool,
     clipboard_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<u8> {
@@ -1056,7 +1314,7 @@ fn read_message_type(
 }
 
 fn send_server_cut_text(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     text: &[u8],
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -1188,26 +1446,26 @@ fn server_pixel_format() -> [u8; 16] {
     ]
 }
 
-fn read_u8(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<u8> {
+fn read_u8(stream: &mut (impl Read + Write), shutdown: &AtomicBool) -> io::Result<u8> {
     let mut byte = [0u8; 1];
     read_exact_interruptible(stream, &mut byte, shutdown)?;
     Ok(byte[0])
 }
 
-fn read_u16(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<u16> {
+fn read_u16(stream: &mut (impl Read + Write), shutdown: &AtomicBool) -> io::Result<u16> {
     let mut bytes = [0u8; 2];
     read_exact_interruptible(stream, &mut bytes, shutdown)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
-fn read_u32(stream: &mut TcpStream, shutdown: &AtomicBool) -> io::Result<u32> {
+fn read_u32(stream: &mut (impl Read + Write), shutdown: &AtomicBool) -> io::Result<u32> {
     let mut bytes = [0u8; 4];
     read_exact_interruptible(stream, &mut bytes, shutdown)?;
     Ok(u32::from_be_bytes(bytes))
 }
 
 fn read_exact_interruptible(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     buffer: &mut [u8],
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -1240,7 +1498,7 @@ fn read_exact_interruptible(
 }
 
 fn write_all_interruptible(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     mut buffer: &[u8],
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -1272,7 +1530,7 @@ fn write_all_interruptible(
 }
 
 fn discard_exact(
-    stream: &mut TcpStream,
+    stream: &mut (impl Read + Write),
     mut remaining: usize,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -1339,6 +1597,7 @@ mod tests {
                     name: "test".to_string(),
                     input_enabled: true,
                     clipboard_enabled: true,
+                    authentication: None,
                 },
                 &server_shutdown,
                 Some(&input_tx),
@@ -1522,6 +1781,13 @@ mod tests {
     }
 
     #[test]
+    fn compares_authentication_values_without_content_early_exit() {
+        assert!(constant_time_equal(b"credential", b"credential"));
+        assert!(!constant_time_equal(b"credential", b"credentiaL"));
+        assert!(!constant_time_equal(b"short", b"longer"));
+    }
+
+    #[test]
     fn accepts_rfb_33_security_none_handshake() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -1545,6 +1811,7 @@ mod tests {
                     name: "test".to_string(),
                     input_enabled: false,
                     clipboard_enabled: false,
+                    authentication: None,
                 },
                 &server_shutdown,
                 None,
