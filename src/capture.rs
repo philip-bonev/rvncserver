@@ -78,7 +78,15 @@ impl CaptureSession {
         // streams when a combined RemoteDesktop session requests Monitor|Window
         // sources, so let the backend choose its default source type.
         let clipboard = if config.enable_clipboard {
-            Some(Arc::new(ClipboardManager::new().await?))
+            match ClipboardManager::new().await {
+                Ok(clipboard) => Some(Arc::new(clipboard)),
+                Err(error) => {
+                    crate::timestamped_log!(
+                        "clipboard: portal clipboard is unavailable; continuing without clipboard sharing: {error}"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -91,7 +99,7 @@ impl CaptureSession {
         {
             Ok(result) => (manager, result),
             Err(error) if persistence_is_unsupported(&error) => {
-                eprintln!(
+                crate::timestamped_log!(
                     "capture: portal does not support persisted permissions; retrying without persistence"
                 );
                 drop(manager);
@@ -107,7 +115,7 @@ impl CaptureSession {
         };
 
         if restore_token.is_some() {
-            eprintln!("capture: portal returned a restore token");
+            crate::timestamped_log!("capture: portal returned a restore token");
         }
 
         let stream = session.streams().first().ok_or_else(|| {
@@ -181,6 +189,11 @@ impl CaptureSession {
         self.pipewire.try_recv_frame()
     }
 
+    /// Whether portal clipboard support initialized successfully.
+    pub fn clipboard_enabled(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
     /// Notification signalled after a frame is queued.
     pub fn frame_notify(&self) -> Arc<Notify> {
         self.pipewire.frame_notify()
@@ -233,12 +246,12 @@ impl CaptureSession {
                         pressed,
                     )
                     .await?;
-                eprintln!(
+                crate::timestamped_log!(
                     "input: portal keyboard key {} forwarded",
                     if pressed { "press" } else { "release" }
                 );
                 if matches!(keysym, 0xffe1..=0xffee) {
-                    eprintln!(
+                    crate::timestamped_log!(
                         "input: portal modifier keysym {keysym:#x} {}",
                         if pressed { "pressed" } else { "released" }
                     );
@@ -279,7 +292,7 @@ impl CaptureSession {
                                 pressed,
                             )
                             .await?;
-                        eprintln!(
+                        crate::timestamped_log!(
                             "input: portal pointer button {evdev_button:#x} {}",
                             if pressed { "pressed" } else { "released" }
                         );
@@ -389,12 +402,14 @@ impl CaptureSession {
                 };
                 match Frame::from_video_frame(&video_frame) {
                     Ok(frame) => {
-                        eprintln!("capture: first usable PipeWire buffer type: {buffer_type}");
+                        crate::timestamped_log!(
+                            "capture: first usable PipeWire buffer type: {buffer_type}"
+                        );
                         return Ok(frame);
                     }
                     Err(error) => {
                         if last_error_log.elapsed() >= Duration::from_secs(5) {
-                            eprintln!("capture: skipping unusable frame: {error}");
+                            crate::timestamped_log!("capture: skipping unusable frame: {error}");
                             last_error_log = std::time::Instant::now();
                         }
                     }
@@ -404,13 +419,16 @@ impl CaptureSession {
             for event in self.pipewire.drain_state_events() {
                 match &event.state {
                     PwStreamState::Error(message) => {
-                        eprintln!(
+                        crate::timestamped_log!(
                             "capture: stream {} reported an error: {message}",
                             event.stream_id
                         );
                     }
                     state => {
-                        eprintln!("capture: stream {} state: {state:?}", event.stream_id);
+                        crate::timestamped_log!(
+                            "capture: stream {} state: {state:?}",
+                            event.stream_id
+                        );
                     }
                 }
             }
@@ -441,19 +459,21 @@ impl CaptureSession {
             Ok(()) => match response_rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    eprintln!("capture: stream destruction failed: {error}");
+                    crate::timestamped_log!("capture: stream destruction failed: {error}");
                 }
                 Err(error) => {
-                    eprintln!("capture: stream destruction did not complete: {error}");
+                    crate::timestamped_log!(
+                        "capture: stream destruction did not complete: {error}"
+                    );
                 }
             },
             Err(error) => {
-                eprintln!("capture: could not request stream destruction: {error}");
+                crate::timestamped_log!("capture: could not request stream destruction: {error}");
             }
         }
 
         if let Err(error) = self.pipewire.shutdown() {
-            eprintln!("capture: PipeWire shutdown failed: {error}");
+            crate::timestamped_log!("capture: PipeWire shutdown failed: {error}");
         }
     }
 }

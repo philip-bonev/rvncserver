@@ -46,12 +46,14 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         .map_err(|error| AppError::Network(format!("failed to bind {address}: {error}")))?;
 
     if config.auth_mode == AuthMode::Vnc {
-        eprintln!(
+        crate::timestamped_log!(
             "warning: classic VNC authentication uses weak DES and does not encrypt session traffic; do not use on untrusted networks"
         );
     }
     if config.enable_input || config.enable_clipboard {
-        eprintln!("warning: any authenticated client can use enabled input/clipboard features");
+        crate::timestamped_log!(
+            "warning: any authenticated client can use enabled input/clipboard features"
+        );
     }
 
     let capture_config = CaptureConfig {
@@ -60,8 +62,9 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         ..CaptureConfig::default()
     };
     let mut capture = CaptureSession::start(capture_config).await?;
+    let clipboard_enabled = config.enable_clipboard && capture.clipboard_enabled();
 
-    eprintln!("capture: waiting for the first frame...");
+    crate::timestamped_log!("capture: waiting for the first frame...");
     let first_frame = capture.wait_for_first_frame(FIRST_FRAME_TIMEOUT).await?;
 
     let width = u16::try_from(first_frame.width).map_err(|_| {
@@ -80,13 +83,13 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let store = Arc::new(FrameStore::new());
     store.publish(Arc::new(first_frame));
 
-    eprintln!("rfb: listening on {address}");
+    crate::timestamped_log!("rfb: listening on {address}");
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    let mut has_remote_events = config.enable_input || config.enable_clipboard;
+    let mut has_remote_events = config.enable_input || clipboard_enabled;
     let (client_event_tx, mut client_event_rx) = mpsc::channel::<ClientEvent>(256);
     let (server_clipboard_tx, server_clipboard_rx) = mpsc::channel::<Vec<u8>>(4);
-    let (mut selection_transfer_rx, mut clipboard_owner_rx) = if config.enable_clipboard {
+    let (mut selection_transfer_rx, mut clipboard_owner_rx) = if clipboard_enabled {
         let (transfer, owner) = capture.start_clipboard_listeners().await?;
         (Some(transfer), Some(owner))
     } else {
@@ -101,7 +104,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             height,
             name: "rvncserver".to_string(),
             input_enabled: config.enable_input,
-            clipboard_enabled: config.enable_clipboard,
+            clipboard_enabled,
+            encodings: config.encodings.clone(),
             authentication: Some(authentication),
         },
         Arc::clone(&shutdown),
@@ -130,7 +134,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
                     let should_log = last_frame_error
                         .is_none_or(|last| last.elapsed() >= FRAME_ERROR_LOG_INTERVAL);
                     if should_log {
-                        eprintln!("capture: skipping unusable frame: {error}");
+                        crate::timestamped_log!("capture: skipping unusable frame: {error}");
                         last_frame_error = Some(Instant::now());
                     }
                 }
@@ -140,13 +144,13 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         for event in capture.drain_state_events() {
             match event.state {
                 PwStreamState::Error(message) => {
-                    eprintln!(
+                    crate::timestamped_log!(
                         "capture: stream {} reported an error: {message}",
                         event.stream_id
                     );
                 }
                 state => {
-                    eprintln!("capture: stream {} state: {state:?}", event.stream_id);
+                    crate::timestamped_log!("capture: stream {} state: {state:?}", event.stream_id);
                 }
             }
         }
@@ -157,52 +161,52 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             event = client_event_rx.recv(), if has_remote_events => {
                 if let Some(event) = event {
                     if let Err(error) = capture.handle_client_event(event).await {
-                        eprintln!("input: portal rejected client event: {error}");
+                        crate::timestamped_log!("input: portal rejected client event: {error}");
                     }
                 } else {
                     has_remote_events = false;
                 }
             }
-            transfer = recv_optional(&mut selection_transfer_rx), if config.enable_clipboard => {
+            transfer = recv_optional(&mut selection_transfer_rx), if clipboard_enabled => {
                 if let Some(transfer) = transfer {
                     if let Err(error) = capture.handle_selection_transfer(transfer).await {
-                        eprintln!("clipboard: could not provide remote text: {error}");
+                        crate::timestamped_log!("clipboard: could not provide remote text: {error}");
                     }
                 } else {
-                    eprintln!("clipboard: transfer listener ended");
+                    crate::timestamped_log!("clipboard: transfer listener ended");
                     selection_transfer_rx = None;
                 }
             }
-            owner = recv_optional(&mut clipboard_owner_rx), if config.enable_clipboard => {
+            owner = recv_optional(&mut clipboard_owner_rx), if clipboard_enabled => {
                 if let Some(mime_types) = owner {
                     match capture.read_local_clipboard(&mime_types).await {
                         Ok(Some(text)) => {
                             if server_clipboard_tx.try_send(text).is_err() {
-                                eprintln!("clipboard: client update queue is full; dropping update");
+                                crate::timestamped_log!("clipboard: client update queue is full; dropping update");
                             }
                         }
                         Ok(None) => {}
-                        Err(error) => eprintln!("clipboard: could not read local text: {error}"),
+                        Err(error) => crate::timestamped_log!("clipboard: could not read local text: {error}"),
                     }
                 } else {
-                    eprintln!("clipboard: owner-change listener ended");
+                    crate::timestamped_log!("clipboard: owner-change listener ended");
                     clipboard_owner_rx = None;
                 }
             }
             result = &mut ctrl_c => {
                 if let Err(error) = result {
-                    eprintln!("server: could not listen for Ctrl+C: {error}");
+                    crate::timestamped_log!("server: could not listen for Ctrl+C: {error}");
                 }
                 break;
             }
         }
     }
 
-    eprintln!("server: shutting down...");
+    crate::timestamped_log!("server: shutting down...");
     shutdown.store(true, Ordering::Release);
 
     if rfb_thread.join().is_err() {
-        eprintln!("rfb: listener thread panicked");
+        crate::timestamped_log!("rfb: listener thread panicked");
     }
 
     capture.shutdown();

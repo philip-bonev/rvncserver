@@ -15,12 +15,12 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(AppError::Cli(error)) => {
-            eprintln!("rvncserver: {error}\n");
+            rvncserver::timestamped_log!("rvncserver: {error}\n");
             eprint!("{}", cli::help_text());
             ExitCode::from(2)
         }
         Err(error) => {
-            eprintln!("rvncserver: {error}");
+            rvncserver::timestamped_log!("rvncserver: {error}");
             ExitCode::FAILURE
         }
     }
@@ -39,10 +39,10 @@ async fn run() -> Result<(), AppError> {
         Command::Run(config) => {
             if let Some(path) = config.capture_probe.clone() {
                 let mut capture = CaptureSession::start(CaptureConfig::default()).await?;
-                eprintln!("capture: waiting for the first frame...");
+                rvncserver::timestamped_log!("capture: waiting for the first frame...");
                 let frame = capture.wait_for_first_frame(CAPTURE_PROBE_TIMEOUT).await?;
                 frame.write_ppm(&path)?;
-                eprintln!(
+                rvncserver::timestamped_log!(
                     "capture: wrote {}x{} frame to {}",
                     frame.width,
                     frame.height,

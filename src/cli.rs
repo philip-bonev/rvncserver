@@ -19,6 +19,29 @@ pub const DEFAULT_LISTEN: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default RFB port.
 pub const DEFAULT_PORT: u16 = 5900;
 
+/// RFB encodings that the server may negotiate with a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RfbEncoding {
+    Raw,
+    Hextile,
+    Zlib,
+    Zrle,
+    CopyRect,
+}
+
+impl RfbEncoding {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "raw" => Some(Self::Raw),
+            "hextile" => Some(Self::Hextile),
+            "zlib" => Some(Self::Zlib),
+            "zrle" => Some(Self::Zrle),
+            "copyrect" => Some(Self::CopyRect),
+            _ => None,
+        }
+    }
+}
+
 /// Supported RFB authentication modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthMode {
@@ -43,6 +66,8 @@ pub struct Config {
     pub enable_input: bool,
     /// Request portal permission for bidirectional clipboard sharing.
     pub enable_clipboard: bool,
+    /// Optional allowlist of framebuffer encodings; Raw must be included.
+    pub encodings: Option<Vec<RfbEncoding>>,
     /// TLS server certificate PEM path.
     pub tls_cert: Option<PathBuf>,
     /// TLS server private-key PEM path.
@@ -131,6 +156,7 @@ struct FileConfig {
     capture_probe: Option<PathBuf>,
     enable_input: Option<bool>,
     enable_clipboard: Option<bool>,
+    encodings: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     password_file: Option<PathBuf>,
@@ -152,6 +178,7 @@ where
     let mut capture_probe = None;
     let mut enable_input = false;
     let mut enable_clipboard = false;
+    let mut encodings = None;
     let mut tls_cert = None;
     let mut tls_key = None;
     let mut password_file = None;
@@ -163,6 +190,7 @@ where
     let mut capture_probe_set = false;
     let mut enable_input_set = false;
     let mut enable_clipboard_set = false;
+    let mut encodings_set = false;
     let mut tls_cert_set = false;
     let mut tls_key_set = false;
     let mut password_file_set = false;
@@ -314,6 +342,17 @@ where
                 enable_clipboard_set = true;
                 enable_clipboard = false;
             }
+            "--encodings" => {
+                if encodings_set {
+                    return Err(CliError::DuplicateOption("--encodings"));
+                }
+                encodings_set = true;
+                encodings = Some(parse_encodings(&take_value(
+                    inline_value,
+                    &mut args,
+                    "--encodings",
+                )?)?);
+            }
             _ => return Err(CliError::UnknownArgument(raw)),
         }
     }
@@ -352,6 +391,12 @@ where
     }
     if !enable_clipboard_set {
         enable_clipboard = file_config.enable_clipboard.unwrap_or(false);
+    }
+    if !encodings_set {
+        encodings = file_config
+            .encodings
+            .map(|values| parse_encodings(&values.join(",")))
+            .transpose()?;
     }
     if !tls_cert_set {
         tls_cert = file_config.tls_cert;
@@ -409,12 +454,39 @@ where
         capture_probe,
         enable_input,
         enable_clipboard,
+        encodings,
         tls_cert,
         tls_key,
         password_file,
         auth_mode,
         config_file: selected_config.filter(|path| path.exists()),
     }))
+}
+
+fn parse_encodings(value: &str) -> Result<Vec<RfbEncoding>, CliError> {
+    if value.is_empty() {
+        return Err(CliError::EmptyValue("--encodings"));
+    }
+    let mut encodings = Vec::new();
+    for item in value.split(',') {
+        let encoding = RfbEncoding::parse(item).ok_or({
+            CliError::IncompatibleOptions(
+                "invalid encoding; expected raw, hextile, zlib, zrle, or copyrect",
+            )
+        })?;
+        if encodings.contains(&encoding) {
+            return Err(CliError::IncompatibleOptions(
+                "encoding list contains a duplicate entry",
+            ));
+        }
+        encodings.push(encoding);
+    }
+    if !encodings.contains(&RfbEncoding::Raw) {
+        return Err(CliError::IncompatibleOptions(
+            "encoding list must include raw as a fallback",
+        ));
+    }
+    Ok(encodings)
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -487,6 +559,7 @@ Options:
   --disable-input          Disable keyboard/pointer control from the config file
   --enable-clipboard       Request portal permission for clipboard sharing
   --disable-clipboard      Disable clipboard sharing from the config file
+  --encodings <LIST>       Allowed encodings, comma-separated (must include raw)
   -h, --help               Print this help
   -V, --version            Print the application version
 
@@ -544,6 +617,7 @@ mod tests {
         assert_eq!(config.capture_probe, None);
         assert!(!config.enable_input);
         assert!(!config.enable_clipboard);
+        assert_eq!(config.encodings, None);
         assert!(config.tls_cert.is_none());
         assert!(config.tls_key.is_none());
         assert!(config.password_file.is_none());
@@ -581,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_encoding_allowlist_and_requires_raw_fallback() {
+        assert_eq!(
+            config(&["--encodings=raw,zrle"]).encodings.unwrap(),
+            [RfbEncoding::Raw, RfbEncoding::Zrle]
+        );
+        assert_eq!(
+            parse(&["--encodings", "zlib"]),
+            Err(CliError::IncompatibleOptions(
+                "encoding list must include raw as a fallback"
+            ))
+        );
+        assert_eq!(
+            parse(&["--encodings", "raw,unknown"]),
+            Err(CliError::IncompatibleOptions(
+                "invalid encoding; expected raw, hextile, zlib, zrle, or copyrect"
+            ))
+        );
+    }
+
+    #[test]
     fn selects_vnc_authentication_mode() {
         let selected = config(&["--auth", "vnc", "--password-file", "/tmp/pass"]);
         assert_eq!(selected.auth_mode, AuthMode::Vnc);
@@ -615,7 +709,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt"}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"]}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -624,6 +718,14 @@ mod tests {
         assert_eq!(loaded.port, 5902);
         assert!(loaded.enable_input);
         assert!(loaded.enable_clipboard);
+        assert_eq!(
+            loaded.encodings,
+            Some(vec![RfbEncoding::Raw, RfbEncoding::Zrle])
+        );
+        assert_eq!(
+            config(&["--config", &path_argument, "--encodings", "raw"]).encodings,
+            Some(vec![RfbEncoding::Raw])
+        );
         assert_eq!(loaded.auth_mode, AuthMode::Vnc);
         assert_eq!(
             loaded.password_file,

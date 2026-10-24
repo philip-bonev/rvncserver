@@ -32,6 +32,7 @@ use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Compress, Compression, FlushCompress, Status};
 
+use crate::cli::RfbEncoding;
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
 use crate::input::ClientEvent;
 
@@ -66,6 +67,8 @@ pub struct RfbConfig {
     pub input_enabled: bool,
     /// Whether clipboard messages are enabled.
     pub clipboard_enabled: bool,
+    /// Optional allowlist; Raw remains a required fallback.
+    pub encodings: Option<Vec<RfbEncoding>>,
     /// Optional TLS/VeNCrypt authentication settings.
     pub authentication: Option<Arc<AuthenticationConfig>>,
 }
@@ -336,11 +339,21 @@ impl PixelFormat {
     }
 
     fn zrle_bytes_per_pixel(self) -> usize {
-        if self.bits_per_pixel == 32 && self.depth == 24 {
+        let used_bits = self.used_component_bits();
+        if self.bits_per_pixel == 32
+            && used_bits.count_ones() <= 24
+            && (used_bits & 0xff00_0000 == 0 || used_bits & 0x0000_00ff == 0)
+        {
             3
         } else {
             self.bytes_per_pixel()
         }
+    }
+
+    fn used_component_bits(self) -> u32 {
+        (u32::from(self.red_max) << self.red_shift)
+            | (u32::from(self.green_max) << self.green_shift)
+            | (u32::from(self.blue_max) << self.blue_shift)
     }
 
     fn encode(self, bgra: &[u8]) -> [u8; 4] {
@@ -381,11 +394,24 @@ impl PixelFormat {
 
     fn encode_zrle(self, bgra: &[u8]) -> [u8; 4] {
         let encoded = self.encode(bgra);
-        if self.zrle_bytes_per_pixel() == 3 && self.big_endian {
-            [encoded[1], encoded[2], encoded[3], 0]
-        } else {
-            encoded
+        if self.zrle_bytes_per_pixel() != 3 {
+            return encoded;
         }
+
+        let high_byte_unused = self.used_component_bits() & 0xff00_0000 == 0;
+        let omitted_byte = match (self.big_endian, high_byte_unused) {
+            (false, true) | (true, false) => 3,
+            (false, false) | (true, true) => 0,
+        };
+        let mut compact = [0; 4];
+        let mut destination = 0;
+        for (index, byte) in encoded[..4].iter().enumerate() {
+            if index != omitted_byte {
+                compact[destination] = *byte;
+                destination += 1;
+            }
+        }
+        compact
     }
 
     fn from_wire(format: &[u8; 16]) -> io::Result<Self> {
@@ -491,9 +517,9 @@ fn run_listener(
                     break;
                 }
 
-                eprintln!("rfb: client connected from {address}");
+                crate::timestamped_log!("rfb: client connected from {address}");
                 if let Err(error) = configure_stream(&stream) {
-                    eprintln!("rfb: could not configure client socket: {error}");
+                    crate::timestamped_log!("rfb: could not configure client socket: {error}");
                     continue;
                 }
 
@@ -509,18 +535,18 @@ fn run_listener(
                 store.client_disconnected();
 
                 match result {
-                    Ok(()) => eprintln!("rfb: client disconnected"),
+                    Ok(()) => crate::timestamped_log!("rfb: client disconnected"),
                     Err(error) if is_normal_disconnect(&error) => {
-                        eprintln!("rfb: client disconnected: {error}");
+                        crate::timestamped_log!("rfb: client disconnected: {error}");
                     }
-                    Err(error) => eprintln!("rfb: client error: {error}"),
+                    Err(error) => crate::timestamped_log!("rfb: client error: {error}"),
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
             Err(error) => {
-                eprintln!("rfb: accept failed: {error}");
+                crate::timestamped_log!("rfb: accept failed: {error}");
                 break;
             }
         }
@@ -648,7 +674,7 @@ fn handle_client(
             0 => {
                 update_state.pixel_format = handle_set_pixel_format(&mut stream, shutdown)?;
                 update_state.client_pixels = None;
-                eprintln!(
+                crate::timestamped_log!(
                     "rfb: client pixel format: {}bpp depth {} {}-endian, RGB max=({},{},{}), shifts=({},{},{})",
                     update_state.pixel_format.bits_per_pixel,
                     update_state.pixel_format.depth,
@@ -666,14 +692,15 @@ fn handle_client(
                 );
             }
             2 => {
-                let preferences = handle_set_encodings(&mut stream, shutdown)?;
+                let preferences =
+                    handle_set_encodings(&mut stream, config.encodings.as_deref(), shutdown)?;
                 update_state.encoding = preferences.preferred;
                 if update_state.copy_rect_enabled != preferences.copy_rect {
                     update_state.client_pixels = None;
                 }
                 update_state.copy_rect_enabled = preferences.copy_rect;
-                eprintln!(
-                    "rfb: client encoding preference: {:?}, CopyRect {}",
+                crate::timestamped_log!(
+                    "rfb: selected framebuffer encoding: {:?}, CopyRect {}",
                     preferences.preferred,
                     if preferences.copy_rect {
                         "enabled"
@@ -699,14 +726,19 @@ fn handle_client(
                 let keysym = read_u32(&mut stream, shutdown)?;
                 // Avoid logging keysyms or typed values, but expose whether
                 // ordinary keys (for example, the C in Ctrl+C) reach RFB.
-                eprintln!(
+                crate::timestamped_log!(
                     "rfb: received keyboard key {}",
                     if down { "pressed" } else { "released" }
                 );
                 if is_modifier_keysym(keysym) {
-                    eprintln!(
+                    crate::timestamped_log!(
                         "rfb: received modifier keysym {keysym:#x} {}",
                         if down { "down" } else { "up" }
+                    );
+                }
+                if down && is_ascii_control_keysym(keysym) {
+                    crate::timestamped_log!(
+                        "rfb: received an ASCII control-character keysym (value redacted)"
                     );
                 }
                 if keysym > i32::MAX as u32 {
@@ -717,7 +749,7 @@ fn handle_client(
                 if let Some(held_input) = &mut held_input {
                     held_input.key(keysym, down)?;
                 } else if !keyboard_input_warned {
-                    eprintln!("rfb: keyboard input is disabled; event ignored");
+                    crate::timestamped_log!("rfb: keyboard input is disabled; event ignored");
                     keyboard_input_warned = true;
                 }
             }
@@ -729,7 +761,7 @@ fn handle_client(
                 let x = u16::from_be_bytes([event[1], event[2]]);
                 let y = u16::from_be_bytes([event[3], event[4]]);
                 if buttons != received_button_mask {
-                    eprintln!(
+                    crate::timestamped_log!(
                         "rfb: received pointer button mask {received_button_mask:#04x} -> {buttons:#04x}"
                     );
                     received_button_mask = buttons;
@@ -737,7 +769,7 @@ fn handle_client(
                 if let Some(held_input) = &mut held_input {
                     held_input.pointer(x, y, buttons)?;
                 } else if !pointer_input_warned {
-                    eprintln!("rfb: pointer input is disabled; event ignored");
+                    crate::timestamped_log!("rfb: pointer input is disabled; event ignored");
                     pointer_input_warned = true;
                 }
             }
@@ -963,6 +995,7 @@ fn handle_set_pixel_format(
 
 fn handle_set_encodings(
     stream: &mut (impl Read + Write),
+    allowed: Option<&[RfbEncoding]>,
     shutdown: &AtomicBool,
 ) -> io::Result<EncodingPreferences> {
     let mut padding = [0u8; 1];
@@ -978,17 +1011,26 @@ fn handle_set_encodings(
     let mut encodings = vec![0u8; count as usize * 4];
     read_exact_interruptible(stream, &mut encodings, shutdown)?;
 
-    select_encodings(&encodings)
+    select_encodings_with_allowlist(&encodings, allowed)
 }
 
+#[cfg(test)]
 fn select_encodings(encodings: &[u8]) -> io::Result<EncodingPreferences> {
+    select_encodings_with_allowlist(encodings, None)
+}
+
+fn select_encodings_with_allowlist(
+    encodings: &[u8],
+    allowed: Option<&[RfbEncoding]>,
+) -> io::Result<EncodingPreferences> {
     let mut preferred = None;
     let mut copy_rect = false;
     for encoding in encodings.chunks_exact(4) {
         let value = i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]);
         let candidate = match value {
             ENCODING_COPY_RECT => {
-                copy_rect = true;
+                copy_rect =
+                    allowed.is_none_or(|encodings| encodings.contains(&RfbEncoding::CopyRect));
                 None
             }
             ENCODING_HEXTILE => Some(Encoding::Hextile),
@@ -997,11 +1039,31 @@ fn select_encodings(encodings: &[u8]) -> io::Result<EncodingPreferences> {
             ENCODING_RAW => Some(Encoding::Raw),
             _ => None,
         };
-        if preferred.is_none() {
+        let candidate_allowed = match candidate {
+            Some(Encoding::Raw) => {
+                allowed.is_none_or(|encodings| encodings.contains(&RfbEncoding::Raw))
+            }
+            Some(Encoding::Hextile) => {
+                allowed.is_none_or(|encodings| encodings.contains(&RfbEncoding::Hextile))
+            }
+            Some(Encoding::Zlib) => {
+                allowed.is_none_or(|encodings| encodings.contains(&RfbEncoding::Zlib))
+            }
+            Some(Encoding::Zrle) => {
+                allowed.is_none_or(|encodings| encodings.contains(&RfbEncoding::Zrle))
+            }
+            None => false,
+        };
+        if preferred.is_none() && candidate_allowed {
             preferred = candidate;
         }
     }
     preferred
+        .or_else(|| {
+            allowed
+                .is_some_and(|encodings| encodings.contains(&RfbEncoding::Raw))
+                .then_some(Encoding::Raw)
+        })
         .map(|preferred| EncodingPreferences {
             preferred,
             copy_rect,
@@ -1667,10 +1729,21 @@ fn send_zlib_rectangle(
 }
 
 fn compress_sync(compressor: &mut Compress, input: &[u8]) -> io::Result<Vec<u8>> {
+    compress_sync_with_buffer_size(compressor, input, 8192)
+}
+
+fn compress_sync_with_buffer_size(
+    compressor: &mut Compress,
+    input: &[u8],
+    buffer_size: usize,
+) -> io::Result<Vec<u8>> {
+    if buffer_size == 0 {
+        return Err(invalid_data("zlib output buffer cannot be empty"));
+    }
     let mut compressed = Vec::new();
     let mut input_offset = 0;
     loop {
-        let mut output = [0u8; 8192];
+        let mut output = vec![0u8; buffer_size];
         let input_before = compressor.total_in();
         let output_before = compressor.total_out();
         let status = compressor
@@ -1690,7 +1763,7 @@ fn compress_sync(compressor: &mut Compress, input: &[u8]) -> io::Result<Vec<u8>>
             io::Error::other(format!("could not allocate compressed rectangle: {error}"))
         })?;
         compressed.extend_from_slice(&output[..produced]);
-        if input_offset == input.len() && status == Status::Ok {
+        if input_offset == input.len() && status == Status::Ok && produced < output.len() {
             return Ok(compressed);
         }
         if consumed == 0 && produced == 0 {
@@ -2012,14 +2085,19 @@ impl<'a> ClientInputGuard<'a> {
         self.sender
             .blocking_send(ClientEvent::Key { keysym, pressed })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
-        eprintln!(
+        crate::timestamped_log!(
             "rfb: keyboard key {} queued for portal",
             if pressed { "press" } else { "release" }
         );
         if is_modifier_keysym(keysym) {
-            eprintln!(
+            crate::timestamped_log!(
                 "rfb: modifier keysym {keysym:#x} {}",
                 if pressed { "down" } else { "up" }
+            );
+        }
+        if pressed && is_ascii_control_keysym(keysym) {
+            crate::timestamped_log!(
+                "rfb: queued an ASCII control-character keysym for portal (value redacted)"
             );
         }
         if pressed {
@@ -2036,7 +2114,9 @@ impl<'a> ClientInputGuard<'a> {
             .blocking_send(ClientEvent::Pointer { x, y, buttons })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
         if previous_buttons != buttons {
-            eprintln!("rfb: pointer button mask {previous_buttons:#04x} -> {buttons:#04x}");
+            crate::timestamped_log!(
+                "rfb: pointer button mask {previous_buttons:#04x} -> {buttons:#04x}"
+            );
         }
         self.pointer = Some((x, y, buttons));
         Ok(())
@@ -2050,6 +2130,10 @@ fn is_modifier_keysym(keysym: u32) -> bool {
             | 0xff7f // Num_Lock
             | 0xffe1..=0xffee // Shift, Control, Caps, Meta, Alt, Super, Hyper
     )
+}
+
+fn is_ascii_control_keysym(keysym: u32) -> bool {
+    keysym < 0x20 || keysym == 0x7f
 }
 
 impl Drop for ClientInputGuard<'_> {
@@ -2375,6 +2459,7 @@ mod tests {
                     name: "test".to_string(),
                     input_enabled: true,
                     clipboard_enabled: true,
+                    encodings: None,
                     authentication: None,
                 },
                 &server_shutdown,
@@ -2668,6 +2753,7 @@ mod tests {
                 name: "test".to_string(),
                 input_enabled: false,
                 clipboard_enabled: false,
+                encodings: None,
                 authentication: Some(Arc::new(AuthenticationConfig::Vnc {
                     password: b"password".to_vec(),
                 })),
@@ -2771,6 +2857,7 @@ mod tests {
                     name: "test".to_string(),
                     input_enabled: false,
                     clipboard_enabled: false,
+                    encodings: None,
                     authentication: None,
                 },
                 &server_shutdown,
@@ -2877,6 +2964,11 @@ mod tests {
             ..rgb888_be
         };
         assert_eq!(rgb888_32.encode(&[255, 128, 0, 255]), [255, 128, 0, 255]);
+        assert_eq!(rgb888_32.zrle_bytes_per_pixel(), 3);
+        assert_eq!(
+            &rgb888_32.encode_zrle(&[255, 128, 0, 255])[..3],
+            &[255, 128, 0]
+        );
 
         let rgb332 = PixelFormat {
             bits_per_pixel: 8,
@@ -2962,7 +3054,33 @@ mod tests {
                 copy_rect: true,
             }
         );
+        let raw_only = [RfbEncoding::Raw];
+        assert_eq!(
+            select_encodings_with_allowlist(&offered, Some(&raw_only)).unwrap(),
+            EncodingPreferences {
+                preferred: Encoding::Raw,
+                copy_rect: false,
+            }
+        );
         assert!(select_encodings(&42i32.to_be_bytes()).is_err());
+    }
+
+    #[test]
+    fn sync_compression_drains_full_output_buffers() {
+        let input: Vec<u8> = (0..65_536)
+            .map(|index| ((index * 73 + index / 13) & 0xff) as u8)
+            .collect();
+        let mut compressor = Compress::new(Compression::default(), true);
+        let compressed = compress_sync_with_buffer_size(&mut compressor, &input, 7).unwrap();
+
+        let mut decompressor = flate2::Decompress::new(true);
+        let mut decoded = vec![0; input.len()];
+        let status = decompressor
+            .decompress(&compressed, &mut decoded, flate2::FlushDecompress::Sync)
+            .unwrap();
+        assert_eq!(status, Status::Ok);
+        assert_eq!(decompressor.total_out() as usize, input.len());
+        assert_eq!(decoded, input);
     }
 
     #[test]

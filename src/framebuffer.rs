@@ -178,7 +178,7 @@ impl Frame {
         let is_fast_path = frame.meta.crop.is_none()
             && !frame.is_bottom_up()
             && frame.stride as usize == output_stride
-            && matches!(frame.format, PixelFormat::BGRA | PixelFormat::BGRx);
+            && frame.format == PixelFormat::BGRA;
 
         let bottom_up = frame.is_bottom_up();
         let mut damage = normalize_damage(frame, crop_x, crop_y, output_width, output_height);
@@ -240,8 +240,20 @@ impl Frame {
                 .ok_or(FrameError::BufferTooSmall)?;
 
             match frame.format {
-                PixelFormat::BGRA | PixelFormat::BGRx => {
+                PixelFormat::BGRA => {
                     destination_row.copy_from_slice(source_row);
+                }
+                PixelFormat::BGRx => {
+                    for (source, destination) in source_row
+                        .chunks_exact(4)
+                        .zip(destination_row.chunks_exact_mut(4))
+                    {
+                        destination[..3].copy_from_slice(&source[..3]);
+                        // The X byte is padding, not alpha; normalize it so
+                        // clients that interpret the unused RFB byte as alpha
+                        // always see opaque pixels.
+                        destination[3] = 255;
+                    }
                 }
                 PixelFormat::RGBA | PixelFormat::RGBx => {
                     for (source, destination) in source_row
@@ -617,6 +629,14 @@ mod tests {
                 30, 20, 10, 255, 60, 50, 40, 255, 90, 80, 70, 255, 120, 110, 100, 255,
             ]
         );
+    }
+
+    #[test]
+    fn normalizes_bgrx_padding_to_opaque_alpha() {
+        let source = video_frame(2, 1, 8, PixelFormat::BGRx, vec![1, 2, 3, 0, 4, 5, 6, 127]);
+        let frame = Frame::from_video_frame(&source).unwrap();
+
+        assert_eq!(frame.data.as_slice(), &[1, 2, 3, 255, 4, 5, 6, 255]);
     }
 
     #[test]

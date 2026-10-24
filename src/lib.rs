@@ -14,5 +14,15 @@ pub mod cli;
 pub mod error;
 pub mod framebuffer;
 pub mod input;
+pub mod logging;
 pub mod rfb;
 pub mod server;
+
+/// Print a diagnostic message with a UTC timestamp, without logging secrets
+/// or requiring an external logging dependency.
+#[macro_export]
+macro_rules! timestamped_log {
+    ($($argument:tt)*) => {{
+        eprintln!("[{}] {}", $crate::logging::timestamp(), format_args!($($argument)*));
+    }};
+}

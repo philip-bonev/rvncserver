@@ -51,6 +51,17 @@ classic VNC authentication can be selected for clients that need it:
 ./target/release/rvncserver --enable-input --enable-clipboard
 ```
 
+To restrict framebuffer encodings, set an allowlist in the configuration or on
+the command line. `raw` is required as the fallback; when the list is omitted,
+the server uses the client's preferred supported encoding. For example, use Raw
+only to troubleshoot a client's compressed-image rendering:
+
+```sh
+./target/release/rvncserver --encodings raw
+```
+
+Supported names are `raw`, `hextile`, `zlib`, `zrle`, and `copyrect`.
+
 By default, settings are loaded from `$XDG_CONFIG_HOME/rvncserver/config.json`
 or `~/.config/rvncserver/config.json`. Pass `--config <PATH>` to select another
 file. Command-line options override values from JSON. Paths in the JSON file are
@@ -66,6 +77,7 @@ Example configuration:
   "capture_probe": null,
   "enable_input": false,
   "enable_clipboard": false,
+  "encodings": ["raw", "zrle", "copyrect"],
   "auth_mode": "vencrypt",
   "tls_cert": "server.crt",
   "tls_key": "server.key",
@@ -101,7 +113,8 @@ Both credential-file formats require owner-only permissions (`chmod 600`).
 Classic VNC Authentication does not encrypt the session and its DES challenge
 response is weak; use VeNCrypt unless compatibility requires VNC mode. The
 desktop portal requests permission for enabled input and clipboard capabilities.
-Authenticated clients can use any enabled capability.
+If the portal does not provide clipboard support, the server warns and continues
+without clipboard sharing. Authenticated clients can use any enabled capability.
 
 To select classic VNC authentication from the command line, provide a
 password-only file (maximum 8 bytes) and use `--auth vnc`; the same mode can be
