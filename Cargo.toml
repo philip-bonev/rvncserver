@@ -1,6 +1,6 @@
 [package]
 name = "rvncserver"
-version = "0.1.2"
+version = "0.1.3"
 description = "A lightweight VNC server for Wayland desktops"
 authors = ["Philip Bonev"]
 license = "Apache-2.0"

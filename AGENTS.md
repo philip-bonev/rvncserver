@@ -404,6 +404,10 @@ After making changes:
 
 Do not upgrade dependencies or regenerate the lockfile unnecessarily.
 
+When preparing a release, keep the package version in `Cargo.toml`, the root
+package entry in `Cargo.lock`, and the Git release tag in sync. Update the
+manifest and lockfile before creating/pushing the matching tag.
+
 Do not change unrelated files.
 
 Do not claim that a build or test passed unless the command was actually executed successfully.
