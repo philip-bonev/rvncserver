@@ -1,4 +1,4 @@
-//! Minimal RFB 3.3/3.8 server.
+//! Minimal RFB 3.3/3.8 server, with Apple RFB 3.889 reserved for Apple auth.
 //!
 //! This module intentionally depends only on the normalized [`Frame`] type and
 //! the standard library. It currently supports:
@@ -28,18 +28,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use aes::Aes128;
+use aes::cipher::{BlockCipherDecrypt, KeyInit as AesKeyInit};
+use crypto_bigint::zeroize::Zeroize;
+use crypto_bigint::{BoxedUint, Odd, Resize};
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Compress, Compression, FlushCompress, Status};
+use md5::{Digest, Md5};
 
 use crate::cli::RfbEncoding;
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
 use crate::input::ClientEvent;
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
+/// Apple Remote Desktop's non-standard version token.
+const APPLE_RFB_VERSION: &[u8; 12] = b"RFB 003.889\n";
 const SECURITY_TYPE_NONE: u32 = 1;
 const SECURITY_TYPE_VNC_AUTH: u8 = 2;
 const SECURITY_TYPE_VENCRYPT: u8 = 19;
+const SECURITY_TYPE_APPLE_DH: u8 = 30;
 const ENCODING_COPY_RECT: i32 = 1;
 const ENCODING_ZLIB: i32 = 6;
 const VENCRYPT_SUBTYPE_X509_PLAIN: u32 = 262;
@@ -84,6 +92,10 @@ pub enum AuthenticationConfig {
     Vnc {
         password: Vec<u8>,
     },
+    AppleDh {
+        username: Vec<u8>,
+        password: Vec<u8>,
+    },
 }
 
 impl Drop for AuthenticationConfig {
@@ -96,6 +108,10 @@ impl Drop for AuthenticationConfig {
                 password.fill(0);
             }
             Self::Vnc { password } => password.fill(0),
+            Self::AppleDh { username, password } => {
+                username.fill(0);
+                password.fill(0);
+            }
         }
     }
 }
@@ -269,6 +285,64 @@ pub fn load_vnc_authentication(password_path: &Path) -> io::Result<Authenticatio
         ));
     }
     Ok(AuthenticationConfig::Vnc { password })
+}
+
+/// Read Apple DH credentials from a mode-0600 username/password file.
+pub fn load_apple_dh_authentication(password_path: &Path) -> io::Result<AuthenticationConfig> {
+    let config = load_auth_credentials(password_path)?;
+    Ok(AuthenticationConfig::AppleDh {
+        username: config.0,
+        password: config.1,
+    })
+}
+
+fn load_auth_credentials(path: &Path) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let file = File::open(path)?;
+    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "credential file must not be accessible by group or other users (chmod 600)",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(2051).read_to_end(&mut bytes)?;
+    if bytes.len() > 2050 {
+        bytes.fill(0);
+        return Err(invalid_data("credential file exceeds 2050 bytes"));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    let Some(split) = bytes.iter().position(|b| *b == b'\n') else {
+        bytes.fill(0);
+        return Err(invalid_data(
+            "credential file must contain username and password on separate lines",
+        ));
+    };
+    let username_end = if split > 0 && bytes[split - 1] == b'\r' {
+        split - 1
+    } else {
+        split
+    };
+    let password_start = split + 1;
+    if bytes[password_start..].contains(&b'\n') || bytes[password_start..].contains(&b'\r') {
+        bytes.fill(0);
+        return Err(invalid_data(
+            "credential file must contain exactly two lines",
+        ));
+    }
+    let user = bytes[..username_end].to_vec();
+    let pass = bytes[password_start..].to_vec();
+    bytes.fill(0);
+    if user.is_empty() || user.len() > 64 || pass.is_empty() || pass.len() > 64 {
+        return Err(invalid_data(
+            "Apple DH username and password must each be 1 to 64 bytes",
+        ));
+    }
+    Ok((user, pass))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +597,9 @@ fn run_listener(
                     continue;
                 }
 
+                // Clipboard events queued while no RFB client was connected
+                // are historical state, not an update for this new client.
+                while clipboard_rx.try_recv().is_ok() {}
                 store.client_connected();
                 let result = handle_client(
                     stream,
@@ -533,6 +610,7 @@ fn run_listener(
                     &mut clipboard_rx,
                 );
                 store.client_disconnected();
+                while clipboard_rx.try_recv().is_ok() {}
 
                 match result {
                     Ok(()) => crate::timestamped_log!("rfb: client disconnected"),
@@ -570,7 +648,19 @@ fn handle_client(
     clipboard_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> io::Result<()> {
     let mut tcp_stream = stream;
-    write_all_interruptible(&mut tcp_stream, RFB_VERSION, shutdown)?;
+    let apple_auth = matches!(
+        config.authentication.as_deref(),
+        Some(AuthenticationConfig::AppleDh { .. })
+    );
+    write_all_interruptible(
+        &mut tcp_stream,
+        if apple_auth {
+            APPLE_RFB_VERSION
+        } else {
+            RFB_VERSION
+        },
+        shutdown,
+    )?;
 
     let mut version = [0u8; 12];
     read_exact_interruptible(&mut tcp_stream, &mut version, shutdown)?;
@@ -589,6 +679,13 @@ fn handle_client(
         }
         Some(AuthenticationConfig::Vnc { password }) => {
             negotiate_vnc_auth(&mut tcp_stream, version, password, shutdown)?;
+            ClientStream::Plain(tcp_stream)
+        }
+        Some(AuthenticationConfig::AppleDh { username, password }) => {
+            if version != RfbVersion::Apple3_889 {
+                return Err(invalid_data("Apple DH authentication requires RFB 3.889"));
+            }
+            negotiate_apple_dh(&mut tcp_stream, username, password, shutdown)?;
             ClientStream::Plain(tcp_stream)
         }
         None => {
@@ -613,6 +710,11 @@ fn handle_client(
                         )));
                     }
                     write_all_interruptible(&mut tcp_stream, &0u32.to_be_bytes(), shutdown)?;
+                }
+                RfbVersion::Apple3_889 => {
+                    return Err(invalid_data(
+                        "Apple RFB 3.889 requires Apple DH authentication",
+                    ));
                 }
             }
             ClientStream::Plain(tcp_stream)
@@ -904,6 +1006,11 @@ fn negotiate_vnc_auth(
                 return Err(invalid_data("client did not select VNC Authentication"));
             }
         }
+        RfbVersion::Apple3_889 => {
+            return Err(invalid_data(
+                "Apple RFB 3.889 requires Apple DH authentication",
+            ));
+        }
     }
 
     let mut challenge = [0u8; 16];
@@ -914,6 +1021,124 @@ fn negotiate_vnc_auth(
     let expected = vnc_auth_response(password, &challenge)?;
     let authenticated = constant_time_equal(&response, &expected);
     write_auth_result(stream, authenticated, version == RfbVersion::V3_8, shutdown)
+}
+
+fn negotiate_apple_dh(
+    stream: &mut TcpStream,
+    expected_username: &[u8],
+    expected_password: &[u8],
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    const PRIME_HEX: &str = concat!(
+        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+        "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+        "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+        "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+        "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D",
+        "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F",
+        "83655D23DCA3AD961C62F356208552BB9ED529077096966D",
+        "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B",
+        "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9",
+        "DE2BCBF6955817183995497CEA956AE515D2261898FA0510",
+        "15728E5A8AACAA68FFFFFFFFFFFFFFFF"
+    );
+    let mut prime_bytes = [0u8; 256];
+    for (i, pair) in PRIME_HEX.as_bytes().chunks_exact(2).enumerate() {
+        prime_bytes[i] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    let prime = BoxedUint::from_be_slice(&prime_bytes, 2048)
+        .map_err(|_| invalid_data("invalid Apple DH modulus"))?;
+    let odd_prime = Odd::new(prime.clone())
+        .into_option()
+        .ok_or_else(|| invalid_data("invalid Apple DH modulus"))?;
+
+    let mut private_bytes = [0u8; 256];
+    File::open("/dev/urandom")?.read_exact(&mut private_bytes)?;
+    let private = SecretDhExponent(
+        BoxedUint::from_be_slice(&private_bytes, 2048)
+            .map_err(|_| invalid_data("invalid Apple DH private value"))?,
+    );
+    private_bytes.fill(0);
+    let generator = BoxedUint::from(2u8).resize(2048);
+    let server_public = generator.pow_mod(&private.0, &odd_prime).to_be_bytes();
+
+    write_all_interruptible(stream, &[1, SECURITY_TYPE_APPLE_DH], shutdown)?;
+    let selected_type = read_u8(stream, shutdown)?;
+    if selected_type != SECURITY_TYPE_APPLE_DH {
+        return Err(invalid_data(format!(
+            "client selected security type {selected_type}, but Apple DH (30) was offered"
+        )));
+    }
+    let mut hello = [0u8; 4];
+    hello[..2].copy_from_slice(&2u16.to_be_bytes());
+    hello[2..].copy_from_slice(&256u16.to_be_bytes());
+    write_all_interruptible(stream, &hello, shutdown)?;
+    write_all_interruptible(stream, &prime_bytes, shutdown)?;
+    write_all_interruptible(stream, &server_public, shutdown)?;
+
+    let mut response = [0u8; 384];
+    read_exact_interruptible(stream, &mut response, shutdown)?;
+    let client_public_bytes = &response[128..];
+    let client_public = BoxedUint::from_be_slice(client_public_bytes, 2048)
+        .map_err(|_| invalid_data("invalid Apple DH client public value"))?;
+    // Reject trivial/out-of-range public values before exponentiation.
+    let two = BoxedUint::from(2u8).resize(2048);
+    let upper = &prime - &two;
+    if client_public < two || client_public > upper {
+        response.fill(0);
+        return Err(invalid_data("Apple DH client public value is out of range"));
+    }
+    let mut shared = client_public.pow_mod(&private.0, &odd_prime).to_be_bytes();
+    let mut shared_256 = [0u8; 256];
+    if shared.len() > shared_256.len() {
+        response.fill(0);
+        return Err(invalid_data("invalid Apple DH shared secret size"));
+    }
+    shared_256[256 - shared.len()..].copy_from_slice(&shared);
+    shared.fill(0);
+    let mut key = Md5::digest(shared_256);
+    shared_256.fill(0);
+    let cipher = Aes128::new_from_slice(&key)
+        .map_err(|_| invalid_data("could not initialize Apple DH AES cipher"))?;
+    key.fill(0);
+    for block in response[..128].chunks_exact_mut(16) {
+        let mut aes_block = aes::Block::default();
+        aes_block.copy_from_slice(block);
+        cipher.decrypt_block(&mut aes_block);
+        block.copy_from_slice(&aes_block);
+    }
+    let credentials = &response[..128];
+    let user_end = credentials[..64].iter().position(|b| *b == 0).unwrap_or(64);
+    let pass_end = credentials[64..].iter().position(|b| *b == 0).unwrap_or(64);
+    let authenticated = constant_time_equal(&credentials[..user_end], expected_username)
+        & constant_time_equal(&credentials[64..64 + pass_end], expected_password);
+    response.fill(0);
+    write_auth_result(stream, authenticated, true, shutdown)?;
+    if authenticated {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Apple DH credentials rejected",
+        ))
+    }
+}
+
+fn hex_nibble(byte: u8) -> io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(invalid_data("invalid hexadecimal Apple DH modulus")),
+    }
+}
+
+struct SecretDhExponent(BoxedUint);
+
+impl Drop for SecretDhExponent {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 fn vnc_auth_response(password: &[u8], challenge: &[u8; 16]) -> io::Result<[u8; 16]> {
@@ -2238,6 +2463,7 @@ fn validate_rectangle(
 enum RfbVersion {
     V3_3,
     V3_8,
+    Apple3_889,
 }
 
 fn parse_client_version(version: &[u8; 12]) -> io::Result<RfbVersion> {
@@ -2259,8 +2485,9 @@ fn parse_client_version(version: &[u8; 12]) -> io::Result<RfbVersion> {
     match minor {
         3 => Ok(RfbVersion::V3_3),
         8 => Ok(RfbVersion::V3_8),
+        889 => Ok(RfbVersion::Apple3_889),
         _ => Err(invalid_data(format!(
-            "unsupported RFB version {major}.{minor}; supported versions are 3.3 and 3.8"
+            "unsupported RFB version {major}.{minor}; supported versions are 3.3, 3.8, and Apple 3.889"
         ))),
     }
 }
@@ -2431,6 +2658,17 @@ mod tests {
             zlib_compressor: Compress::new(Compression::default(), true),
             client_pixels: None,
         }
+    }
+
+    #[test]
+    fn boxed_dh_operands_are_resized_to_modulus_precision() {
+        let precision = 2048;
+        let modulus = BoxedUint::from(23u8).resize(precision);
+        let odd_modulus = Odd::new(modulus).into_option().unwrap();
+        let base = BoxedUint::from(2u8).resize(precision);
+        let exponent = BoxedUint::from(3u8).resize(precision);
+        let result = base.pow_mod(&exponent, &odd_modulus).to_be_bytes();
+        assert_eq!(result.last(), Some(&8));
     }
 
     #[test]
@@ -2670,6 +2908,7 @@ mod tests {
 
     #[test]
     fn parses_supported_versions() {
+        assert_eq!(APPLE_RFB_VERSION, b"RFB 003.889\n");
         assert_eq!(
             parse_client_version(b"RFB 003.003\n").unwrap(),
             RfbVersion::V3_3
@@ -2677,6 +2916,10 @@ mod tests {
         assert_eq!(
             parse_client_version(b"RFB 003.008\n").unwrap(),
             RfbVersion::V3_8
+        );
+        assert_eq!(
+            parse_client_version(b"RFB 003.889\n").unwrap(),
+            RfbVersion::Apple3_889
         );
         assert!(parse_client_version(b"RFB 003.007\n").is_err());
         assert!(parse_client_version(b"RFB 003.009\n").is_err());

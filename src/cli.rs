@@ -50,6 +50,8 @@ pub enum AuthMode {
     VeNCrypt,
     /// Legacy VNC DES challenge-response (no session encryption).
     Vnc,
+    /// Apple-specific DH authentication (no session encryption).
+    AppleDh,
 }
 
 /// Validated runtime configuration.
@@ -441,6 +443,11 @@ where
             "VNC authentication requires password_file",
         ));
     }
+    if auth_mode == AuthMode::AppleDh && password_file.is_none() {
+        return Err(CliError::IncompatibleOptions(
+            "Apple DH authentication requires password_file",
+        ));
+    }
 
     if capture_probe.is_some() && (enable_input || enable_clipboard) {
         return Err(CliError::IncompatibleOptions(
@@ -500,8 +507,9 @@ fn parse_auth_mode(value: &str) -> Result<AuthMode, CliError> {
     match value {
         "vencrypt" => Ok(AuthMode::VeNCrypt),
         "vnc" => Ok(AuthMode::Vnc),
+        "apple-dh" => Ok(AuthMode::AppleDh),
         _ => Err(CliError::IncompatibleOptions(
-            "invalid auth mode; expected vencrypt or vnc",
+            "invalid auth mode; expected vencrypt, vnc, or apple-dh",
         )),
     }
 }
@@ -554,7 +562,7 @@ Options:
   --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt
   --tls-key <PATH>         TLS private key PEM
   --password-file <PATH>   Authentication credentials file (owner-only permissions)
-  --auth <MODE>            Authentication: vencrypt (default) or vnc
+  --auth <MODE>            Authentication: vencrypt (default), vnc, or apple-dh
   --enable-input           Request portal permission for keyboard/pointer control
   --disable-input          Disable keyboard/pointer control from the config file
   --enable-clipboard       Request portal permission for clipboard sharing
@@ -688,6 +696,15 @@ mod tests {
                 "VNC authentication requires password_file"
             ))
         );
+    }
+
+    #[test]
+    fn selects_apple_dh_authentication_mode() {
+        assert_eq!(
+            config(&["--auth", "apple-dh", "--password-file", "/tmp/credentials"]).auth_mode,
+            AuthMode::AppleDh
+        );
+        assert!(parse(&["--auth", "apple-dh"]).is_err());
     }
 
     #[test]

@@ -121,6 +121,15 @@ password-only file (maximum 8 bytes) and use `--auth vnc`; the same mode can be
 selected with `"auth_mode": "vnc"` in JSON. When using the two-line VeNCrypt
 credential file, VNC mode uses the second line as its password.
 
+Apple's legacy DH authentication can be selected with `--auth apple-dh` or
+`"auth_mode": "apple-dh"`. Its owner-only credential file must contain the
+username and password on separate lines (each at most 64 bytes). This opt-in
+mode advertises Apple's non-standard `RFB 003.889` version and SecurityType 30.
+It uses DH-derived AES solely to protect credentials during authentication;
+framebuffer, input, and clipboard traffic remain unencrypted. Use it only on a
+trusted network or inside a separately secured tunnel. Type 30 does not
+guarantee that macOS Screen Sharing enables clipboard controls.
+
 Use `--help` for the complete command-line interface.
 
 ### Capture probe
@@ -138,6 +147,8 @@ This captures one normalized frame and writes it as a binary PPM file.
 - RFB 3.8 version negotiation for authenticated server sessions
 - VeNCrypt X509Plain (TLS plus username/password authentication; default)
 - Classic VNC Authentication (RFB SecurityType 2), selectable with `--auth vnc`
+- Apple DH authentication (SecurityType 30 and RFB 3.889), opt-in with
+  `--auth apple-dh`; native Screen Sharing interoperability has not been tested
 - One client at a time
 - 8-, 16-, and 32-bit true-color client pixel formats, including RGB332,
   RGB565, and 24-bit color in 32-bit pixels with either byte order
@@ -162,6 +173,8 @@ This captures one normalized frame and writes it as a binary PPM file.
 - VNC mode is unencrypted, uses obsolete DES, truncates password security to
   at most 8 bytes, and permits offline guessing from captured challenges. Do
   not use it on untrusted networks.
+- Apple DH mode is Apple-specific and does not encrypt session traffic; it has
+  not been validated against a native macOS Screen Sharing client.
 - VeNCrypt requires RFB 3.8; VNC Authentication also supports RFB 3.3.
 - macOS Screen Sharing compatibility with VNC Authentication has not yet been
   verified against an actual Mac client.

@@ -41,6 +41,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             rfb::load_authentication(certificate, key, password_path)
         }
         AuthMode::Vnc => rfb::load_vnc_authentication(password_path),
+        AuthMode::AppleDh => rfb::load_apple_dh_authentication(password_path),
     }
     .map(Arc::new)
     .map_err(|error| AppError::Network(format!("failed to initialize authentication: {error}")))?;
@@ -52,6 +53,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     if config.auth_mode == AuthMode::Vnc {
         crate::timestamped_log!(
             "warning: classic VNC authentication uses weak DES and does not encrypt session traffic; do not use on untrusted networks"
+        );
+    }
+    if config.auth_mode == AuthMode::AppleDh {
+        crate::timestamped_log!(
+            "warning: Apple DH authentication is Apple-specific and does not encrypt session traffic"
         );
     }
     if config.enable_input || config.enable_clipboard {
@@ -200,7 +206,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
                                     Ok(Some(ClipboardEvent::LocalText(text))) => {
                                         crate::timestamped_log!("clipboard: read local text ({} bytes)", text.len());
                                         let text = utf8_to_latin1(&text);
-                                        if server_clipboard_tx.try_send(text).is_err() {
+                                        if store.has_clients() && server_clipboard_tx.try_send(text).is_err() {
                                             crate::timestamped_log!("clipboard: client update queue is full; dropping update");
                                         }
                                     }
