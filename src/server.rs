@@ -10,6 +10,10 @@ use tokio::sync::mpsc;
 
 use crate::capture::{CaptureConfig, CaptureSession};
 use crate::cli::{AuthMode, Config};
+use crate::clipboard::{
+    ClipboardBackend, ClipboardEvent, ClipboardListenerEvent, ClipboardService,
+    wayland::WaylandClipboard,
+};
 use crate::error::AppError;
 use crate::framebuffer::{Frame, FrameStore};
 use crate::input::ClientEvent;
@@ -62,7 +66,12 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         ..CaptureConfig::default()
     };
     let mut capture = CaptureSession::start(capture_config).await?;
-    let clipboard_enabled = config.enable_clipboard && capture.clipboard_enabled();
+    let (mut clipboard_service, mut clipboard_events) = if config.enable_clipboard {
+        initialize_clipboard(&capture).await
+    } else {
+        (None, None)
+    };
+    let clipboard_enabled = clipboard_events.is_some();
 
     crate::timestamped_log!("capture: waiting for the first frame...");
     let first_frame = capture.wait_for_first_frame(FIRST_FRAME_TIMEOUT).await?;
@@ -89,12 +98,6 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let mut has_remote_events = config.enable_input || clipboard_enabled;
     let (client_event_tx, mut client_event_rx) = mpsc::channel::<ClientEvent>(256);
     let (server_clipboard_tx, server_clipboard_rx) = mpsc::channel::<Vec<u8>>(4);
-    let (mut selection_transfer_rx, mut clipboard_owner_rx) = if clipboard_enabled {
-        let (transfer, owner) = capture.start_clipboard_listeners().await?;
-        (Some(transfer), Some(owner))
-    } else {
-        (None, None)
-    };
 
     let rfb_thread = rfb::spawn(
         listener,
@@ -160,37 +163,56 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             event = client_event_rx.recv(), if has_remote_events => {
                 if let Some(event) = event {
-                    if let Err(error) = capture.handle_client_event(event).await {
-                        crate::timestamped_log!("input: portal rejected client event: {error}");
+                    match event {
+                        ClientEvent::Clipboard(data) => {
+                            if let Some(service) = clipboard_service.as_mut() {
+                                crate::timestamped_log!("clipboard: received remote text ({} bytes)", data.len());
+                                let text = latin1_to_utf8(&data);
+                                if let Err(error) = service.set_remote_text(text).await {
+                                    crate::timestamped_log!("clipboard: could not publish remote text: {error}");
+                                }
+                            }
+                        }
+                        input_event => if let Err(error) = capture.handle_client_event(input_event).await {
+                            crate::timestamped_log!("input: portal rejected client event: {error}");
+                        }
                     }
                 } else {
                     has_remote_events = false;
                 }
             }
-            transfer = recv_optional(&mut selection_transfer_rx), if clipboard_enabled => {
-                if let Some(transfer) = transfer {
-                    if let Err(error) = capture.handle_selection_transfer(transfer).await {
-                        crate::timestamped_log!("clipboard: could not provide remote text: {error}");
-                    }
-                } else {
-                    crate::timestamped_log!("clipboard: transfer listener ended");
-                    selection_transfer_rx = None;
-                }
-            }
-            owner = recv_optional(&mut clipboard_owner_rx), if clipboard_enabled => {
-                if let Some(mime_types) = owner {
-                    match capture.read_local_clipboard(&mime_types).await {
-                        Ok(Some(text)) => {
-                            if server_clipboard_tx.try_send(text).is_err() {
-                                crate::timestamped_log!("clipboard: client update queue is full; dropping update");
+            event = recv_clipboard_event(&mut clipboard_events), if clipboard_enabled => {
+                if let Some(event) = event {
+                    match event {
+                        ClipboardListenerEvent::TransferRequest { serial, mime_type } => {
+                            if let Some(service) = clipboard_service.as_mut() {
+                                if let Err(error) = service.provide_transfer(serial, mime_type).await {
+                                    crate::timestamped_log!("clipboard: could not provide remote text: {error}");
+                                }
                             }
                         }
-                        Ok(None) => {}
-                        Err(error) => crate::timestamped_log!("clipboard: could not read local text: {error}"),
+                        ClipboardListenerEvent::LocalSelectionChanged(mime_types) => {
+                            if !mime_types.iter().any(|mime| mime == "text/plain" || mime == "text/plain;charset=utf-8") {
+                                continue;
+                            }
+                            if let Some(service) = clipboard_service.as_mut() {
+                                match service.read_local_text().await {
+                                    Ok(Some(ClipboardEvent::LocalText(text))) => {
+                                        crate::timestamped_log!("clipboard: read local text ({} bytes)", text.len());
+                                        let text = utf8_to_latin1(&text);
+                                        if server_clipboard_tx.try_send(text).is_err() {
+                                            crate::timestamped_log!("clipboard: client update queue is full; dropping update");
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => crate::timestamped_log!("clipboard: could not read local text: {error}"),
+                                }
+                            }
+                        }
                     }
                 } else {
-                    crate::timestamped_log!("clipboard: owner-change listener ended");
-                    clipboard_owner_rx = None;
+                    crate::timestamped_log!("clipboard: event listener ended");
+                    clipboard_events = None;
                 }
             }
             result = &mut ctrl_c => {
@@ -210,12 +232,105 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     }
 
     capture.shutdown();
+    if let Some(service) = clipboard_service.as_mut() {
+        service.shutdown().await;
+    }
     Ok(())
 }
 
-async fn recv_optional<T>(receiver: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
+async fn recv_clipboard_event(
+    receiver: &mut Option<mpsc::UnboundedReceiver<ClipboardListenerEvent>>,
+) -> Option<ClipboardListenerEvent> {
     match receiver {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
     }
+}
+
+async fn initialize_clipboard(
+    capture: &CaptureSession,
+) -> (
+    Option<ClipboardService>,
+    Option<mpsc::UnboundedReceiver<ClipboardListenerEvent>>,
+) {
+    if let Some(backend) = capture.portal_clipboard_backend() {
+        match start_clipboard_backend(backend).await {
+            Ok((service, events)) => {
+                crate::timestamped_log!("clipboard: using XDG Desktop Portal backend");
+                return (Some(service), Some(events));
+            }
+            Err(error) if is_permission_denial(&error) => {
+                crate::timestamped_log!(
+                    "clipboard: portal permission was denied; fallback will not bypass the user's choice: {error}"
+                );
+                return (None, None);
+            }
+            Err(error) => {
+                crate::timestamped_log!(
+                    "clipboard: portal backend unavailable ({error}); trying Wayland fallback"
+                );
+            }
+        }
+    } else {
+        crate::timestamped_log!("clipboard: portal clipboard unavailable; trying Wayland fallback");
+    }
+
+    match WaylandClipboard::connect() {
+        Ok(backend) => match start_clipboard_backend(backend).await {
+            Ok((service, events)) => {
+                crate::timestamped_log!("clipboard: using ext_data_control_v1 backend");
+                (Some(service), Some(events))
+            }
+            Err(error) => {
+                crate::timestamped_log!("clipboard: Wayland fallback unavailable: {error}");
+                (None, None)
+            }
+        },
+        Err(error) => {
+            crate::timestamped_log!("clipboard: Wayland fallback unavailable: {error}");
+            (None, None)
+        }
+    }
+}
+
+async fn start_clipboard_backend(
+    backend: impl ClipboardBackend + 'static,
+) -> Result<
+    (
+        ClipboardService,
+        mpsc::UnboundedReceiver<ClipboardListenerEvent>,
+    ),
+    String,
+> {
+    let mut service = ClipboardService::initialize(backend).await?;
+    match service.start_listeners().await {
+        Ok(events) => Ok((service, events)),
+        Err(error) => {
+            service.shutdown().await;
+            Err(error)
+        }
+    }
+}
+
+fn is_permission_denial(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("denied")
+        || lower.contains("cancelled")
+        || lower.contains("canceled")
+        || lower.contains("permission")
+        || lower.contains("not authorized")
+}
+
+fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
+    data.iter()
+        .map(|byte| char::from(*byte))
+        .collect::<String>()
+        .into_bytes()
+}
+
+fn utf8_to_latin1(data: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(data)
+        .chars()
+        .map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?'))
+        .collect()
 }

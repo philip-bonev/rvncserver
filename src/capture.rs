@@ -16,8 +16,9 @@ use lamco_pipewire::{
 use lamco_portal::{
     ClipboardManager, PortalConfig, PortalError, PortalManager, PortalSessionHandle,
 };
-use tokio::sync::{Notify, mpsc as tokio_mpsc};
+use tokio::sync::Notify;
 
+use crate::clipboard::portal::PortalClipboard;
 use crate::error::AppError;
 use crate::framebuffer::Frame;
 use crate::input::ClientEvent;
@@ -61,10 +62,9 @@ pub struct CaptureSession {
     // Keep PipeWire first so its Drop runs before the portal session is
     // released.
     pipewire: PipeWireThreadManager,
-    session: PortalSessionHandle,
+    session: Arc<PortalSessionHandle>,
     manager: PortalManager,
     clipboard: Option<Arc<ClipboardManager>>,
-    remote_clipboard: Vec<u8>,
     pointer_buttons: u8,
     stream_id: u32,
     stream_size: (u32, u32),
@@ -174,10 +174,9 @@ impl CaptureSession {
 
         Ok(Self {
             pipewire,
-            session,
+            session: Arc::new(session),
             manager,
             clipboard,
-            remote_clipboard: Vec::new(),
             pointer_buttons: 0,
             stream_id: 0,
             stream_size,
@@ -189,9 +188,12 @@ impl CaptureSession {
         self.pipewire.try_recv_frame()
     }
 
-    /// Whether portal clipboard support initialized successfully.
-    pub fn clipboard_enabled(&self) -> bool {
-        self.clipboard.is_some()
+    /// Create a backend adapter for the active portal clipboard session.
+    pub fn portal_clipboard_backend(&self) -> Option<PortalClipboard> {
+        Some(PortalClipboard::new(
+            Arc::clone(self.clipboard.as_ref()?),
+            Arc::clone(&self.session),
+        ))
     }
 
     /// Notification signalled after a frame is queued.
@@ -207,29 +209,6 @@ impl CaptureSession {
     /// Size reported by the portal for the selected stream.
     pub fn stream_size(&self) -> (u32, u32) {
         self.stream_size
-    }
-
-    /// Start portal clipboard signal listeners for an enabled clipboard session.
-    pub async fn start_clipboard_listeners(
-        &self,
-    ) -> Result<
-        (
-            tokio_mpsc::UnboundedReceiver<lamco_portal::clipboard::SelectionTransferEvent>,
-            tokio_mpsc::UnboundedReceiver<Vec<String>>,
-        ),
-        AppError,
-    > {
-        let clipboard = self
-            .clipboard
-            .as_ref()
-            .ok_or_else(|| AppError::Capture("clipboard support is disabled".to_string()))?;
-        let (transfer_tx, transfer_rx) = tokio_mpsc::unbounded_channel();
-        let (owner_tx, owner_rx) = tokio_mpsc::unbounded_channel();
-        clipboard
-            .start_selection_transfer_listener(transfer_tx)
-            .await?;
-        clipboard.start_owner_changed_listener(owner_tx).await?;
-        Ok((transfer_rx, owner_rx))
     }
 
     /// Forward an RFB event through the permission-controlled portal session.
@@ -317,69 +296,13 @@ impl CaptureSession {
                 self.pointer_buttons = merge_pointer_button_mask(self.pointer_buttons, buttons);
             }
             ClientEvent::Clipboard(data) => {
-                let clipboard = self.clipboard.as_ref().ok_or_else(|| {
-                    AppError::Capture("clipboard support is disabled".to_string())
-                })?;
-                self.remote_clipboard = latin1_to_utf8(&data);
-                clipboard
-                    .announce_rdp_formats(
-                        self.session.ashpd_session(),
-                        vec![
-                            "text/plain;charset=utf-8".to_string(),
-                            "text/plain".to_string(),
-                        ],
-                    )
-                    .await?;
+                return Err(AppError::Capture(format!(
+                    "clipboard event must be handled by ClipboardService ({} bytes)",
+                    data.len()
+                )));
             }
         }
         Ok(())
-    }
-
-    /// Provide remote-owned text when the local clipboard portal requests it.
-    pub async fn handle_selection_transfer(
-        &self,
-        event: lamco_portal::clipboard::SelectionTransferEvent,
-    ) -> Result<(), AppError> {
-        let clipboard = self
-            .clipboard
-            .as_ref()
-            .ok_or_else(|| AppError::Capture("clipboard support is disabled".to_string()))?;
-        if event.mime_type != "text/plain" && event.mime_type != "text/plain;charset=utf-8" {
-            clipboard
-                .write_selection_data(self.session.ashpd_session(), event.serial, Vec::new())
-                .await?;
-            return Ok(());
-        }
-        clipboard
-            .write_selection_data(
-                self.session.ashpd_session(),
-                event.serial,
-                self.remote_clipboard.clone(),
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Read local text for delivery to the connected RFB client.
-    pub async fn read_local_clipboard(
-        &self,
-        mime_types: &[String],
-    ) -> Result<Option<Vec<u8>>, AppError> {
-        let Some(clipboard) = &self.clipboard else {
-            return Ok(None);
-        };
-        let mime_type = ["text/plain;charset=utf-8", "text/plain"]
-            .into_iter()
-            .find(|supported| mime_types.iter().any(|mime| mime == supported));
-        let Some(mime_type) = mime_type else {
-            return Ok(None);
-        };
-        let data = clipboard
-            .read_local_clipboard(self.session.ashpd_session(), mime_type)
-            .await?;
-        let mut text = utf8_to_latin1(&data);
-        text.truncate(1024 * 1024);
-        Ok(Some(text))
     }
 
     /// Wait for the first usable frame, normalizing it before returning.
@@ -496,6 +419,7 @@ fn merge_pointer_button_mask(current: u8, event: u8) -> u8 {
     (current & HELD_POINTER_BUTTON_MASK) | (event & WHEEL_BUTTON_MASK)
 }
 
+#[cfg(test)]
 fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
     let mut text = String::with_capacity(data.len());
     for byte in data {
@@ -504,6 +428,7 @@ fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
     text.into_bytes()
 }
 
+#[cfg(test)]
 fn utf8_to_latin1(data: &[u8]) -> Vec<u8> {
     String::from_utf8_lossy(data)
         .chars()

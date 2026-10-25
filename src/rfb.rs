@@ -788,6 +788,7 @@ fn handle_client(
                     })?;
                     let mut text = vec![0u8; length as usize];
                     read_exact_interruptible(&mut stream, &mut text, shutdown)?;
+                    crate::timestamped_log!("rfb: received ClientCutText ({} bytes)", text.len());
                     input_tx
                         .blocking_send(ClientEvent::Clipboard(text))
                         .map_err(|_| {
@@ -2200,6 +2201,7 @@ fn send_server_cut_text(
     if text.len() > MAX_CUT_TEXT as usize {
         return Err(invalid_data("server clipboard text exceeds the size limit"));
     }
+    crate::timestamped_log!("rfb: sending ServerCutText ({} bytes)", text.len());
     let length = u32::try_from(text.len())
         .map_err(|_| invalid_data("server clipboard text exceeds the RFB limit"))?;
     let mut header = [0u8; 8];

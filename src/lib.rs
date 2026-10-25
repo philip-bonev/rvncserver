@@ -11,6 +11,7 @@
 
 pub mod capture;
 pub mod cli;
+pub mod clipboard;
 pub mod error;
 pub mod framebuffer;
 pub mod input;
