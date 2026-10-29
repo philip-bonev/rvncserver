@@ -107,7 +107,13 @@ graceful shutdown. The daemon writes and removes a PID file at
 `$HOME/.local/state/rvncserver/rvncserver.pid`). Override it with `pid_file` in
 JSON or `--pid-file <PATH>`; pass the same path to `--stop` if needed. PID files
 include process start-time data to avoid signaling a reused PID. This is not a
-service-manager integration.
+service-manager integration. Use `rvncserver --status` to report whether the
+daemon is running, starting, or stopped. When running, status also prints the
+active effective configuration (including command-line overrides) from a
+private sidecar file next to the PID file. The sidecar contains configuration
+values and credential-file paths, but never credential contents. A second
+daemon launch using the same PID-file path is rejected while the first instance
+is starting or running.
 
 Example configuration:
 

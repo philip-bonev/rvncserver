@@ -122,6 +122,8 @@ pub enum Command {
     Version,
     /// Stop the daemon identified by its PID file.
     Stop(PathBuf),
+    /// Report daemon status and the active configuration, if available.
+    Status(PathBuf),
 }
 
 /// Command-line validation failure.
@@ -254,6 +256,7 @@ where
     let mut log_file_set = false;
     let mut pid_file_set = false;
     let mut stop_requested = false;
+    let mut status_requested = false;
     let mut config_path_set = false;
 
     let mut args = args.into_iter();
@@ -285,6 +288,15 @@ where
                     return Err(CliError::DuplicateOption("--stop"));
                 }
                 stop_requested = true;
+            }
+            "--status" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if status_requested {
+                    return Err(CliError::DuplicateOption("--status"));
+                }
+                status_requested = true;
             }
             "--listen" => {
                 if listen_set {
@@ -628,14 +640,23 @@ where
         }
     }
 
-    if stop_requested {
+    if stop_requested && status_requested {
+        return Err(CliError::IncompatibleOptions(
+            "--stop and --status cannot be used together",
+        ));
+    }
+    if stop_requested || status_requested {
         let pid_file =
             pid_file
                 .or_else(default_pid_file_path)
                 .ok_or(CliError::IncompatibleOptions(
                     "cannot determine PID file; set XDG_RUNTIME_DIR, HOME, or --pid-file",
                 ))?;
-        return Ok(Command::Stop(pid_file));
+        return Ok(if status_requested {
+            Command::Status(pid_file)
+        } else {
+            Command::Stop(pid_file)
+        });
     }
 
     let any_credential_setting = tls_cert.is_some() || tls_key.is_some() || password_file.is_some();
@@ -875,6 +896,7 @@ Options:
   --foreground             Override daemonize=true from JSON
   --pid-file <PATH>        PID file for daemon control (default: XDG runtime dir)
   --stop                   Request graceful shutdown of the daemon
+  --status                 Show daemon status and its active configuration
   --log-file <PATH>        Append stdout and stderr to this file
   --log-target <TARGET>    Log destination: stderr (default), file, or journald
   --log-max-size <SIZE>    Rotate file logs at this size (default: 50MB)
@@ -1017,6 +1039,11 @@ mod tests {
             parse(&["--stop", "--stop"]),
             Err(CliError::DuplicateOption("--stop"))
         );
+        assert_eq!(
+            parse(&["--status", "--pid-file", "/tmp/rvncserver.pid"]),
+            Ok(Command::Status(PathBuf::from("/tmp/rvncserver.pid")))
+        );
+        assert!(parse(&["--stop", "--status"]).is_err());
     }
 
     #[test]
