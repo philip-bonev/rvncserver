@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use lamco_pipewire::{FrameBuffer, PixelFormat, VideoFrame};
 
+use crate::cursor::{CursorSnapshot, CursorStore, CursorUpdate};
+
 /// A normalized frame ready for transmission.
 ///
 /// `data` is always tightly packed, top-down BGRA with exactly
@@ -439,6 +441,7 @@ fn normalize_damage(
 pub struct FrameStore {
     inner: Mutex<FrameStoreInner>,
     ready: Condvar,
+    cursor: CursorStore,
 }
 
 #[derive(Debug, Default)]
@@ -455,6 +458,17 @@ impl FrameStore {
     /// Create an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Publish cursor metadata alongside framebuffer updates.
+    pub fn publish_cursor(&self, update: CursorUpdate) {
+        self.cursor.publish(update);
+        self.ready.notify_all();
+    }
+
+    /// Return the current cursor state for protocol serialization.
+    pub fn cursor_snapshot(&self) -> CursorSnapshot {
+        self.cursor.snapshot()
     }
 
     /// Publish a frame and return its sequence number.

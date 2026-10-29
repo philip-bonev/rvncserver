@@ -50,6 +50,8 @@ const SECURITY_TYPE_VENCRYPT: u8 = 19;
 const SECURITY_TYPE_APPLE_DH: u8 = 30;
 const ENCODING_COPY_RECT: i32 = 1;
 const ENCODING_ZLIB: i32 = 6;
+const ENCODING_POINTER_POS: i32 = -232;
+const ENCODING_RICH_CURSOR: i32 = -239;
 const VENCRYPT_SUBTYPE_X509_PLAIN: u32 = 262;
 const MAX_ENCODINGS: u16 = 1024;
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
@@ -73,6 +75,8 @@ pub struct RfbConfig {
     pub name: String,
     /// Whether keyboard and pointer input are enabled.
     pub input_enabled: bool,
+    /// Whether separately rendered cursor pseudo-encodings are enabled.
+    pub cursor_enabled: bool,
     /// Whether clipboard messages are enabled.
     pub clipboard_enabled: bool,
     /// Optional allowlist; Raw remains a required fallback.
@@ -374,12 +378,20 @@ struct ClientUpdateState {
     zrle_compressor: Compress,
     zlib_compressor: Compress,
     client_pixels: Option<Vec<[u8; 4]>>,
+    cursor_enabled: bool,
+    rich_cursor_enabled: bool,
+    pointer_pos_enabled: bool,
+    cursor_snapshot: crate::cursor::CursorSnapshot,
+    sent_cursor_shape_sequence: u64,
+    sent_cursor_position_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EncodingPreferences {
     preferred: Encoding,
     copy_rect: bool,
+    rich_cursor: bool,
+    pointer_pos: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,6 +755,12 @@ fn handle_client(
         zrle_compressor: Compress::new(Compression::default(), true),
         zlib_compressor: Compress::new(Compression::default(), true),
         client_pixels: None,
+        cursor_enabled: config.cursor_enabled,
+        rich_cursor_enabled: false,
+        pointer_pos_enabled: false,
+        cursor_snapshot: crate::cursor::CursorSnapshot::default(),
+        sent_cursor_shape_sequence: 0,
+        sent_cursor_position_sequence: 0,
     };
     let mut keyboard_input_warned = false;
     let mut pointer_input_warned = false;
@@ -776,6 +794,7 @@ fn handle_client(
             0 => {
                 update_state.pixel_format = handle_set_pixel_format(&mut stream, shutdown)?;
                 update_state.client_pixels = None;
+                update_state.sent_cursor_shape_sequence = 0;
                 crate::timestamped_log!(
                     "rfb: client pixel format: {}bpp depth {} {}-endian, RGB max=({},{},{}), shifts=({},{},{})",
                     update_state.pixel_format.bits_per_pixel,
@@ -797,14 +816,32 @@ fn handle_client(
                 let preferences =
                     handle_set_encodings(&mut stream, config.encodings.as_deref(), shutdown)?;
                 update_state.encoding = preferences.preferred;
+                if preferences.rich_cursor && !update_state.rich_cursor_enabled {
+                    update_state.sent_cursor_shape_sequence = 0;
+                }
+                if preferences.pointer_pos && !update_state.pointer_pos_enabled {
+                    update_state.sent_cursor_position_sequence = 0;
+                }
+                update_state.rich_cursor_enabled = preferences.rich_cursor;
+                update_state.pointer_pos_enabled = preferences.pointer_pos;
                 if update_state.copy_rect_enabled != preferences.copy_rect {
                     update_state.client_pixels = None;
                 }
                 update_state.copy_rect_enabled = preferences.copy_rect;
                 crate::timestamped_log!(
-                    "rfb: selected framebuffer encoding: {:?}, CopyRect {}",
+                    "rfb: selected framebuffer encoding: {:?}, CopyRect {}, RichCursor {}, PointerPos {}",
                     preferences.preferred,
                     if preferences.copy_rect {
+                        "enabled"
+                    } else {
+                        "not offered"
+                    },
+                    if preferences.rich_cursor {
+                        "enabled"
+                    } else {
+                        "not offered"
+                    },
+                    if preferences.pointer_pos {
                         "enabled"
                     } else {
                         "not offered"
@@ -1251,8 +1288,18 @@ fn select_encodings_with_allowlist(
 ) -> io::Result<EncodingPreferences> {
     let mut preferred = None;
     let mut copy_rect = false;
+    let mut rich_cursor = false;
+    let mut pointer_pos = false;
     for encoding in encodings.chunks_exact(4) {
         let value = i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]);
+        if value == ENCODING_RICH_CURSOR {
+            rich_cursor = true;
+            continue;
+        }
+        if value == ENCODING_POINTER_POS {
+            pointer_pos = true;
+            continue;
+        }
         let candidate = match value {
             ENCODING_COPY_RECT => {
                 copy_rect =
@@ -1293,6 +1340,8 @@ fn select_encodings_with_allowlist(
         .map(|preferred| EncodingPreferences {
             preferred,
             copy_rect,
+            rich_cursor,
+            pointer_pos,
         })
         .ok_or_else(|| invalid_data("client did not offer a supported framebuffer encoding"))
 }
@@ -1325,6 +1374,7 @@ fn handle_update_request(
         // request, but finish the previous request safely if it pipelines one.
         send_empty_update(stream, shutdown)?;
     }
+    state.cursor_snapshot = store.cursor_snapshot();
 
     if !incremental {
         let changes = match store.changes_since(state.last_sequence) {
@@ -1368,6 +1418,7 @@ fn service_pending_update(
     state: &mut ClientUpdateState,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
+    state.cursor_snapshot = store.cursor_snapshot();
     let requested = match state.pending_update {
         Some(requested) => requested,
         None => return Ok(()),
@@ -1388,7 +1439,14 @@ fn service_pending_update(
     };
 
     let updates = damage_within(&state.pending_damage, requested);
-    if updates.is_empty() {
+    let cursor_update_pending = state.cursor_enabled
+        && ((state.rich_cursor_enabled
+            && state.cursor_snapshot.shape.is_some()
+            && state.cursor_snapshot.shape_sequence != state.sent_cursor_shape_sequence)
+            || (state.pointer_pos_enabled
+                && state.cursor_snapshot.position.is_some()
+                && state.cursor_snapshot.position_sequence != state.sent_cursor_position_sequence));
+    if updates.is_empty() && !cursor_update_pending {
         return Ok(());
     }
 
@@ -1614,10 +1672,23 @@ fn send_update(
         return Err(invalid_data("too many rectangles in framebuffer update"));
     }
 
+    let send_cursor = state.cursor_enabled
+        && state.rich_cursor_enabled
+        && state.cursor_snapshot.shape.is_some()
+        && state.cursor_snapshot.shape_sequence != state.sent_cursor_shape_sequence;
+    let send_pointer_pos = state.cursor_enabled
+        && state.pointer_pos_enabled
+        && state.cursor_snapshot.position.is_some()
+        && state.cursor_snapshot.position_sequence != state.sent_cursor_position_sequence;
+    let rectangle_count =
+        rectangles.len() + usize::from(send_cursor) + usize::from(send_pointer_pos);
+    let rectangle_count = u16::try_from(rectangle_count)
+        .map_err(|_| invalid_data("too many rectangles in framebuffer update"))?;
+
     let mut header = [0u8; 4];
     header[0] = 0; // FramebufferUpdate
     header[1] = 0; // padding
-    header[2..4].copy_from_slice(&(rectangles.len() as u16).to_be_bytes());
+    header[2..4].copy_from_slice(&rectangle_count.to_be_bytes());
     write_all_interruptible(stream, &header, shutdown)?;
 
     for rect in rectangles {
@@ -1720,7 +1791,89 @@ fn send_update(
         }
     }
 
+    if send_cursor {
+        if let Some(shape) = state.cursor_snapshot.shape.as_deref() {
+            send_rich_cursor(stream, shape, state.pixel_format, shutdown)?;
+            state.sent_cursor_shape_sequence = state.cursor_snapshot.shape_sequence;
+        }
+    }
+    if send_pointer_pos {
+        if let Some(position) = state.cursor_snapshot.position {
+            send_pointer_position(stream, position, frame.width, frame.height, shutdown)?;
+            state.sent_cursor_position_sequence = state.cursor_snapshot.position_sequence;
+        }
+    }
+
     Ok(())
+}
+
+fn send_rich_cursor(
+    stream: &mut (impl Read + Write),
+    shape: &crate::cursor::CursorShape,
+    pixel_format: PixelFormat,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let expected_pixels = usize::from(shape.width)
+        .checked_mul(usize::from(shape.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| invalid_data("cursor dimensions overflow"))?;
+    if shape.width == 0
+        || shape.height == 0
+        || shape.hotspot.0 >= shape.width
+        || shape.hotspot.1 >= shape.height
+        || expected_pixels > 4 * 1024 * 1024
+        || shape.pixels.len() != expected_pixels
+    {
+        return Err(invalid_data("cursor shape is invalid or too large"));
+    }
+    let mut header = [0u8; 12];
+    header[0..2].copy_from_slice(&shape.hotspot.0.to_be_bytes());
+    header[2..4].copy_from_slice(&shape.hotspot.1.to_be_bytes());
+    header[4..6].copy_from_slice(&shape.width.to_be_bytes());
+    header[6..8].copy_from_slice(&shape.height.to_be_bytes());
+    header[8..12].copy_from_slice(&ENCODING_RICH_CURSOR.to_be_bytes());
+    write_all_interruptible(stream, &header, shutdown)?;
+
+    let bytes_per_pixel = pixel_format.bytes_per_pixel();
+    for bgra in shape.pixels.chunks_exact(4) {
+        let encoded = pixel_format.encode(bgra);
+        write_all_interruptible(stream, &encoded[..bytes_per_pixel], shutdown)?;
+    }
+
+    let width = usize::from(shape.width);
+    let height = usize::from(shape.height);
+    let mask_stride = width.div_ceil(8);
+    let mut mask = vec![0u8; mask_stride * height];
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = shape.pixels[(y * width + x) * 4 + 3];
+            if alpha != 0 {
+                mask[y * mask_stride + x / 8] |= 1 << (7 - x % 8);
+            }
+        }
+    }
+    write_all_interruptible(stream, &mask, shutdown)
+}
+
+fn send_pointer_position(
+    stream: &mut (impl Read + Write),
+    position: (i32, i32),
+    framebuffer_width: u32,
+    framebuffer_height: u32,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    if framebuffer_width == 0 || framebuffer_height == 0 {
+        return Err(invalid_data("framebuffer dimensions are invalid"));
+    }
+    let x = position.0.clamp(0, framebuffer_width as i32 - 1) as u16;
+    let y = position.1.clamp(0, framebuffer_height as i32 - 1) as u16;
+    let mut header = [0u8; 12];
+    header[0..2].copy_from_slice(&x.to_be_bytes());
+    header[2..4].copy_from_slice(&y.to_be_bytes());
+    header[4..6].copy_from_slice(&0u16.to_be_bytes());
+    header[6..8].copy_from_slice(&0u16.to_be_bytes());
+    header[8..12].copy_from_slice(&ENCODING_POINTER_POS.to_be_bytes());
+    write_all_interruptible(stream, &header, shutdown)
 }
 
 fn send_raw_rectangle(
@@ -2657,6 +2810,12 @@ mod tests {
             zrle_compressor: Compress::new(Compression::default(), true),
             zlib_compressor: Compress::new(Compression::default(), true),
             client_pixels: None,
+            cursor_enabled: false,
+            rich_cursor_enabled: false,
+            pointer_pos_enabled: false,
+            cursor_snapshot: crate::cursor::CursorSnapshot::default(),
+            sent_cursor_shape_sequence: 0,
+            sent_cursor_position_sequence: 0,
         }
     }
 
@@ -2698,6 +2857,7 @@ mod tests {
                     height: 2,
                     name: "test".to_string(),
                     input_enabled: true,
+                    cursor_enabled: false,
                     clipboard_enabled: true,
                     encodings: None,
                     authentication: None,
@@ -2997,6 +3157,7 @@ mod tests {
                 height: 2,
                 name: "test".to_string(),
                 input_enabled: false,
+                cursor_enabled: false,
                 clipboard_enabled: false,
                 encodings: None,
                 authentication: Some(Arc::new(AuthenticationConfig::Vnc {
@@ -3101,6 +3262,7 @@ mod tests {
                     height: 2,
                     name: "test".to_string(),
                     input_enabled: false,
+                    cursor_enabled: false,
                     clipboard_enabled: false,
                     encodings: None,
                     authentication: None,
@@ -3297,6 +3459,8 @@ mod tests {
             EncodingPreferences {
                 preferred: Encoding::Zlib,
                 copy_rect: true,
+                rich_cursor: false,
+                pointer_pos: false,
             }
         );
         let raw_only = [RfbEncoding::Raw];
@@ -3305,9 +3469,70 @@ mod tests {
             EncodingPreferences {
                 preferred: Encoding::Raw,
                 copy_rect: false,
+                rich_cursor: false,
+                pointer_pos: false,
             }
         );
         assert!(select_encodings(&42i32.to_be_bytes()).is_err());
+    }
+
+    #[test]
+    fn negotiates_cursor_pseudo_encodings_separately_from_frame_encoding() {
+        let mut offered = ENCODING_RAW.to_be_bytes().to_vec();
+        offered.extend_from_slice(&ENCODING_RICH_CURSOR.to_be_bytes());
+        offered.extend_from_slice(&ENCODING_POINTER_POS.to_be_bytes());
+        let selected = select_encodings(&offered).unwrap();
+        assert_eq!(selected.preferred, Encoding::Raw);
+        assert!(selected.rich_cursor);
+        assert!(selected.pointer_pos);
+    }
+
+    #[test]
+    fn sends_rich_cursor_shape_and_pointer_position_pseudo_rectangles() {
+        let frame = Frame::new(2, 1, vec![0; 8]).unwrap();
+        let shape = crate::cursor::CursorShape {
+            width: 2,
+            height: 1,
+            hotspot: (1, 0),
+            pixels: Arc::new(vec![1, 2, 3, 255, 4, 5, 6, 0]),
+        };
+        let mut state = test_update_state(Encoding::Raw, false);
+        state.cursor_enabled = true;
+        state.rich_cursor_enabled = true;
+        state.pointer_pos_enabled = true;
+        state.cursor_snapshot = crate::cursor::CursorSnapshot {
+            position: Some((1, 0)),
+            position_sequence: 1,
+            shape: Some(Arc::new(shape)),
+            shape_sequence: 1,
+        };
+        let mut output = std::io::Cursor::new(Vec::new());
+
+        send_update(
+            &mut output,
+            &frame,
+            &[],
+            &mut state,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let output = output.into_inner();
+        assert_eq!(&output[..4], &[0, 0, 0, 2]);
+        let cursor_rect = &output[4..16];
+        assert_eq!(&cursor_rect[..8], &[0, 1, 0, 0, 0, 2, 0, 1]);
+        assert_eq!(
+            i32::from_be_bytes(cursor_rect[8..12].try_into().unwrap()),
+            ENCODING_RICH_CURSOR
+        );
+        assert_eq!(&output[16..24], &[1, 2, 3, 255, 4, 5, 6, 0]);
+        assert_eq!(output[24], 0x80);
+        let pointer_rect = &output[25..37];
+        assert_eq!(&pointer_rect[..8], &[0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            i32::from_be_bytes(pointer_rect[8..12].try_into().unwrap()),
+            ENCODING_POINTER_POS
+        );
     }
 
     #[test]

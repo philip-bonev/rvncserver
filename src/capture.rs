@@ -19,6 +19,7 @@ use lamco_portal::{
 use tokio::sync::Notify;
 
 use crate::clipboard::portal::PortalClipboard;
+use crate::cursor::CursorUpdate;
 use crate::error::AppError;
 use crate::framebuffer::Frame;
 use crate::input::ClientEvent;
@@ -68,6 +69,14 @@ pub struct CaptureSession {
     pointer_buttons: u8,
     stream_id: u32,
     stream_size: (u32, u32),
+}
+
+/// Initial normalized frame and cursor metadata received with it, if any.
+pub struct CapturedFrame {
+    /// Normalized desktop framebuffer.
+    pub frame: Frame,
+    /// Cursor state attached to the PipeWire buffer.
+    pub cursor: Option<CursorUpdate>,
 }
 
 impl CaptureSession {
@@ -310,13 +319,20 @@ impl CaptureSession {
     /// Frames that cannot be normalized are skipped and reported at a bounded
     /// rate. This is used both by the server startup path and by the capture
     /// probe.
-    pub async fn wait_for_first_frame(&self, timeout: Duration) -> Result<Frame, AppError> {
+    pub async fn wait_for_first_frame(
+        &self,
+        timeout: Duration,
+        capture_cursor: bool,
+    ) -> Result<CapturedFrame, AppError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let notify = self.pipewire.frame_notify();
         let mut last_error_log = std::time::Instant::now();
 
         loop {
             while let Some(video_frame) = self.pipewire.try_recv_frame() {
+                let cursor = capture_cursor
+                    .then(|| CursorUpdate::from_video_frame(&video_frame))
+                    .flatten();
                 let buffer_type = match video_frame.meta.buffer_type {
                     1 => "MemPtr",
                     2 => "MemFd",
@@ -328,7 +344,7 @@ impl CaptureSession {
                         crate::timestamped_log!(
                             "capture: first usable PipeWire buffer type: {buffer_type}"
                         );
-                        return Ok(frame);
+                        return Ok(CapturedFrame { frame, cursor });
                     }
                     Err(error) => {
                         if last_error_log.elapsed() >= Duration::from_secs(5) {

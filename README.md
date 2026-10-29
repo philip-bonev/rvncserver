@@ -93,6 +93,12 @@ bytes. Rotated files are named `<log>.1.gz`, `<log>.2.gz`, etc. Set rotations to
 `0` to keep no backups. Rotation checks the size before each application log
 entry, so one large entry can exceed the threshold. The default target is
 stderr; daemonized stderr goes to `/dev/null` unless a log target is selected.
+The 50 MB/10-backup defaults apply when file logging is selected; they do not
+affect stderr or journald. Set `enable_cursor: true` in JSON or pass
+`--enable-cursor` to send the cursor shape (`RichCursor`) and movement
+(`PointerPos`) separately when a client advertises support. Cursor updates are
+disabled by default and depend on the compositor providing cursor metadata
+through PipeWire.
 Manage the daemon by its
 PID with `rvncserver --stop`, which sends SIGTERM and waits up to 10 seconds for
 graceful shutdown. The daemon writes and removes a PID file at
@@ -111,11 +117,13 @@ Example configuration:
   "port": 5900,
   "capture_probe": null,
   "enable_input": false,
+  "enable_cursor": false,
   "enable_clipboard": false,
   "daemonize": false,
-  "log_target": "stderr",
-  "log_max_size": null,
-  "log_max_rotations": null,
+  "log_target": "file",
+  "log_file": "rvncserver.log",
+  "log_max_size": "50MB",
+  "log_max_rotations": 10,
   "pid_file": null,
   "encodings": ["raw", "zrle", "copyrect"],
   "auth_mode": "vencrypt",

@@ -81,6 +81,8 @@ pub struct Config {
     pub capture_probe: Option<PathBuf>,
     /// Request portal permission for remote keyboard and pointer input.
     pub enable_input: bool,
+    /// Send cursor shape and pointer position as RFB pseudo-encodings.
+    pub enable_cursor: bool,
     /// Request portal permission for bidirectional clipboard sharing.
     pub enable_clipboard: bool,
     /// Optional allowlist of framebuffer encodings; Raw must be included.
@@ -193,6 +195,7 @@ struct FileConfig {
     port: Option<u16>,
     capture_probe: Option<PathBuf>,
     enable_input: Option<bool>,
+    enable_cursor: Option<bool>,
     enable_clipboard: Option<bool>,
     encodings: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
@@ -221,6 +224,7 @@ where
     let mut port = DEFAULT_PORT;
     let mut capture_probe = None;
     let mut enable_input = false;
+    let mut enable_cursor = false;
     let mut enable_clipboard = false;
     let mut encodings = None;
     let mut tls_cert = None;
@@ -239,6 +243,7 @@ where
     let mut port_set = false;
     let mut capture_probe_set = false;
     let mut enable_input_set = false;
+    let mut enable_cursor_set = false;
     let mut enable_clipboard_set = false;
     let mut encodings_set = false;
     let mut tls_cert_set = false;
@@ -449,6 +454,30 @@ where
                 enable_input_set = true;
                 enable_input = false;
             }
+            "--enable-cursor" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if enable_cursor_set {
+                    return Err(CliError::DuplicateOption(
+                        "--enable-cursor/--disable-cursor",
+                    ));
+                }
+                enable_cursor_set = true;
+                enable_cursor = true;
+            }
+            "--disable-cursor" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if enable_cursor_set {
+                    return Err(CliError::DuplicateOption(
+                        "--enable-cursor/--disable-cursor",
+                    ));
+                }
+                enable_cursor_set = true;
+                enable_cursor = false;
+            }
             "--enable-clipboard" => {
                 if inline_value.is_some() {
                     return Err(CliError::UnknownArgument(raw));
@@ -517,6 +546,9 @@ where
     }
     if !enable_input_set {
         enable_input = file_config.enable_input.unwrap_or(false);
+    }
+    if !enable_cursor_set {
+        enable_cursor = file_config.enable_cursor.unwrap_or(false);
     }
     if !enable_clipboard_set {
         enable_clipboard = file_config.enable_clipboard.unwrap_or(false);
@@ -626,9 +658,9 @@ where
         ));
     }
 
-    if capture_probe.is_some() && (enable_input || enable_clipboard) {
+    if capture_probe.is_some() && (enable_input || enable_clipboard || enable_cursor) {
         return Err(CliError::IncompatibleOptions(
-            "--enable-input and --enable-clipboard require server mode and cannot be used with --capture-probe",
+            "--enable-input, --enable-clipboard, and --enable-cursor require server mode and cannot be used with --capture-probe",
         ));
     }
     if capture_probe.is_some() && daemonize {
@@ -670,6 +702,7 @@ where
         port,
         capture_probe,
         enable_input,
+        enable_cursor,
         enable_clipboard,
         encodings,
         tls_cert,
@@ -849,6 +882,8 @@ Options:
   --log-max-rotations <N>  Number of compressed rotated logs to keep (default: 10)
   --enable-input           Request portal permission for keyboard/pointer control
   --disable-input          Disable keyboard/pointer control from the config file
+  --enable-cursor          Send cursor shape/position separately to VNC clients
+  --disable-cursor         Disable separate cursor updates from the config file
   --enable-clipboard       Request portal permission for clipboard sharing
   --disable-clipboard      Disable clipboard sharing from the config file
   --encodings <LIST>       Allowed encodings, comma-separated (must include raw)
@@ -908,6 +943,7 @@ mod tests {
         assert_eq!(config.port, 5900);
         assert_eq!(config.capture_probe, None);
         assert!(!config.enable_input);
+        assert!(!config.enable_cursor);
         assert!(!config.enable_clipboard);
         assert_eq!(config.encodings, None);
         assert!(config.tls_cert.is_none());
@@ -946,9 +982,11 @@ mod tests {
 
     #[test]
     fn parses_input_and_clipboard_flags() {
-        let config = config(&["--enable-input", "--enable-clipboard"]);
-        assert!(config.enable_input);
-        assert!(config.enable_clipboard);
+        let selected = config(&["--enable-input", "--enable-clipboard", "--enable-cursor"]);
+        assert!(selected.enable_input);
+        assert!(selected.enable_clipboard);
+        assert!(selected.enable_cursor);
+        assert!(parse(&["--enable-cursor", "--disable-cursor"]).is_err());
     }
 
     #[test]
@@ -1074,9 +1112,10 @@ mod tests {
         assert_eq!(
             parse(&["--capture-probe", "/tmp/frame.ppm", "--enable-input"]),
             Err(CliError::IncompatibleOptions(
-                "--enable-input and --enable-clipboard require server mode and cannot be used with --capture-probe"
+                "--enable-input, --enable-clipboard, and --enable-cursor require server mode and cannot be used with --capture-probe"
             ))
         );
+        assert!(parse(&["--capture-probe", "/tmp/frame.ppm", "--enable-cursor"]).is_err());
     }
 
     #[test]
@@ -1088,7 +1127,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_cursor":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -1096,6 +1135,7 @@ mod tests {
         assert_eq!(loaded.listen, "0.0.0.0".parse::<IpAddr>().unwrap());
         assert_eq!(loaded.port, 5902);
         assert!(loaded.enable_input);
+        assert!(loaded.enable_cursor);
         assert!(loaded.enable_clipboard);
         assert_eq!(
             loaded.encodings,

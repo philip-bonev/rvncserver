@@ -89,7 +89,10 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let clipboard_enabled = clipboard_events.is_some();
 
     crate::timestamped_log!("capture: waiting for the first frame...");
-    let first_frame = capture.wait_for_first_frame(FIRST_FRAME_TIMEOUT).await?;
+    let first_capture = capture
+        .wait_for_first_frame(FIRST_FRAME_TIMEOUT, config.enable_cursor)
+        .await?;
+    let first_frame = first_capture.frame;
 
     let width = u16::try_from(first_frame.width).map_err(|_| {
         AppError::Capture(format!(
@@ -106,6 +109,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     let store = Arc::new(FrameStore::new());
     store.publish(Arc::new(first_frame));
+    if config.enable_cursor {
+        if let Some(cursor) = first_capture.cursor {
+            store.publish_cursor(cursor);
+        }
+    }
 
     crate::timestamped_log!("rfb: listening on {address}");
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -122,6 +130,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             height,
             name: "rvncserver".to_string(),
             input_enabled: config.enable_input,
+            cursor_enabled: config.enable_cursor,
             clipboard_enabled,
             encodings: config.encodings.clone(),
             authentication: Some(authentication),
@@ -137,6 +146,11 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     loop {
         while let Some(video_frame) = capture.try_recv_frame() {
+            if config.enable_cursor
+                && let Some(cursor) = crate::cursor::CursorUpdate::from_video_frame(&video_frame)
+            {
+                store.publish_cursor(cursor);
+            }
             if !store.has_clients() {
                 continue;
             }
