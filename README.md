@@ -84,10 +84,24 @@ override a JSON daemon setting. Select diagnostics output with
 `--log-target file|journald`. File logging requires `log_file` or
 `--log-file <PATH>` and appends to an owner-only file; JSON paths are relative to
 the config file. Journald logging uses the system syslog interface and is
-collected by systemd-journald. The default target is stderr; daemonized stderr
-goes to `/dev/null` unless a log target is selected. Manage the daemon by its
-PID using your operating system's process tools; rvncserver does not currently
-create a PID file or provide a service manager integration.
+collected by systemd-journald. File logs rotate at 50 MB by default and retain
+10 compressed backups. Override these with `log_max_size` and
+`log_max_rotations` in JSON, or `--log-max-size <SIZE>` and
+`--log-max-rotations <N>`. Sizes accept `B`, `KB`, `MB`, and `GB` suffixes
+(case-insensitive, binary units where 1 KB = 1024 bytes); a bare number means
+bytes. Rotated files are named `<log>.1.gz`, `<log>.2.gz`, etc. Set rotations to
+`0` to keep no backups. Rotation checks the size before each application log
+entry, so one large entry can exceed the threshold. The default target is
+stderr; daemonized stderr goes to `/dev/null` unless a log target is selected.
+Manage the daemon by its
+PID with `rvncserver --stop`, which sends SIGTERM and waits up to 10 seconds for
+graceful shutdown. The daemon writes and removes a PID file at
+`$XDG_RUNTIME_DIR/rvncserver.pid` (falling back to
+`$XDG_STATE_HOME/rvncserver/rvncserver.pid` or
+`$HOME/.local/state/rvncserver/rvncserver.pid`). Override it with `pid_file` in
+JSON or `--pid-file <PATH>`; pass the same path to `--stop` if needed. PID files
+include process start-time data to avoid signaling a reused PID. This is not a
+service-manager integration.
 
 Example configuration:
 
@@ -100,6 +114,9 @@ Example configuration:
   "enable_clipboard": false,
   "daemonize": false,
   "log_target": "stderr",
+  "log_max_size": null,
+  "log_max_rotations": null,
+  "pid_file": null,
   "encodings": ["raw", "zrle", "copyrect"],
   "auth_mode": "vencrypt",
   "tls_cert": "server.crt",

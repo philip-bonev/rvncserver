@@ -22,8 +22,17 @@ use crate::rfb;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Run the capture and RFB server until Ctrl+C.
+/// Run the capture and RFB server until Ctrl+C or SIGTERM.
 pub async fn run(config: Config) -> Result<(), AppError> {
+    // Install handlers before portal setup so stop requests during startup are
+    // queued and handled through the same orderly cleanup path.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| {
+        AppError::Network(format!("could not register SIGTERM handler: {error}"))
+    })?;
+
     let password_path = config.password_file.as_deref().ok_or_else(|| {
         AppError::Network(
             "authentication requires password_file in config.json or --password-file".to_string(),
@@ -126,9 +135,6 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let notify = capture.frame_notify();
     let mut last_frame_error: Option<Instant> = None;
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-
     loop {
         while let Some(video_frame) = capture.try_recv_frame() {
             if !store.has_clients() {
@@ -225,6 +231,10 @@ pub async fn run(config: Config) -> Result<(), AppError> {
                 if let Err(error) = result {
                     crate::timestamped_log!("server: could not listen for Ctrl+C: {error}");
                 }
+                break;
+            }
+            _ = terminate.recv() => {
+                crate::timestamped_log!("server: received SIGTERM");
                 break;
             }
         }

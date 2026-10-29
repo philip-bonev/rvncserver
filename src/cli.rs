@@ -19,6 +19,9 @@ pub const DEFAULT_LISTEN: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default RFB port.
 pub const DEFAULT_PORT: u16 = 5900;
 
+/// Default file-log rotation threshold (50 MiB).
+pub const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
+
 /// RFB encodings that the server may negotiate with a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RfbEncoding {
@@ -96,6 +99,12 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     /// Destination for application diagnostics.
     pub log_target: LogTarget,
+    /// Rotate file logs when they reach this size, in bytes. `None` disables rotation.
+    pub log_max_size: u64,
+    /// Number of compressed rotated log files to retain (default: 10).
+    pub log_max_rotations: usize,
+    /// PID file used to stop a daemonized instance.
+    pub pid_file: Option<PathBuf>,
     /// Path from which this configuration was loaded, if any.
     pub config_file: Option<PathBuf>,
 }
@@ -109,6 +118,8 @@ pub enum Command {
     Help,
     /// Print the application version and exit.
     Version,
+    /// Stop the daemon identified by its PID file.
+    Stop(PathBuf),
 }
 
 /// Command-line validation failure.
@@ -168,6 +179,13 @@ impl fmt::Display for CliError {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConfigLogSize {
+    Bytes(u64),
+    Unit(String),
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -184,6 +202,9 @@ struct FileConfig {
     log_target: Option<String>,
     daemonize: Option<bool>,
     log_file: Option<PathBuf>,
+    log_max_size: Option<ConfigLogSize>,
+    log_max_rotations: Option<usize>,
+    pid_file: Option<PathBuf>,
 }
 
 impl Error for CliError {}
@@ -209,6 +230,9 @@ where
     let mut daemonize = false;
     let mut log_file = None;
     let mut cli_log_target = None;
+    let mut cli_log_max_size = None;
+    let mut cli_log_max_rotations = None;
+    let mut pid_file = None;
     let mut config_path = None;
 
     let mut listen_set = false;
@@ -223,6 +247,8 @@ where
     let mut auth_mode_set = false;
     let mut daemonize_set = false;
     let mut log_file_set = false;
+    let mut pid_file_set = false;
+    let mut stop_requested = false;
     let mut config_path_set = false;
 
     let mut args = args.into_iter();
@@ -245,6 +271,15 @@ where
                     return Err(CliError::UnknownArgument(raw));
                 }
                 return Ok(Command::Version);
+            }
+            "--stop" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if stop_requested {
+                    return Err(CliError::DuplicateOption("--stop"));
+                }
+                stop_requested = true;
             }
             "--listen" => {
                 if listen_set {
@@ -358,6 +393,41 @@ where
                     &mut args,
                     "--log-target",
                 )?)?);
+            }
+            "--log-max-size" => {
+                if cli_log_max_size.is_some() {
+                    return Err(CliError::DuplicateOption("--log-max-size"));
+                }
+                let value = take_value(inline_value, &mut args, "--log-max-size")?;
+                let size = parse_log_size(&value)?;
+                if size == 0 {
+                    return Err(CliError::IncompatibleOptions(
+                        "--log-max-size must be a positive byte count",
+                    ));
+                }
+                cli_log_max_size = Some(size);
+            }
+            "--log-max-rotations" => {
+                if cli_log_max_rotations.is_some() {
+                    return Err(CliError::DuplicateOption("--log-max-rotations"));
+                }
+                let value = take_value(inline_value, &mut args, "--log-max-rotations")?;
+                cli_log_max_rotations = Some(value.parse::<usize>().map_err(|_| {
+                    CliError::IncompatibleOptions(
+                        "--log-max-rotations must be a non-negative integer",
+                    )
+                })?);
+            }
+            "--pid-file" => {
+                if pid_file_set {
+                    return Err(CliError::DuplicateOption("--pid-file"));
+                }
+                pid_file_set = true;
+                pid_file = Some(PathBuf::from(take_value(
+                    inline_value,
+                    &mut args,
+                    "--pid-file",
+                )?));
             }
             "--enable-input" => {
                 if inline_value.is_some() {
@@ -477,6 +547,22 @@ where
     if !log_file_set {
         log_file = file_config.log_file;
     }
+    if !pid_file_set {
+        pid_file = file_config.pid_file;
+    }
+    let configured_log_max_size = file_config
+        .log_max_size
+        .map(|value| match value {
+            ConfigLogSize::Bytes(bytes) => Ok(bytes),
+            ConfigLogSize::Unit(value) => parse_log_size(&value),
+        })
+        .transpose()?;
+    let log_max_size = cli_log_max_size
+        .or(configured_log_max_size)
+        .unwrap_or(DEFAULT_LOG_MAX_SIZE);
+    let log_max_rotations = cli_log_max_rotations
+        .or(file_config.log_max_rotations)
+        .unwrap_or(10);
     let log_target = match cli_log_target {
         Some(target) => target,
         None if log_file_set => LogTarget::File,
@@ -505,6 +591,19 @@ where
         if !log_file_set {
             resolve_relative(&mut log_file, base);
         }
+        if !pid_file_set {
+            resolve_relative(&mut pid_file, base);
+        }
+    }
+
+    if stop_requested {
+        let pid_file =
+            pid_file
+                .or_else(default_pid_file_path)
+                .ok_or(CliError::IncompatibleOptions(
+                    "cannot determine PID file; set XDG_RUNTIME_DIR, HOME, or --pid-file",
+                ))?;
+        return Ok(Command::Stop(pid_file));
     }
 
     let any_credential_setting = tls_cert.is_some() || tls_key.is_some() || password_file.is_some();
@@ -550,6 +649,21 @@ where
         }
         LogTarget::File | LogTarget::Stderr | LogTarget::Journald => {}
     }
+    if log_max_size == 0 {
+        return Err(CliError::IncompatibleOptions(
+            "log_max_size must be a positive byte count",
+        ));
+    }
+    if log_target != LogTarget::File
+        && (cli_log_max_size.is_some()
+            || configured_log_max_size.is_some()
+            || cli_log_max_rotations.is_some()
+            || file_config.log_max_rotations.is_some())
+    {
+        return Err(CliError::IncompatibleOptions(
+            "log rotation requires the file log target",
+        ));
+    }
 
     Ok(Command::Run(Config {
         listen,
@@ -565,6 +679,9 @@ where
         daemonize,
         log_file,
         log_target,
+        log_max_size,
+        log_max_rotations,
+        pid_file: pid_file.or_else(default_pid_file_path),
         config_file: selected_config.filter(|path| path.exists()),
     }))
 }
@@ -602,6 +719,16 @@ fn default_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/rvncserver/config.json"))
 }
 
+fn default_pid_file_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return Some(PathBuf::from(path).join("rvncserver.pid"));
+    }
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
+    state_home.map(|path| path.join("rvncserver/rvncserver.pid"))
+}
+
 fn parse_auth_mode(value: &str) -> Result<AuthMode, CliError> {
     match value {
         "vencrypt" => Ok(AuthMode::VeNCrypt),
@@ -622,6 +749,44 @@ fn parse_log_target(value: &str) -> Result<LogTarget, CliError> {
             "invalid log target; expected stderr, file, or journald",
         )),
     }
+}
+
+fn parse_log_size(value: &str) -> Result<u64, CliError> {
+    let value = value.trim();
+    let split_at = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    if split_at == 0 {
+        return Err(CliError::IncompatibleOptions(
+            "log size must be a positive integer with optional B, KB, MB, or GB suffix",
+        ));
+    }
+    let number = value[..split_at].parse::<u64>().map_err(|_| {
+        CliError::IncompatibleOptions("log size is outside the supported integer range")
+    })?;
+    let suffix = value[split_at..].trim().to_ascii_uppercase();
+    let multiplier = match suffix.as_str() {
+        "" | "B" => 1,
+        "KB" => 1024,
+        "MB" => 1024 * 1024,
+        "GB" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(CliError::IncompatibleOptions(
+                "unsupported log size unit; use B, KB, MB, or GB",
+            ));
+        }
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .ok_or(CliError::IncompatibleOptions(
+            "log size is outside the supported integer range",
+        ))?;
+    if bytes == 0 {
+        return Err(CliError::IncompatibleOptions(
+            "log size must be greater than zero",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn resolve_relative(path: &mut Option<PathBuf>, base: &std::path::Path) {
@@ -675,8 +840,13 @@ Options:
   --auth <MODE>            Authentication: vencrypt (default), vnc, or apple-dh
   --daemonize              Detach from the terminal and run in the background
   --foreground             Override daemonize=true from JSON
+  --pid-file <PATH>        PID file for daemon control (default: XDG runtime dir)
+  --stop                   Request graceful shutdown of the daemon
   --log-file <PATH>        Append stdout and stderr to this file
   --log-target <TARGET>    Log destination: stderr (default), file, or journald
+  --log-max-size <SIZE>    Rotate file logs at this size (default: 50MB)
+                           Supports B, KB, MB, GB; bare numbers are bytes
+  --log-max-rotations <N>  Number of compressed rotated logs to keep (default: 10)
   --enable-input           Request portal permission for keyboard/pointer control
   --disable-input          Disable keyboard/pointer control from the config file
   --enable-clipboard       Request portal permission for clipboard sharing
@@ -747,6 +917,8 @@ mod tests {
         assert!(!config.daemonize);
         assert!(config.log_file.is_none());
         assert_eq!(config.log_target, LogTarget::Stderr);
+        assert_eq!(config.log_max_size, 50 * 1024 * 1024);
+        assert_eq!(config.log_max_rotations, 10);
     }
 
     #[test]
@@ -794,6 +966,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_stop_and_pid_file_options() {
+        assert_eq!(
+            parse(&["--stop", "--pid-file", "/tmp/rvncserver.pid"]),
+            Ok(Command::Stop(PathBuf::from("/tmp/rvncserver.pid")))
+        );
+        assert_eq!(
+            config(&["--pid-file", "/tmp/rvncserver.pid"]).pid_file,
+            Some(PathBuf::from("/tmp/rvncserver.pid"))
+        );
+        assert_eq!(
+            parse(&["--stop", "--stop"]),
+            Err(CliError::DuplicateOption("--stop"))
+        );
+    }
+
+    #[test]
     fn parses_and_validates_log_targets() {
         assert_eq!(
             config(&["--log-target", "journald"]).log_target,
@@ -805,6 +993,35 @@ mod tests {
         );
         assert!(parse(&["--log-target", "file"]).is_err());
         assert!(parse(&["--log-target", "journald", "--log-file", "/tmp/server.log"]).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_log_rotation_options() {
+        let selected = config(&[
+            "--log-file",
+            "/tmp/rvncserver.log",
+            "--log-max-size",
+            "1MB",
+            "--log-max-rotations",
+            "3",
+        ]);
+        assert_eq!(selected.log_max_size, 1024 * 1024);
+        assert_eq!(selected.log_max_rotations, 3);
+
+        for (value, expected) in [
+            ("2GB", 2 * 1024 * 1024 * 1024),
+            ("3MB", 3 * 1024 * 1024),
+            ("4KB", 4 * 1024),
+            ("5B", 5),
+            ("6", 6),
+        ] {
+            assert_eq!(parse_log_size(value).unwrap(), expected);
+        }
+        assert!(parse_log_size("1TB").is_err());
+        assert!(parse_log_size("0MB").is_err());
+
+        assert!(parse(&["--log-max-size", "100"]).is_err());
+        assert!(parse(&["--log-file", "/tmp/rvncserver.log", "--log-max-size", "0"]).is_err());
     }
 
     #[test]
@@ -871,7 +1088,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log"}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -894,6 +1111,8 @@ mod tests {
             loaded.log_file,
             Some(path.parent().unwrap().join("rvncserver.log"))
         );
+        assert_eq!(loaded.log_max_size, 2 * 1024 * 1024);
+        assert_eq!(loaded.log_max_rotations, 2);
         assert!(!config(&["--config", &path_argument, "--foreground"]).daemonize);
         assert_eq!(
             loaded.password_file,
