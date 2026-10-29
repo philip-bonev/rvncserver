@@ -20,6 +20,15 @@ separate desktop session, or a graphical interface.
 cargo build --release
 ```
 
+To build the release binary and Debian package together, use cargo-deb:
+
+```sh
+cargo deb
+```
+
+The `.deb` is written to `target/debian/`. It declares `xdg-desktop-portal` and
+uses cargo-deb's `$auto` dependency detection for linked system libraries.
+
 ## Run
 
 Configure an authentication mode and credential file as described below before
@@ -68,6 +77,18 @@ file. Command-line options override values from JSON. Paths in the JSON file are
 relative to that file's directory; command-line paths are relative to the
 current directory.
 
+The server stays in the foreground by default. Set `"daemonize": true` in JSON
+or pass `--daemonize` to fork into a detached session. Use `--foreground` to
+override a JSON daemon setting. Select diagnostics output with
+`"log_target": "file"` or `"log_target": "journald"` in JSON, or
+`--log-target file|journald`. File logging requires `log_file` or
+`--log-file <PATH>` and appends to an owner-only file; JSON paths are relative to
+the config file. Journald logging uses the system syslog interface and is
+collected by systemd-journald. The default target is stderr; daemonized stderr
+goes to `/dev/null` unless a log target is selected. Manage the daemon by its
+PID using your operating system's process tools; rvncserver does not currently
+create a PID file or provide a service manager integration.
+
 Example configuration:
 
 ```json
@@ -77,6 +98,8 @@ Example configuration:
   "capture_probe": null,
   "enable_input": false,
   "enable_clipboard": false,
+  "daemonize": false,
+  "log_target": "stderr",
   "encodings": ["raw", "zrle", "copyrect"],
   "auth_mode": "vencrypt",
   "tls_cert": "server.crt",

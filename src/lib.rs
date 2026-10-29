@@ -24,6 +24,6 @@ pub mod server;
 #[macro_export]
 macro_rules! timestamped_log {
     ($($argument:tt)*) => {{
-        eprintln!("[{}] {}", $crate::logging::timestamp(), format_args!($($argument)*));
+        $crate::logging::log(format_args!("[{}] {}", $crate::logging::timestamp(), format_args!($($argument)*)));
     }};
 }

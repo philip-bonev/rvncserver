@@ -54,6 +54,18 @@ pub enum AuthMode {
     AppleDh,
 }
 
+/// Destination for application diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogTarget {
+    /// Keep output on the existing stderr (or `/dev/null` when daemonized).
+    #[default]
+    Stderr,
+    /// Append output to `log_file`.
+    File,
+    /// Send output to the system log, which systemd-journald collects.
+    Journald,
+}
+
 /// Validated runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -78,6 +90,12 @@ pub struct Config {
     pub password_file: Option<PathBuf>,
     /// Authentication mode selected from CLI or JSON.
     pub auth_mode: AuthMode,
+    /// Run detached from the invoking terminal.
+    pub daemonize: bool,
+    /// Append stdout/stderr output to this file.
+    pub log_file: Option<PathBuf>,
+    /// Destination for application diagnostics.
+    pub log_target: LogTarget,
     /// Path from which this configuration was loaded, if any.
     pub config_file: Option<PathBuf>,
 }
@@ -163,6 +181,9 @@ struct FileConfig {
     tls_key: Option<PathBuf>,
     password_file: Option<PathBuf>,
     auth_mode: Option<String>,
+    log_target: Option<String>,
+    daemonize: Option<bool>,
+    log_file: Option<PathBuf>,
 }
 
 impl Error for CliError {}
@@ -185,6 +206,9 @@ where
     let mut tls_key = None;
     let mut password_file = None;
     let mut auth_mode = AuthMode::default();
+    let mut daemonize = false;
+    let mut log_file = None;
+    let mut cli_log_target = None;
     let mut config_path = None;
 
     let mut listen_set = false;
@@ -197,6 +221,8 @@ where
     let mut tls_key_set = false;
     let mut password_file_set = false;
     let mut auth_mode_set = false;
+    let mut daemonize_set = false;
+    let mut log_file_set = false;
     let mut config_path_set = false;
 
     let mut args = args.into_iter();
@@ -301,6 +327,37 @@ where
                 auth_mode_set = true;
                 let value = take_value(inline_value, &mut args, "--auth")?;
                 auth_mode = parse_auth_mode(&value)?;
+            }
+            "--daemonize" | "--foreground" => {
+                if inline_value.is_some() {
+                    return Err(CliError::UnknownArgument(raw));
+                }
+                if daemonize_set {
+                    return Err(CliError::DuplicateOption("--daemonize/--foreground"));
+                }
+                daemonize_set = true;
+                daemonize = name == "--daemonize";
+            }
+            "--log-file" => {
+                if log_file_set {
+                    return Err(CliError::DuplicateOption("--log-file"));
+                }
+                log_file_set = true;
+                log_file = Some(PathBuf::from(take_value(
+                    inline_value,
+                    &mut args,
+                    "--log-file",
+                )?));
+            }
+            "--log-target" => {
+                if cli_log_target.is_some() {
+                    return Err(CliError::DuplicateOption("--log-target"));
+                }
+                cli_log_target = Some(parse_log_target(&take_value(
+                    inline_value,
+                    &mut args,
+                    "--log-target",
+                )?)?);
             }
             "--enable-input" => {
                 if inline_value.is_some() {
@@ -414,6 +471,24 @@ where
             auth_mode = parse_auth_mode(&value)?;
         }
     }
+    if !daemonize_set {
+        daemonize = file_config.daemonize.unwrap_or(false);
+    }
+    if !log_file_set {
+        log_file = file_config.log_file;
+    }
+    let log_target = match cli_log_target {
+        Some(target) => target,
+        None if log_file_set => LogTarget::File,
+        None => match file_config.log_target.as_deref() {
+            Some(target) => parse_log_target(target)?,
+            None if log_file.is_some() => LogTarget::File,
+            None => LogTarget::Stderr,
+        },
+    };
+    if cli_log_target.is_some() && log_target != LogTarget::File && !log_file_set {
+        log_file = None;
+    }
     if let Some(base) = selected_config.as_ref().and_then(|path| path.parent()) {
         if !capture_probe_set {
             resolve_relative(&mut capture_probe, base);
@@ -426,6 +501,9 @@ where
         }
         if !password_file_set {
             resolve_relative(&mut password_file, base);
+        }
+        if !log_file_set {
+            resolve_relative(&mut log_file, base);
         }
     }
 
@@ -454,6 +532,24 @@ where
             "--enable-input and --enable-clipboard require server mode and cannot be used with --capture-probe",
         ));
     }
+    if capture_probe.is_some() && daemonize {
+        return Err(CliError::IncompatibleOptions(
+            "--daemonize cannot be used with --capture-probe",
+        ));
+    }
+    match log_target {
+        LogTarget::File if log_file.is_none() => {
+            return Err(CliError::IncompatibleOptions(
+                "file logging requires log_file or --log-file",
+            ));
+        }
+        LogTarget::Stderr | LogTarget::Journald if log_file.is_some() => {
+            return Err(CliError::IncompatibleOptions(
+                "log_file requires the file log target",
+            ));
+        }
+        LogTarget::File | LogTarget::Stderr | LogTarget::Journald => {}
+    }
 
     Ok(Command::Run(Config {
         listen,
@@ -466,6 +562,9 @@ where
         tls_key,
         password_file,
         auth_mode,
+        daemonize,
+        log_file,
+        log_target,
         config_file: selected_config.filter(|path| path.exists()),
     }))
 }
@@ -510,6 +609,17 @@ fn parse_auth_mode(value: &str) -> Result<AuthMode, CliError> {
         "apple-dh" => Ok(AuthMode::AppleDh),
         _ => Err(CliError::IncompatibleOptions(
             "invalid auth mode; expected vencrypt, vnc, or apple-dh",
+        )),
+    }
+}
+
+fn parse_log_target(value: &str) -> Result<LogTarget, CliError> {
+    match value {
+        "file" => Ok(LogTarget::File),
+        "journald" => Ok(LogTarget::Journald),
+        "stderr" => Ok(LogTarget::Stderr),
+        _ => Err(CliError::IncompatibleOptions(
+            "invalid log target; expected stderr, file, or journald",
         )),
     }
 }
@@ -563,6 +673,10 @@ Options:
   --tls-key <PATH>         TLS private key PEM
   --password-file <PATH>   Authentication credentials file (owner-only permissions)
   --auth <MODE>            Authentication: vencrypt (default), vnc, or apple-dh
+  --daemonize              Detach from the terminal and run in the background
+  --foreground             Override daemonize=true from JSON
+  --log-file <PATH>        Append stdout and stderr to this file
+  --log-target <TARGET>    Log destination: stderr (default), file, or journald
   --enable-input           Request portal permission for keyboard/pointer control
   --disable-input          Disable keyboard/pointer control from the config file
   --enable-clipboard       Request portal permission for clipboard sharing
@@ -630,6 +744,9 @@ mod tests {
         assert!(config.tls_key.is_none());
         assert!(config.password_file.is_none());
         assert_eq!(config.auth_mode, AuthMode::VeNCrypt);
+        assert!(!config.daemonize);
+        assert!(config.log_file.is_none());
+        assert_eq!(config.log_target, LogTarget::Stderr);
     }
 
     #[test]
@@ -660,6 +777,34 @@ mod tests {
         let config = config(&["--enable-input", "--enable-clipboard"]);
         assert!(config.enable_input);
         assert!(config.enable_clipboard);
+    }
+
+    #[test]
+    fn parses_daemon_and_log_options() {
+        let selected = config(&["--daemonize", "--log-file", "/tmp/rvncserver.log"]);
+        assert!(selected.daemonize);
+        assert_eq!(
+            selected.log_file,
+            Some(PathBuf::from("/tmp/rvncserver.log"))
+        );
+        assert_eq!(
+            parse(&["--daemonize", "--foreground"]),
+            Err(CliError::DuplicateOption("--daemonize/--foreground"))
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_log_targets() {
+        assert_eq!(
+            config(&["--log-target", "journald"]).log_target,
+            LogTarget::Journald
+        );
+        assert_eq!(
+            config(&["--log-target", "file", "--log-file", "/tmp/server.log"]).log_target,
+            LogTarget::File
+        );
+        assert!(parse(&["--log-target", "file"]).is_err());
+        assert!(parse(&["--log-target", "journald", "--log-file", "/tmp/server.log"]).is_err());
     }
 
     #[test]
@@ -726,7 +871,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"]}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log"}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -744,6 +889,12 @@ mod tests {
             Some(vec![RfbEncoding::Raw])
         );
         assert_eq!(loaded.auth_mode, AuthMode::Vnc);
+        assert!(loaded.daemonize);
+        assert_eq!(
+            loaded.log_file,
+            Some(path.parent().unwrap().join("rvncserver.log"))
+        );
+        assert!(!config(&["--config", &path_argument, "--foreground"]).daemonize);
         assert_eq!(
             loaded.password_file,
             Some(PathBuf::from("/tmp/credentials.txt"))
