@@ -33,7 +33,9 @@ uses cargo-deb's `$auto` dependency detection for linked system libraries.
 
 Configure an authentication mode and credential file as described below before
 the first server start. VeNCrypt is the default and requires its TLS settings;
-VNC mode does not use TLS.
+VNC mode offers TLS-protected authentication when both `tls_cert` and
+`tls_key` are configured. The TLS certificate authenticates the server to the
+client; client certificates are not required.
 
 ```sh
 ./target/release/rvncserver
@@ -164,16 +166,23 @@ password on separate lines. For `auth_mode: "vnc"` (or `--auth vnc`), clients
 use classic VNC Authentication; the password is limited to 8 bytes and may be
 provided as a one-line file, or as the second line of the same two-line file.
 Both credential-file formats require owner-only permissions (`chmod 600`).
-Classic VNC Authentication does not encrypt the session and its DES challenge
-response is weak; use VeNCrypt unless compatibility requires VNC mode. The
-desktop portal requests permission for enabled input and clipboard capabilities.
+`auth_mode: "vnc"` uses TLS when both `tls_cert` and `tls_key` are configured.
+In that case it offers VeNCrypt `X509Vnc` plus plaintext VNC. RFB 3.8 clients
+may select either; RFB 3.3 clients use plaintext VNC because VeNCrypt is not
+available in that version. This explicitly permits a plaintext downgrade, and
+the server logs a warning when it is used. Without both TLS settings, VNC mode
+is plaintext only. Clients must support X509Vnc and trust the server certificate
+to use TLS; client certificates are not required. The desktop portal requests
+permission for enabled input and clipboard capabilities.
 If the portal does not provide clipboard support, the server warns and continues
 without clipboard sharing. Authenticated clients can use any enabled capability.
 
-To select classic VNC authentication from the command line, provide a
-password-only file (maximum 8 bytes) and use `--auth vnc`; the same mode can be
-selected with `"auth_mode": "vnc"` in JSON. When using the two-line VeNCrypt
-credential file, VNC mode uses the second line as its password.
+To select VNC password authentication from the command line, provide a
+password-only file (maximum 8 bytes) and use `--auth vnc`; it can also be
+selected with `"auth_mode": "vnc"` in JSON. Configure the TLS certificate and
+key to enable X509Vnc in VNC mode. RFB 3.8 clients can then choose X509Vnc or
+plaintext VNC; RFB 3.3 clients use plaintext VNC. When using the two-line
+credential file, VNC mode uses the second line as the password.
 
 Apple's legacy DH authentication is experimental and currently not working
 with macOS Screen Sharing. It can be selected with `--auth apple-dh` or
@@ -201,6 +210,8 @@ This captures one normalized frame and writes it as a binary PPM file.
 - RFB 3.8 version negotiation for authenticated server sessions
 - VeNCrypt X509Plain (TLS plus username/password authentication; default)
 - Classic VNC Authentication (RFB SecurityType 2), selectable with `--auth vnc`
+- VNC Authentication with optional TLS via VeNCrypt X509Vnc when both TLS files
+  are configured; VNC mode also offers plaintext fallback
 - Experimental Apple DH authentication (SecurityType 30 and RFB 3.889), opt-in
   with `--auth apple-dh`; currently not working with macOS Screen Sharing
 - One client at a time
@@ -224,13 +235,17 @@ This captures one normalized frame and writes it as a binary PPM file.
 - TLS certificate trust must be configured on each client using VeNCrypt.
   Protect the private key and credential file; the server rejects either file
   if it has group/other permission bits set.
-- VNC mode is unencrypted, uses obsolete DES, truncates password security to
-  at most 8 bytes, and permits offline guessing from captured challenges. Do
+- TLS-protected VNC requires RFB 3.8 and a client that supports X509Vnc. VNC
+  mode permits plaintext fallback: RFB 3.3 clients use it, and RFB 3.8 clients
+  may select it. Use `vencrypt` when TLS must be mandatory. No client
+  certificate is required.
+- Plain VNC mode is unencrypted, uses obsolete DES, truncates password security
+  to at most 8 bytes, and permits offline guessing from captured challenges. Do
   not use it on untrusted networks.
 - Apple DH mode is experimental and currently not working with macOS Screen
   Sharing. Apple-specific client messages remain unsupported. The mode does
   not encrypt session traffic.
-- VeNCrypt requires RFB 3.8; VNC Authentication also supports RFB 3.3.
+- VeNCrypt requires RFB 3.8; plaintext VNC Authentication also supports RFB 3.3.
 - macOS Screen Sharing compatibility with VNC Authentication has not yet been
   verified against an actual Mac client.
 - VeNCrypt X509Plain client compatibility varies; use a client that supports

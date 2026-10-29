@@ -668,6 +668,11 @@ where
             "VeNCrypt authentication requires tls_cert, tls_key, and password_file together",
         ));
     }
+    if auth_mode == AuthMode::Vnc && tls_cert.is_some() != tls_key.is_some() {
+        return Err(CliError::IncompatibleOptions(
+            "VNC mode requires tls_cert and tls_key together when enabling X509Vnc",
+        ));
+    }
     if auth_mode == AuthMode::Vnc && password_file.is_none() {
         return Err(CliError::IncompatibleOptions(
             "VNC authentication requires password_file",
@@ -888,10 +893,10 @@ Options:
   --port <PORT>            TCP port to bind (default: 5900)
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
-  --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt
-  --tls-key <PATH>         TLS private key PEM
+  --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt modes
+  --tls-key <PATH>         TLS private key PEM for VeNCrypt modes
   --password-file <PATH>   Authentication credentials file (owner-only permissions)
-  --auth <MODE>            Authentication: vencrypt (default), vnc, or apple-dh
+  --auth <MODE>            Authentication: vencrypt, vnc, or apple-dh
   --daemonize              Detach from the terminal and run in the background
   --foreground             Override daemonize=true from JSON
   --pid-file <PATH>        PID file for daemon control (default: XDG runtime dir)
@@ -914,7 +919,8 @@ Options:
 
 The captured screen source is selected in the desktop portal dialog.
 Input and clipboard are disabled unless explicitly enabled. VeNCrypt is the
-secure default; VNC mode uses weak DES and does not encrypt traffic.
+secure default; VNC mode offers X509Vnc plus plaintext fallback when both TLS
+files are configured.
 The default address is loopback only.
 In capture-probe mode, --listen and --port are accepted but unused.
 ",
@@ -1113,6 +1119,23 @@ mod tests {
     fn selects_vnc_authentication_mode() {
         let selected = config(&["--auth", "vnc", "--password-file", "/tmp/pass"]);
         assert_eq!(selected.auth_mode, AuthMode::Vnc);
+        assert!(selected.tls_cert.is_none());
+        let tls_selected = config(&[
+            "--auth",
+            "vnc",
+            "--password-file",
+            "/tmp/pass",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+        ]);
+        assert_eq!(tls_selected.auth_mode, AuthMode::Vnc);
+        assert_eq!(
+            tls_selected.tls_cert,
+            Some(PathBuf::from("/tmp/server.crt"))
+        );
+        assert_eq!(tls_selected.tls_key, Some(PathBuf::from("/tmp/server.key")));
         assert_eq!(
             config(&["--auth", "vencrypt"]).auth_mode,
             AuthMode::VeNCrypt
@@ -1121,6 +1144,19 @@ mod tests {
             parse(&["--auth", "vnc"]),
             Err(CliError::IncompatibleOptions(
                 "VNC authentication requires password_file"
+            ))
+        );
+        assert_eq!(
+            parse(&[
+                "--auth",
+                "vnc",
+                "--password-file",
+                "/tmp/pass",
+                "--tls-cert",
+                "/tmp/server.crt",
+            ]),
+            Err(CliError::IncompatibleOptions(
+                "VNC mode requires tls_cert and tls_key together when enabling X509Vnc"
             ))
         );
     }
@@ -1173,6 +1209,11 @@ mod tests {
             Some(vec![RfbEncoding::Raw])
         );
         assert_eq!(loaded.auth_mode, AuthMode::Vnc);
+        assert_eq!(
+            loaded.tls_cert,
+            Some(path.parent().unwrap().join("cert.pem"))
+        );
+        assert_eq!(loaded.tls_key, Some(path.parent().unwrap().join("key.pem")));
         assert!(loaded.daemonize);
         assert_eq!(
             loaded.log_file,

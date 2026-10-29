@@ -616,7 +616,14 @@ mod tests {
 
     #[test]
     fn active_config_snapshot_is_valid_json_and_includes_effective_defaults() {
-        let command = cli::parse_args(std::iter::empty::<std::ffi::OsString>()).unwrap();
+        let config_path = test_pid_path().with_extension("config.json");
+        fs::write(&config_path, "{}").unwrap();
+        let command = cli::parse_args([
+            std::ffi::OsString::from("--config"),
+            config_path.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        fs::remove_file(config_path).unwrap();
         let Command::Run(config) = command else {
             panic!("expected default run configuration");
         };

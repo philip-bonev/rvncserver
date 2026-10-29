@@ -49,7 +49,16 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             })?;
             rfb::load_authentication(certificate, key, password_path)
         }
-        AuthMode::Vnc => rfb::load_vnc_authentication(password_path),
+        AuthMode::Vnc => match (config.tls_cert.as_deref(), config.tls_key.as_deref()) {
+            (Some(certificate), Some(key)) => {
+                rfb::load_vnc_tls_authentication(certificate, key, password_path)
+            }
+            (None, None) => rfb::load_vnc_authentication(password_path),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VNC mode requires tls_cert and tls_key together when enabling X509Vnc",
+            )),
+        },
         AuthMode::AppleDh => rfb::load_apple_dh_authentication(password_path),
     }
     .map(Arc::new)
@@ -59,9 +68,14 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let listener = TcpListener::bind(address)
         .map_err(|error| AppError::Network(format!("failed to bind {address}: {error}")))?;
 
-    if config.auth_mode == AuthMode::Vnc {
+    if config.auth_mode == AuthMode::Vnc && config.tls_cert.is_none() {
         crate::timestamped_log!(
             "warning: classic VNC authentication uses weak DES and does not encrypt session traffic; do not use on untrusted networks"
+        );
+    }
+    if config.auth_mode == AuthMode::Vnc && config.tls_cert.is_some() {
+        crate::timestamped_log!(
+            "security warning: VNC mode permits plaintext fallback (RFB 3.3 uses it; RFB 3.8 clients may select it); use vencrypt to require TLS"
         );
     }
     if config.auth_mode == AuthMode::AppleDh {
