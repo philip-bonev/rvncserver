@@ -22,6 +22,12 @@ pub const DEFAULT_PORT: u16 = 5900;
 /// Default file-log rotation threshold (50 MiB).
 pub const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Default number of simultaneous RFB clients.
+pub const DEFAULT_MAX_CLIENTS: usize = 4;
+
+/// Largest accepted simultaneous RFB client limit.
+pub const MAX_CLIENTS_LIMIT: usize = 32;
+
 /// RFB encodings that the server may negotiate with a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RfbEncoding {
@@ -85,6 +91,8 @@ pub struct Config {
     pub enable_cursor: bool,
     /// Request portal permission for bidirectional clipboard sharing.
     pub enable_clipboard: bool,
+    /// Maximum number of simultaneous RFB clients.
+    pub max_clients: usize,
     /// Optional allowlist of framebuffer encodings; Raw must be included.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// TLS server certificate PEM path.
@@ -199,6 +207,7 @@ struct FileConfig {
     enable_input: Option<bool>,
     enable_cursor: Option<bool>,
     enable_clipboard: Option<bool>,
+    max_clients: Option<usize>,
     encodings: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -228,6 +237,7 @@ where
     let mut enable_input = false;
     let mut enable_cursor = false;
     let mut enable_clipboard = false;
+    let mut max_clients = DEFAULT_MAX_CLIENTS;
     let mut encodings = None;
     let mut tls_cert = None;
     let mut tls_key = None;
@@ -247,6 +257,7 @@ where
     let mut enable_input_set = false;
     let mut enable_cursor_set = false;
     let mut enable_clipboard_set = false;
+    let mut max_clients_set = false;
     let mut encodings_set = false;
     let mut tls_cert_set = false;
     let mut tls_key_set = false;
@@ -319,6 +330,16 @@ where
                     return Err(CliError::InvalidPort(value));
                 }
                 port = parsed;
+            }
+            "--max-clients" => {
+                if max_clients_set {
+                    return Err(CliError::DuplicateOption("--max-clients"));
+                }
+                max_clients_set = true;
+                let value = take_value(inline_value, &mut args, "--max-clients")?;
+                max_clients = value.parse::<usize>().map_err(|_| {
+                    CliError::IncompatibleOptions("max_clients must be between 1 and 32")
+                })?;
             }
             "--capture-probe" => {
                 if capture_probe_set {
@@ -565,6 +586,14 @@ where
     if !enable_clipboard_set {
         enable_clipboard = file_config.enable_clipboard.unwrap_or(false);
     }
+    if !max_clients_set {
+        max_clients = file_config.max_clients.unwrap_or(DEFAULT_MAX_CLIENTS);
+    }
+    if !(1..=MAX_CLIENTS_LIMIT).contains(&max_clients) {
+        return Err(CliError::IncompatibleOptions(
+            "max_clients must be between 1 and 32",
+        ));
+    }
     if !encodings_set {
         encodings = file_config
             .encodings
@@ -730,6 +759,7 @@ where
         enable_input,
         enable_cursor,
         enable_clipboard,
+        max_clients,
         encodings,
         tls_cert,
         tls_key,
@@ -891,6 +921,7 @@ Usage: rvncserver [OPTIONS]
 Options:
   --listen <ADDRESS>       IP address to bind (default: 127.0.0.1)
   --port <PORT>            TCP port to bind (default: 5900)
+  --max-clients <N>        Maximum simultaneous RFB clients (default: 4, max: 32)
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
   --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt modes
@@ -973,6 +1004,7 @@ mod tests {
         assert!(!config.enable_input);
         assert!(!config.enable_cursor);
         assert!(!config.enable_clipboard);
+        assert_eq!(config.max_clients, 4);
         assert_eq!(config.encodings, None);
         assert!(config.tls_cert.is_none());
         assert!(config.tls_key.is_none());
@@ -983,6 +1015,21 @@ mod tests {
         assert_eq!(config.log_target, LogTarget::Stderr);
         assert_eq!(config.log_max_size, 50 * 1024 * 1024);
         assert_eq!(config.log_max_rotations, 10);
+    }
+
+    #[test]
+    fn parses_and_validates_max_clients() {
+        assert_eq!(config(&["--max-clients", "8"]).max_clients, 8);
+        assert_eq!(config(&["--max-clients=1"]).max_clients, 1);
+        assert_eq!(
+            parse(&["--max-clients", "0"]),
+            Err(CliError::IncompatibleOptions(
+                "max_clients must be between 1 and 32"
+            ))
+        );
+        assert!(parse(&["--max-clients", "33"]).is_err());
+        assert!(parse(&["--max-clients", "many"]).is_err());
+        assert!(parse(&["--max-clients", "2", "--max-clients", "3"]).is_err());
     }
 
     #[test]
@@ -1190,7 +1237,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_cursor":true,"enable_clipboard":true,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_cursor":true,"enable_clipboard":true,"max_clients":2,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -1200,6 +1247,11 @@ mod tests {
         assert!(loaded.enable_input);
         assert!(loaded.enable_cursor);
         assert!(loaded.enable_clipboard);
+        assert_eq!(loaded.max_clients, 2);
+        assert_eq!(
+            config(&["--config", &path_argument, "--max-clients", "5"]).max_clients,
+            5
+        );
         assert_eq!(
             loaded.encodings,
             Some(vec![RfbEncoding::Raw, RfbEncoding::Zrle])

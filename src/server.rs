@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use lamco_pipewire::PwStreamState;
+use lamco_portal::PortalError;
 use tokio::sync::mpsc;
 
 use crate::capture::{CaptureConfig, CaptureSession};
@@ -15,12 +16,16 @@ use crate::clipboard::{
     wayland::WaylandClipboard,
 };
 use crate::error::AppError;
-use crate::framebuffer::{Frame, FrameStore};
+use crate::framebuffer::{Frame, FrameDamage, FrameStore};
 use crate::input::ClientEvent;
 use crate::rfb;
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const CAPTURE_RESTART_ATTEMPTS: usize = 3;
+const CAPTURE_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
+const CAPTURE_RESTART_DELAYS: [Duration; CAPTURE_RESTART_ATTEMPTS - 1] =
+    [Duration::from_secs(1), Duration::from_secs(5)];
 
 /// Run the capture and RFB server until Ctrl+C or SIGTERM.
 pub async fn run(config: Config) -> Result<(), AppError> {
@@ -94,13 +99,17 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         enable_clipboard: config.enable_clipboard,
         ..CaptureConfig::default()
     };
-    let mut capture = CaptureSession::start(capture_config).await?;
+    let mut capture = CaptureSession::start(capture_config.clone()).await?;
     let (mut clipboard_service, mut clipboard_events) = if config.enable_clipboard {
         initialize_clipboard(&capture).await
     } else {
         (None, None)
     };
-    let clipboard_enabled = clipboard_events.is_some();
+    let mut clipboard_enabled = clipboard_events.is_some();
+    // The RFB capability is fixed for the listener's lifetime. Keep accepting
+    // client clipboard messages even if the local clipboard service is later
+    // lost, so client threads never block on a full event channel.
+    let rfb_clipboard_enabled = clipboard_enabled;
 
     crate::timestamped_log!("capture: waiting for the first frame...");
     let first_capture = capture
@@ -134,7 +143,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
     let mut has_remote_events = config.enable_input || clipboard_enabled;
     let (client_event_tx, mut client_event_rx) = mpsc::channel::<ClientEvent>(256);
-    let (server_clipboard_tx, server_clipboard_rx) = mpsc::channel::<Vec<u8>>(4);
+    let (server_clipboard_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(4);
 
     let rfb_thread = rfb::spawn(
         listener,
@@ -146,17 +155,22 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             input_enabled: config.enable_input,
             cursor_enabled: config.enable_cursor,
             clipboard_enabled,
+            max_clients: config.max_clients,
             encodings: config.encodings.clone(),
             authentication: Some(authentication),
         },
         Arc::clone(&shutdown),
         has_remote_events.then_some(client_event_tx),
-        server_clipboard_rx,
+        server_clipboard_tx.clone(),
     )
     .map_err(|error| AppError::Network(format!("failed to start RFB listener: {error}")))?;
 
-    let notify = capture.frame_notify();
+    let mut notify = capture.frame_notify();
     let mut last_frame_error: Option<Instant> = None;
+    // Startup transitions may still be queued after the first frame. Discard
+    // them so they are not mistaken for a later capture loss.
+    let _ = capture.drain_state_events();
+    let mut capture_lost = false;
 
     loop {
         while let Some(video_frame) = capture.try_recv_frame() {
@@ -186,16 +200,136 @@ pub async fn run(config: Config) -> Result<(), AppError> {
 
         for event in capture.drain_state_events() {
             match event.state {
+                PwStreamState::Streaming => {
+                    crate::timestamped_log!("capture: stream {} is streaming", event.stream_id);
+                    capture_lost = false;
+                }
                 PwStreamState::Error(message) => {
                     crate::timestamped_log!(
                         "capture: stream {} reported an error: {message}",
                         event.stream_id
                     );
+                    capture_lost = true;
+                }
+                PwStreamState::Unconnected => {
+                    crate::timestamped_log!("capture: stream {} disconnected", event.stream_id);
+                    capture_lost = true;
                 }
                 state => {
                     crate::timestamped_log!("capture: stream {} state: {state:?}", event.stream_id);
                 }
             }
+        }
+
+        if capture_lost {
+            crate::timestamped_log!("capture: session lost; reinitializing capture");
+            if let Some(service) = clipboard_service.as_mut() {
+                service.shutdown().await;
+            }
+            clipboard_service = None;
+            clipboard_events = None;
+
+            capture.shutdown();
+            drop(capture);
+
+            let mut restarted = None;
+            for attempt in 0..CAPTURE_RESTART_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(CAPTURE_RESTART_DELAYS[attempt - 1]).await;
+                }
+                match tokio::time::timeout(
+                    CAPTURE_RESTART_TIMEOUT,
+                    CaptureSession::start(capture_config.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(session)) => {
+                        restarted = Some(session);
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        crate::timestamped_log!(
+                            "capture: reinitialization attempt {} failed: {error}",
+                            attempt + 1
+                        );
+                        if matches!(&error, AppError::Portal(PortalError::PermissionDenied)) {
+                            crate::timestamped_log!(
+                                "capture: portal permission was denied; not retrying"
+                            );
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        crate::timestamped_log!(
+                            "capture: reinitialization attempt {} timed out after {} seconds",
+                            attempt + 1,
+                            CAPTURE_RESTART_TIMEOUT.as_secs()
+                        );
+                        // A timed-out request may still be waiting for local
+                        // approval; do not stack another prompt on top of it.
+                        break;
+                    }
+                }
+            }
+            let Some(mut session) = restarted else {
+                return Err(AppError::Capture(
+                    "capture session could not be reinitialized".to_string(),
+                ));
+            };
+
+            let first = match session
+                .wait_for_first_frame(FIRST_FRAME_TIMEOUT, config.enable_cursor)
+                .await
+            {
+                Ok(first) => first,
+                Err(error) => {
+                    session.shutdown();
+                    return Err(error);
+                }
+            };
+            // Discard the restarted stream's startup transitions for the same
+            // reason as at initial startup.
+            let _ = session.drain_state_events();
+            if first.frame.width != u32::from(width) || first.frame.height != u32::from(height) {
+                crate::timestamped_log!(
+                    "capture: restarted stream is {}x{}, but the RFB session is fixed at {}x{}; exiting for supervisor restart",
+                    first.frame.width,
+                    first.frame.height,
+                    width,
+                    height
+                );
+                session.shutdown();
+                return Err(AppError::Capture(
+                    "capture stream dimensions changed after reinitialization".to_string(),
+                ));
+            }
+            let mut first_frame = first.frame;
+            // The restarted capture has no continuity with the old stream.
+            // Force a full refresh so every client replaces its framebuffer.
+            first_frame.damage = FrameDamage::Full;
+            store.publish(Arc::new(first_frame));
+            if config.enable_cursor
+                && let Some(cursor) = first.cursor
+            {
+                store.publish_cursor(cursor);
+            }
+
+            if config.enable_clipboard {
+                let (service, events) = initialize_clipboard(&session).await;
+                clipboard_service = service;
+                clipboard_events = events;
+            }
+            has_remote_events = config.enable_input || rfb_clipboard_enabled;
+            clipboard_enabled = clipboard_events.is_some();
+            // Input and clipboard events queued while capture was down refer to
+            // the old session; discard them instead of applying them late.
+            while client_event_rx.try_recv().is_ok() {}
+            notify = session.frame_notify();
+            capture = session;
+            capture_lost = false;
+            last_frame_error = None;
+            crate::timestamped_log!("capture: session reinitialized");
+            continue;
         }
 
         tokio::select! {
@@ -240,8 +374,8 @@ pub async fn run(config: Config) -> Result<(), AppError> {
                                     Ok(Some(ClipboardEvent::LocalText(text))) => {
                                         crate::timestamped_log!("clipboard: read local text ({} bytes)", text.len());
                                         let text = utf8_to_latin1(&text);
-                                        if store.has_clients() && server_clipboard_tx.try_send(text).is_err() {
-                                            crate::timestamped_log!("clipboard: client update queue is full; dropping update");
+                                        if store.has_clients() && server_clipboard_tx.send(text).is_err() {
+                                            crate::timestamped_log!("clipboard: no client is receiving updates; dropping update");
                                         }
                                     }
                                     Ok(_) => {}

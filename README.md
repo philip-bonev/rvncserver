@@ -42,17 +42,44 @@ client; client certificates are not required.
 ```
 
 On startup the desktop portal asks which screen source to share. The server
-then waits for the first captured frame and listens for an authenticated VNC
-client.
+then waits for the first captured frame and listens for authenticated VNC
+clients.
 
 Defaults:
 
 - Listen address: `127.0.0.1`
 - Port: `5900`
+- Simultaneous clients: `4` (configurable from 1 to 32)
 
 ```sh
 ./target/release/rvncserver --listen 127.0.0.1 --port 5900
 ```
+
+Raise or lower the simultaneous client limit with `--max-clients <N>` or
+`"max_clients": N` in JSON. Connections above the limit are closed immediately.
+With multiple clients, clipboard text is broadcast to every client, and input
+events from all clients share the same remote desktop.
+
+For long-running sessions, finished client threads are joined and reaped, and
+client/frame-store counters are released even if a worker panics. TCP keepalive
+closes peers that disappear without closing the connection, while idle
+authenticated clients remain connected. A connection that does not complete
+authentication and initialization within 60 seconds is closed.
+
+The portal restore token is stored in an owner-only file at
+`$XDG_STATE_HOME/rvncserver/portal-restore-token` (falling back to
+`~/.local/state/rvncserver/portal-restore-token`) and reused on later starts, so
+restarts usually do not require a new local permission dialog. If the portal
+rejects the stored token, session creation is retried without it, and the stale
+file is removed when the retry succeeds without issuing a replacement. The
+token is never logged.
+
+If the portal or PipeWire stream ends, the server stops serving the frozen
+framebuffer and tries to recreate the capture session, reusing the stored token.
+It makes at most three attempts with short backoff, each bounded by a timeout.
+If reinitialization fails, or the restarted stream has different dimensions than
+the running RFB session, the process exits with an error so a service manager
+can restart it.
 
 Remote input and clipboard sharing are disabled by default. Enable either
 capability explicitly when needed. VeNCrypt/TLS authentication is the default;
@@ -214,7 +241,8 @@ This captures one normalized frame and writes it as a binary PPM file.
   are configured; VNC mode also offers plaintext fallback
 - Experimental Apple DH authentication (SecurityType 30 and RFB 3.889), opt-in
   with `--auth apple-dh`; currently not working with macOS Screen Sharing
-- One client at a time
+- Up to `max_clients` simultaneous clients (default 4, maximum 32); excess
+  connections are closed immediately
 - 8-, 16-, and 32-bit true-color client pixel formats, including RGB332,
   RGB565, and 24-bit color in 32-bit pixels with either byte order
 - Zlib, ZRLE, Hextile, and Raw when offered by the client, selected according
@@ -252,6 +280,17 @@ This captures one normalized frame and writes it as a binary PPM file.
   this subtype. Authentication attempts are not currently rate-limited.
 - Only the first stream advertised by the portal is used. Multi-monitor
   selection is not implemented.
+- Multiple clients share one input stream and one clipboard: the most recent
+  keyboard or pointer event from any client wins, and clipboard updates are
+  broadcast. There is no per-client input ownership or arbitration.
+- The RFB ClientInit shared flag is ignored; new clients never disconnect
+  existing clients.
+- Connections above `max_clients` are dropped before RFB negotiation; clients
+  see a closed connection rather than a protocol error.
+- Authenticated clients have no idle timeout. Dead peers are detected through
+  TCP keepalive (60 seconds idle, then three probes at 10-second intervals).
+- The authentication and initialization phase has a fixed 60-second timeout;
+  it is not configurable.
 - The cursor is not embedded in the captured image.
 - Input and clipboard forwarding are disabled by default and require explicit
   CLI opt-in and portal permission. Clipboard support is text-only; RFB's
@@ -268,9 +307,23 @@ This captures one normalized frame and writes it as a binary PPM file.
   incorrectly.
 - The framebuffer dimensions are fixed at startup. A later display resolution
   change causes the client connection to be closed rather than resized.
-- The server requests application-scoped portal permission persistence. If the
-  backend explicitly rejects persistence, it reports the fallback and retries
-  capture with non-persistent permissions. Other portal errors are not retried.
+- The server requests application-scoped portal permission persistence and
+  stores the restore token in an owner-only state file. If the backend
+  explicitly rejects persistence, it reports the fallback and retries capture
+  with non-persistent permissions. A rejected stored token is discarded and
+  session creation is retried once without it. Other portal errors are not
+  retried.
+- Capture loss is handled by recreating the portal and PipeWire session. The
+  restarted stream must have the same dimensions as the running RFB session;
+  otherwise the server exits so a service manager can restart it with a new
+  framebuffer size. Live RFB desktop resizing is not implemented.
+- Capture-loss detection uses PipeWire stream state events (`Error` and
+  `Unconnected`). A stream that stops producing frames without reporting a
+  state change is not treated as lost, and a paused stream is left alone. A
+  silent failure that emits no state event may therefore not be detected.
+- Restore-token persistence depends on the portal backend honoring
+  application-scoped tokens. A backend that does not return a token will still
+  prompt for permission after a restart.
 - The portal source type is left to the backend default. This is required for
   COSMIC's combined RemoteDesktop session; other portal backends may interpret
   an empty source-type mask differently.

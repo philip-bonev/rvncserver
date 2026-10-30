@@ -4,6 +4,9 @@
 //! thread. Frames are handed to the rest of the application as raw
 //! [`VideoFrame`] values; normalization happens in [`crate::framebuffer`].
 
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -26,6 +29,9 @@ use crate::input::ClientEvent;
 
 const HELD_POINTER_BUTTON_MASK: u8 = 0b0110_0111;
 const WHEEL_BUTTON_MASK: u8 = 0b0001_1000;
+
+/// Owner-only file holding the portal restore token across restarts.
+const RESTORE_TOKEN_FILE: &str = "portal-restore-token";
 
 /// Capture configuration.
 #[derive(Debug, Clone)]
@@ -99,32 +105,84 @@ impl CaptureSession {
         } else {
             None
         };
-        let manager =
-            PortalManager::new(portal_config(PersistMode::Application, config.enable_input))
-                .await?;
-        let (manager, (session, restore_token)) = match manager
-            .create_session("rvncserver".to_string(), clipboard.as_deref())
-            .await
-        {
-            Ok(result) => (manager, result),
-            Err(error) if persistence_is_unsupported(&error) => {
-                crate::timestamped_log!(
-                    "capture: portal does not support persisted permissions; retrying without persistence"
-                );
-                drop(manager);
-                let manager =
-                    PortalManager::new(portal_config(PersistMode::DoNot, config.enable_input))
-                        .await?;
-                let result = manager
-                    .create_session("rvncserver".to_string(), clipboard.as_deref())
-                    .await?;
-                (manager, result)
+        let token_path = restore_token_path();
+        let stored_token = token_path.as_deref().and_then(load_restore_token);
+        if stored_token.is_some() {
+            crate::timestamped_log!("capture: using stored portal restore token");
+        } else if token_path.is_none() {
+            crate::timestamped_log!(
+                "capture: cannot persist portal restore token; set XDG_STATE_HOME or HOME"
+            );
+        }
+
+        let mut persist_mode = PersistMode::Application;
+        let mut restore_token = stored_token.clone();
+        let mut token_rejected = false;
+        let (manager, (session, new_restore_token)) = loop {
+            let manager = PortalManager::new(portal_config(
+                persist_mode,
+                config.enable_input,
+                restore_token.clone(),
+            ))
+            .await?;
+            match manager
+                .create_session("rvncserver".to_string(), clipboard.as_deref())
+                .await
+            {
+                Ok(result) => break (manager, result),
+                Err(error)
+                    if persist_mode == PersistMode::Application
+                        && persistence_is_unsupported(&error) =>
+                {
+                    crate::timestamped_log!(
+                        "capture: portal does not support persisted permissions; retrying without persistence"
+                    );
+                    if let Some(path) = token_path.as_deref() {
+                        remove_restore_token(path);
+                    }
+                    persist_mode = PersistMode::DoNot;
+                    restore_token = None;
+                }
+                Err(error)
+                    if restore_token.is_some()
+                        && !matches!(&error, PortalError::PermissionDenied) =>
+                {
+                    crate::timestamped_log!(
+                        "capture: portal rejected the stored restore token; retrying without it: {error}"
+                    );
+                    token_rejected = true;
+                    restore_token = None;
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
 
-        if restore_token.is_some() {
-            crate::timestamped_log!("capture: portal returned a restore token");
+        if let Some(token) = new_restore_token.as_deref() {
+            if persist_mode == PersistMode::DoNot {
+                crate::timestamped_log!(
+                    "capture: portal returned a restore token without persistence; not saving it"
+                );
+            } else if let Some(path) = token_path.as_deref() {
+                match save_restore_token(path, token) {
+                    Ok(()) if !token_rejected && stored_token.as_deref() == Some(token) => {
+                        crate::timestamped_log!("capture: portal reused the stored restore token");
+                    }
+                    Ok(()) => crate::timestamped_log!("capture: saved portal restore token"),
+                    Err(error) => crate::timestamped_log!(
+                        "capture: could not save portal restore token: {error}"
+                    ),
+                }
+            } else {
+                crate::timestamped_log!(
+                    "capture: portal returned a restore token but no state directory is available"
+                );
+            }
+        } else if token_rejected {
+            // The portal accepted a session without the stored token and did
+            // not issue a replacement, so the old token is no longer useful.
+            if let Some(path) = token_path.as_deref() {
+                remove_restore_token(path);
+            }
         }
 
         let stream = session.streams().first().ok_or_else(|| {
@@ -417,7 +475,11 @@ impl CaptureSession {
     }
 }
 
-fn portal_config(persist_mode: PersistMode, enable_input: bool) -> PortalConfig {
+fn portal_config(
+    persist_mode: PersistMode,
+    enable_input: bool,
+    restore_token: Option<String>,
+) -> PortalConfig {
     PortalConfig {
         allow_multiple: false,
         source_type: Default::default(),
@@ -427,7 +489,85 @@ fn portal_config(persist_mode: PersistMode, enable_input: bool) -> PortalConfig 
             Default::default()
         },
         persist_mode,
+        restore_token,
         ..PortalConfig::default()
+    }
+}
+
+fn restore_token_path() -> Option<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        });
+    state_home.map(|path| path.join("rvncserver").join(RESTORE_TOKEN_FILE))
+}
+
+fn load_restore_token(path: &Path) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(token) => {
+            let token = token.trim();
+            if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            crate::timestamped_log!("capture: could not read portal restore token: {error}");
+            None
+        }
+    }
+}
+
+fn save_restore_token(path: &Path, token: &str) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "portal restore token path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    let result = (|| {
+        // Remove a stale temporary file so create_new cannot follow a
+        // pre-existing symlink.
+        let _ = fs::remove_file(&temporary);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn remove_restore_token(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            crate::timestamped_log!("capture: could not remove stale portal restore token: {error}")
+        }
     }
 }
 
@@ -503,5 +643,46 @@ mod tests {
         assert!(!persistence_is_unsupported(&PortalError::SessionCreation(
             "User denied permission".into()
         )));
+    }
+
+    #[test]
+    fn restore_token_round_trips_with_private_permissions() {
+        let directory = std::env::temp_dir().join(format!(
+            "rvncserver-token-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = directory.join(RESTORE_TOKEN_FILE);
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(load_restore_token(&path), None);
+
+        save_restore_token(&path, "first-token").unwrap();
+        assert_eq!(load_restore_token(&path).as_deref(), Some("first-token"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        save_restore_token(&path, "second-token").unwrap();
+        assert_eq!(load_restore_token(&path).as_deref(), Some("second-token"));
+
+        remove_restore_token(&path);
+        assert_eq!(load_restore_token(&path), None);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn empty_restore_token_is_treated_as_absent() {
+        let path = std::env::temp_dir().join(format!(
+            "rvncserver-empty-token-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&path, "  \n").unwrap();
+        assert_eq!(load_restore_token(&path), None);
+        fs::remove_file(path).unwrap();
     }
 }
