@@ -28,7 +28,11 @@ const CAPTURE_RESTART_DELAYS: [Duration; CAPTURE_RESTART_ATTEMPTS - 1] =
     [Duration::from_secs(1), Duration::from_secs(5)];
 
 /// Run the capture and RFB server until Ctrl+C or SIGTERM.
-pub async fn run(config: Config) -> Result<(), AppError> {
+///
+/// `on_started` is invoked exactly once, after the listener accepts clients
+/// and the first frame is published, so callers can report a completed
+/// startup. Every failure before that point returns an error instead.
+pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> {
     // Install handlers before portal setup so stop requests during startup are
     // queued and handled through the same orderly cleanup path.
     let ctrl_c = tokio::signal::ctrl_c();
@@ -164,6 +168,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         server_clipboard_tx.clone(),
     )
     .map_err(|error| AppError::Network(format!("failed to start RFB listener: {error}")))?;
+    on_started();
 
     let mut notify = capture.frame_notify();
     let mut last_frame_error: Option<Instant> = None;

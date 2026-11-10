@@ -2,11 +2,12 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rvncserver::capture::{CaptureConfig, CaptureSession};
 use rvncserver::cli::{self, AuthMode, Command, Config, LogTarget, RfbEncoding};
@@ -14,6 +15,15 @@ use rvncserver::error::AppError;
 use rvncserver::server;
 
 const CAPTURE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Report written by the daemon child once the server is fully started.
+const STARTUP_STARTED: &str = "started";
+/// Report written by the daemon child when startup fails.
+const STARTUP_ERROR_PREFIX: &str = "error: ";
+/// Upper bound for a startup report read from the child.
+const STARTUP_REPORT_LIMIT: u64 = 64 * 1024;
+/// How long the parent waits for a failed child to finish its cleanup.
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let command = match cli::parse_args(std::env::args_os().skip(1)) {
@@ -75,16 +85,32 @@ fn main() -> ExitCode {
                 rvncserver::timestamped_log!("rvncserver: daemon started with pid {pid}");
                 ExitCode::SUCCESS
             }
-            Ok(ProcessSetup::Run(_pid_file_guard)) => {
+            Ok(ProcessSetup::Run {
+                guard: _pid_file_guard,
+                startup,
+            }) => {
+                let notify_started = || {
+                    if let Some(report) = startup.as_ref() {
+                        report.started();
+                    }
+                };
                 match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => match runtime.block_on(run_server(config)) {
+                    Ok(runtime) => match runtime.block_on(run_server(config, &notify_started)) {
                         Ok(()) => ExitCode::SUCCESS,
-                        Err(error) => report_error(error),
+                        Err(error) => {
+                            if let Some(report) = startup.as_ref() {
+                                report.failed(&error.to_string());
+                            }
+                            report_error(error)
+                        }
                     },
                     Err(error) => {
+                        if let Some(report) = startup.as_ref() {
+                            report.failed(&format!("failed to initialize runtime: {error}"));
+                        }
                         rvncserver::timestamped_log!(
                             "rvncserver: failed to initialize runtime: {error}"
                         );
@@ -111,7 +137,7 @@ fn report_error(error: AppError) -> ExitCode {
     }
 }
 
-async fn run_server(config: Config) -> Result<(), AppError> {
+async fn run_server(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> {
     if let Some(path) = config.capture_probe.clone() {
         let mut capture = CaptureSession::start(CaptureConfig::default()).await?;
         rvncserver::timestamped_log!("capture: waiting for the first frame...");
@@ -128,11 +154,15 @@ async fn run_server(config: Config) -> Result<(), AppError> {
         capture.shutdown();
         Ok(())
     } else {
-        server::run(config).await
+        server::run(config, on_started).await
     }
 }
 
 /// Configure logging output and optionally detach before Tokio creates threads.
+///
+/// When daemonizing, the child reports its startup outcome to the parent over
+/// a pipe: the parent only reports a running daemon after the server is fully
+/// started, and any startup failure is printed instead.
 fn configure_process(config: &Config) -> io::Result<ProcessSetup> {
     if config.daemonize && config.pid_file.is_none() {
         return Err(io::Error::new(
@@ -142,7 +172,12 @@ fn configure_process(config: &Config) -> io::Result<ProcessSetup> {
     }
     if !config.daemonize {
         match config.log_target {
-            LogTarget::Stderr => return Ok(ProcessSetup::Run(None)),
+            LogTarget::Stderr => {
+                return Ok(ProcessSetup::Run {
+                    guard: None,
+                    startup: None,
+                });
+            }
             LogTarget::File => {
                 let path = config.log_file.as_deref().ok_or_else(|| {
                     io::Error::new(
@@ -155,11 +190,17 @@ fn configure_process(config: &Config) -> io::Result<ProcessSetup> {
                     config.log_max_size,
                     config.log_max_rotations,
                 )?;
-                return Ok(ProcessSetup::Run(None));
+                return Ok(ProcessSetup::Run {
+                    guard: None,
+                    startup: None,
+                });
             }
             LogTarget::Journald => {
                 rvncserver::logging::use_journald();
-                return Ok(ProcessSetup::Run(None));
+                return Ok(ProcessSetup::Run {
+                    guard: None,
+                    startup: None,
+                });
             }
         }
     }
@@ -189,16 +230,46 @@ fn configure_process(config: &Config) -> io::Result<ProcessSetup> {
         }
     };
 
+    // The child reports success or failure through this pipe so a failed
+    // start is never announced as a running daemon.
+    let (startup, mut startup_reader) = StartupReport::create()?;
+
     // SAFETY: fork is performed before Tokio or any worker threads are started.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid > 0 {
-        return Ok(ProcessSetup::DaemonParent(pid));
+        // Close the parent's copy of the write end so EOF marks the end of
+        // the child's report.
+        drop(startup);
+        return wait_for_startup(&mut startup_reader, pid);
     }
 
-    // Child process: redirect diagnostics before operations that may fail.
+    // Child process: close the read end, then redirect diagnostics before
+    // operations that may fail.
+    drop(startup_reader);
+    match setup_daemon_child(config, pid_file_reservation, output) {
+        Ok(guard) => Ok(ProcessSetup::Run {
+            guard: Some(guard),
+            startup: Some(startup),
+        }),
+        Err(error) => {
+            // The child's stderr may already point at /dev/null or the log
+            // file, so the failure must go through the pipe to the parent's
+            // original terminal.
+            startup.failed(&error.to_string());
+            Err(error)
+        }
+    }
+}
+
+/// Detach the forked child and take ownership of the PID file.
+fn setup_daemon_child(
+    config: &Config,
+    pid_file_reservation: PidFileReservation,
+    output: File,
+) -> io::Result<PidFileGuard> {
     redirect_output(output)?;
     let null_input = File::open("/dev/null")?;
     // SAFETY: both descriptors are valid process file descriptors; dup2 only
@@ -228,13 +299,125 @@ fn configure_process(config: &Config) -> io::Result<ProcessSetup> {
             config.log_max_rotations,
         )?;
     }
-    let pid_file_guard = pid_file_reservation.activate(config)?;
-    Ok(ProcessSetup::Run(Some(pid_file_guard)))
+    pid_file_reservation.activate(config)
+}
+
+/// Block until the forked child reports its startup outcome.
+///
+/// Returns [`ProcessSetup::DaemonParent`] only after the child reports that
+/// the server is fully started; a failed or missing report becomes an error.
+fn wait_for_startup(reader: &mut File, pid: libc::pid_t) -> io::Result<ProcessSetup> {
+    let mut bytes = Vec::new();
+    reader.take(STARTUP_REPORT_LIMIT).read_to_end(&mut bytes)?;
+    match parse_startup_report(&String::from_utf8_lossy(&bytes)) {
+        Ok(()) => Ok(ProcessSetup::DaemonParent(pid)),
+        Err(detail) => {
+            // A failed child exits right after reporting; wait for it so its
+            // PID file is released before this process reports the error.
+            wait_for_child_exit(pid);
+            Err(io::Error::other(detail))
+        }
+    }
+}
+
+/// Interpret a startup report. `Ok(())` means the server is fully started.
+fn parse_startup_report(report: &str) -> Result<(), String> {
+    if report == STARTUP_STARTED {
+        return Ok(());
+    }
+    if let Some(detail) = report.strip_prefix(STARTUP_ERROR_PREFIX) {
+        return Err(detail.to_string());
+    }
+    if report.is_empty() {
+        return Err("daemon exited during startup without reporting a reason".to_string());
+    }
+    let preview: String = report.chars().take(100).collect();
+    Err(format!(
+        "daemon reported an unreadable startup report: {preview}"
+    ))
+}
+
+/// Reap a failed daemon child, bounded so a stuck child cannot hang the
+/// parent indefinitely.
+fn wait_for_child_exit(pid: libc::pid_t) {
+    let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+    loop {
+        // SAFETY: pid is this process's forked child and the null status
+        // pointer only requests reaping without inspecting the exit state.
+        let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if reaped == pid {
+            return;
+        }
+        if reaped < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                return;
+            }
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Write end of the child-to-parent startup report pipe.
+///
+/// Only the first report is delivered, so a later failure cannot corrupt an
+/// already-completed handshake.
+struct StartupReport {
+    file: Mutex<Option<File>>,
+}
+
+impl StartupReport {
+    fn create() -> io::Result<(Self, File)> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds is a two-element array and pipe reports failure via -1.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: on success both descriptors are open and owned by this
+        // process; ownership moves into the File values here.
+        let writer = unsafe { File::from_raw_fd(fds[1]) };
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        Ok((
+            Self {
+                file: Mutex::new(Some(writer)),
+            },
+            reader,
+        ))
+    }
+
+    /// Report that the server is fully started; closes the pipe.
+    fn started(&self) {
+        self.write_report(STARTUP_STARTED);
+    }
+
+    /// Report a startup failure; closes the pipe.
+    fn failed(&self, message: &str) {
+        self.write_report(&format!("{STARTUP_ERROR_PREFIX}{message}"));
+    }
+
+    fn write_report(&self, message: &str) {
+        let mut slot = match self.file.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(mut file) = slot.take() else {
+            return;
+        };
+        let _ = file.write_all(message.as_bytes());
+        let _ = file.flush();
+    }
 }
 
 enum ProcessSetup {
     DaemonParent(libc::pid_t),
-    Run(Option<PidFileGuard>),
+    Run {
+        guard: Option<PidFileGuard>,
+        startup: Option<StartupReport>,
+    },
 }
 
 struct PidFileGuard {
@@ -634,5 +817,30 @@ mod tests {
         assert_eq!(value["port"], config.port);
         assert_eq!(value["enable_cursor"], config.enable_cursor);
         assert_eq!(value["daemonize"], config.daemonize);
+    }
+
+    #[test]
+    fn startup_report_delivers_only_the_first_message() {
+        let (report, mut reader) = StartupReport::create().unwrap();
+        report.started();
+        report.failed("late failure");
+
+        let mut contents = String::new();
+        reader.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, STARTUP_STARTED);
+    }
+
+    #[test]
+    fn startup_report_classification() {
+        assert_eq!(parse_startup_report(STARTUP_STARTED), Ok(()));
+        assert_eq!(
+            parse_startup_report("error: failed to bind 127.0.0.1:5900: Address already in use"),
+            Err("failed to bind 127.0.0.1:5900: Address already in use".to_string())
+        );
+        assert_eq!(
+            parse_startup_report(""),
+            Err("daemon exited during startup without reporting a reason".to_string())
+        );
+        assert!(parse_startup_report("unexpected text").is_err());
     }
 }

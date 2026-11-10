@@ -108,7 +108,12 @@ current directory.
 
 The server stays in the foreground by default. Set `"daemonize": true` in JSON
 or pass `--daemonize` to fork into a detached session. Use `--foreground` to
-override a JSON daemon setting. Select diagnostics output with
+override a JSON daemon setting. The original process reports
+`daemon started with pid` only after the daemon has fully started: credential
+loading, port binding, portal session setup, the first captured frame, and the
+RFB listener. If startup fails — for example, because the port is already in
+use — it prints the error, exits with a failure status, and leaves no daemon
+or PID file behind. Select diagnostics output with
 `"log_target": "file"` or `"log_target": "journald"` in JSON, or
 `--log-target file|journald`. File logging requires `log_file` or
 `--log-file <PATH>` and appends to an owner-only file; JSON paths are relative to
