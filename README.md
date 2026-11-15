@@ -192,6 +192,14 @@ Add the generated `server.crt` to the VNC client's trusted certificates. For
 remote access, issue a certificate with the actual DNS name/IP in its subject
 alternative names and keep the private key and credential file private.
 
+When the certificate is loaded, the server writes a one-line summary to the
+log: subject, issuer, serial number, validity window, public key type and
+size, and the SHA-256 fingerprint of the leaf certificate, plus the size of the
+chain when more than one certificate is configured. Only public certificate
+fields are logged; the private key is never written out. An expired or not yet
+valid certificate is called out in the same line, but does not prevent startup
+because rustls has already accepted the identity.
+
 VeNCrypt uses `X509Plain`; clients must support that security subtype and trust
 the configured server certificate. Its password file contains username and
 password on separate lines. For `auth_mode: "vnc"` (or `--auth vnc`), clients

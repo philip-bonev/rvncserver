@@ -35,6 +35,9 @@ use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use flate2::{Compress, Compression, FlushCompress, Status};
 use md5::{Digest, Md5};
+use rustls::pki_types::CertificateDer;
+use x509_parser::prelude::{ASN1Time, FromDer, X509Certificate};
+use x509_parser::public_key::PublicKey;
 
 use crate::cli::RfbEncoding;
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
@@ -249,6 +252,10 @@ fn load_tls_server_config(
         )
     })?;
 
+    // Describe the identity before it is moved into the configuration so that
+    // the summary is only logged once the server has accepted it.
+    let summary = certificate_summary(&certificates);
+
     let tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)
@@ -258,7 +265,90 @@ fn load_tls_server_config(
                 format!("invalid TLS identity: {error}"),
             )
         })?;
+
+    crate::timestamped_log!("rfb: TLS certificate: {summary}");
     Ok(Arc::new(tls))
+}
+
+/// Build a single-line summary of the leaf certificate in `certificates`.
+///
+/// Only public certificate fields are included; private key material is never
+/// written to the log. If the certificate cannot be parsed the summary falls
+/// back to its fingerprint, because rustls has already accepted the identity
+/// and refusing to start would be the wrong reaction to a cosmetic failure.
+fn certificate_summary(certificates: &[CertificateDer<'static>]) -> String {
+    let Some(leaf) = certificates.first() else {
+        return "no certificate present".to_string();
+    };
+    let der = leaf.as_ref();
+    let fingerprint = sha256_fingerprint(der);
+    let chain = if certificates.len() > 1 {
+        format!(" chain={}", certificates.len())
+    } else {
+        String::new()
+    };
+
+    let certificate = match X509Certificate::from_der(der) {
+        Ok((_remaining, certificate)) => certificate,
+        Err(error) => {
+            return format!("sha256={fingerprint}{chain} (details unavailable: {error})");
+        }
+    };
+
+    let validity = certificate.validity();
+    let (not_before, not_after) = (validity.not_before, validity.not_after);
+    let now = ASN1Time::now();
+    let state = if now < not_before {
+        " [NOT YET VALID]"
+    } else if now > not_after {
+        " [EXPIRED]"
+    } else {
+        ""
+    };
+
+    format!(
+        "subject=\"{}\" issuer=\"{}\" serial={} notBefore={not_before} notAfter={not_after}{state} key={} sha256={fingerprint}{chain}",
+        certificate.subject(),
+        certificate.issuer(),
+        certificate.raw_serial_as_string(),
+        public_key_summary(&certificate),
+    )
+}
+
+/// Describe the public key algorithm and, when it is known, its size in bits.
+fn public_key_summary(certificate: &X509Certificate<'_>) -> String {
+    let Some(key) = certificate.public_key().parsed().ok() else {
+        return "unparsable".to_string();
+    };
+    let algorithm = match key {
+        PublicKey::RSA(_) => "RSA",
+        PublicKey::EC(_) => "ECDSA",
+        PublicKey::DSA(_) => "DSA",
+        PublicKey::GostR3410(_) => "GOST R 34.10-94",
+        PublicKey::GostR3410_2012(_) => "GOST R 34.10-2012",
+        PublicKey::Unknown(_) => "unrecognized",
+    };
+    let bits = key.key_size();
+    if bits == 0 {
+        algorithm.to_string()
+    } else {
+        format!("{algorithm} {bits} bit")
+    }
+}
+
+/// Format the SHA-256 fingerprint of `der` as colon-separated uppercase hex.
+fn sha256_fingerprint(der: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let mut fingerprint = String::with_capacity(95);
+    for (index, byte) in digest.as_ref().iter().enumerate() {
+        if index > 0 {
+            fingerprint.push(':');
+        }
+        let _ = write!(fingerprint, "{byte:02X}");
+    }
+    fingerprint
 }
 
 pub fn load_vnc_authentication(password_path: &Path) -> io::Result<AuthenticationConfig> {
@@ -3102,6 +3192,108 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
+
+    // Self-signed OpenSSL fixtures with fixed validity windows, so the expiry
+    // checks do not depend on the clock: `valid_cert.der` is an RSA-3072
+    // certificate valid from 2020 to 2120, `expired_cert.der` is a P-256
+    // certificate that expired in 2021.
+    const VALID_CERTIFICATE: &[u8] = include_bytes!("../tests/fixtures/valid_cert.der");
+    const EXPIRED_CERTIFICATE: &[u8] = include_bytes!("../tests/fixtures/expired_cert.der");
+
+    #[test]
+    fn sha256_fingerprint_is_colon_separated_uppercase_hex() {
+        let fingerprint = sha256_fingerprint(b"abc");
+        assert_eq!(
+            fingerprint,
+            "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD"
+        );
+        // 32 bytes as two hex digits plus a colon between each pair.
+        assert_eq!(fingerprint.len(), 95);
+    }
+
+    #[test]
+    fn certificate_summary_reports_the_leaf_certificate() {
+        let certificate = CertificateDer::from(VALID_CERTIFICATE);
+        let summary = certificate_summary(std::slice::from_ref(&certificate));
+
+        assert!(
+            summary.contains("subject=\"CN=rvncserver test, O=rvncserver tests\""),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("issuer=\"CN=rvncserver test, O=rvncserver tests\""),
+            "{summary}"
+        );
+        assert!(summary.contains("serial=10:02"), "{summary}");
+        assert!(
+            summary.contains("notBefore=Jan  1 00:00:00 2020 +00:00"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("notAfter=Jan  1 00:00:00 2120 +00:00"),
+            "{summary}"
+        );
+        assert!(summary.contains("key=RSA 3072 bit"), "{summary}");
+        assert!(
+            summary.contains(
+                "sha256=E9:91:97:DD:06:71:33:04:94:7F:F5:4E:93:98:35:4A:8D:81:17:61:05:D7:F8:C7:A7:DD:78:E4:7D:5B:86:DC"
+            ),
+            "{summary}"
+        );
+        assert!(!summary.contains("chain="), "{summary}");
+        assert!(!summary.contains("[EXPIRED]"), "{summary}");
+        assert!(!summary.contains("[NOT YET VALID]"), "{summary}");
+    }
+
+    #[test]
+    fn certificate_summary_marks_an_expired_certificate() {
+        let certificate = CertificateDer::from(EXPIRED_CERTIFICATE);
+        let summary = certificate_summary(std::slice::from_ref(&certificate));
+
+        assert!(summary.contains("[EXPIRED]"), "{summary}");
+        assert!(
+            summary.contains("notBefore=Jan  1 00:00:00 2020 +00:00"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("notAfter=Jan  1 00:00:00 2021 +00:00"),
+            "{summary}"
+        );
+        assert!(summary.contains("serial=10:00"), "{summary}");
+        assert!(summary.contains("key=ECDSA 256 bit"), "{summary}");
+        assert!(
+            summary.contains(
+                "sha256=19:07:1E:45:BB:BB:3D:A6:21:41:3C:E2:72:41:B5:E6:E1:82:48:80:6D:8B:2C:FC:5B:36:A2:7F:F0:C1:C6:19"
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn certificate_summary_counts_extra_chain_certificates() {
+        let leaf = CertificateDer::from(VALID_CERTIFICATE);
+        let summary = certificate_summary(&[leaf.clone(), leaf]);
+
+        assert!(summary.contains("chain=2"), "{summary}");
+    }
+
+    #[test]
+    fn certificate_summary_falls_back_to_the_fingerprint() {
+        let certificate = CertificateDer::from(b"not a certificate".as_slice());
+        let summary = certificate_summary(std::slice::from_ref(&certificate));
+
+        assert!(summary.contains("details unavailable"), "{summary}");
+        assert!(
+            summary.contains(&sha256_fingerprint(b"not a certificate")),
+            "{summary}"
+        );
+        assert!(!summary.contains("subject="), "{summary}");
+    }
+
+    #[test]
+    fn certificate_summary_handles_an_empty_certificate_list() {
+        assert_eq!(certificate_summary(&[]), "no certificate present");
+    }
 
     fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> ClientUpdateState {
         ClientUpdateState {
