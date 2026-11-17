@@ -49,7 +49,7 @@ Defaults:
 
 - Listen address: `127.0.0.1`
 - Port: `5900`
-- Simultaneous clients: `4` (configurable from 1 to 32)
+- Simultaneous clients: `4` (configurable from 1 to 10)
 
 ```sh
 ./target/release/rvncserver --listen 127.0.0.1 --port 5900
@@ -254,7 +254,7 @@ This captures one normalized frame and writes it as a binary PPM file.
   are configured; VNC mode also offers plaintext fallback
 - Experimental Apple DH authentication (SecurityType 30 and RFB 3.889), opt-in
   with `--auth apple-dh`; currently not working with macOS Screen Sharing
-- Up to `max_clients` simultaneous clients (default 4, maximum 32); excess
+- Up to `max_clients` simultaneous clients (default 4, maximum 10); excess
   connections are closed immediately
 - 8-, 16-, and 32-bit true-color client pixel formats, including RGB332,
   RGB565, and 24-bit color in 32-bit pixels with either byte order
@@ -262,7 +262,10 @@ This captures one normalized frame and writes it as a binary PPM file.
   to its encoding preference order. CopyRect is used opportunistically when
   the server can verify a matching source in the client's known framebuffer.
 - Keyboard keysym events and pointer motion/buttons/scroll through the
-  permission-controlled RemoteDesktop portal when `--enable-input` is set
+  permission-controlled RemoteDesktop portal when `--enable-input` is set.
+  RFB button bits follow the protocol specification: buttons 1-3 are the
+  left/middle/right mouse buttons, buttons 4-7 are wheel steps
+  (up/down/left/right), and button 8 is the Back button
 - Bidirectional text clipboard transfer through the portal when
   `--enable-clipboard` is set
 - Full responses for non-incremental requests and damage-region rectangles for

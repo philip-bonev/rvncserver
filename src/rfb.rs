@@ -564,8 +564,11 @@ impl PixelFormat {
 
     fn zrle_bytes_per_pixel(self) -> usize {
         let used_bits = self.used_component_bits();
+        // RFB ZRLE CPIXEL: 32-bit pixels are sent in three bytes only when the
+        // negotiated depth is 24 or less and every used bit fits into either
+        // the three least or the three most significant bytes.
         if self.bits_per_pixel == 32
-            && used_bits.count_ones() <= 24
+            && self.depth <= 24
             && (used_bits & 0xff00_0000 == 0 || used_bits & 0x0000_00ff == 0)
         {
             3
@@ -1068,7 +1071,7 @@ fn handle_client(
     let mut pointer_input_warned = false;
     let mut received_button_mask = 0u8;
     let mut held_input = if config.input_enabled {
-        input_tx.map(ClientInputGuard::new)
+        input_tx.map(|sender| ClientInputGuard::new(sender, shutdown))
     } else {
         None
     };
@@ -1195,7 +1198,9 @@ fn handle_client(
                 }
             }
             5 => {
-                // PointerEvent: button-mask (1), padding (2), x (2), y (2).
+                // PointerEvent: button-mask (1), x-position (2), y-position
+                // (2) after the message-type byte — six bytes in total, with
+                // no padding field.
                 let mut event = [0u8; 5];
                 read_exact_interruptible(&mut stream, &mut event, shutdown)?;
                 let buttons = event[0];
@@ -1230,11 +1235,7 @@ fn handle_client(
                     let mut text = vec![0u8; length as usize];
                     read_exact_interruptible(&mut stream, &mut text, shutdown)?;
                     crate::timestamped_log!("rfb: received ClientCutText ({} bytes)", text.len());
-                    input_tx
-                        .blocking_send(ClientEvent::Clipboard(text))
-                        .map_err(|_| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped")
-                        })?;
+                    send_input_event(input_tx, ClientEvent::Clipboard(text), shutdown)?;
                 } else {
                     discard_exact(&mut stream, length as usize, shutdown)?;
                 }
@@ -2848,23 +2849,27 @@ fn encoded_frame_pixel(
 /// Tracks held remote inputs so a client disconnect can release them.
 struct ClientInputGuard<'a> {
     sender: &'a tokio::sync::mpsc::Sender<ClientEvent>,
+    shutdown: &'a AtomicBool,
     pressed_keys: HashSet<u32>,
     pointer: Option<(u16, u16, u8)>,
 }
 
 impl<'a> ClientInputGuard<'a> {
-    fn new(sender: &'a tokio::sync::mpsc::Sender<ClientEvent>) -> Self {
+    fn new(sender: &'a tokio::sync::mpsc::Sender<ClientEvent>, shutdown: &'a AtomicBool) -> Self {
         Self {
             sender,
+            shutdown,
             pressed_keys: HashSet::new(),
             pointer: None,
         }
     }
 
     fn key(&mut self, keysym: u32, pressed: bool) -> io::Result<()> {
-        self.sender
-            .blocking_send(ClientEvent::Key { keysym, pressed })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
+        send_input_event(
+            self.sender,
+            ClientEvent::Key { keysym, pressed },
+            self.shutdown,
+        )?;
         crate::timestamped_log!(
             "rfb: keyboard key {} queued for portal",
             if pressed { "press" } else { "release" }
@@ -2890,9 +2895,11 @@ impl<'a> ClientInputGuard<'a> {
 
     fn pointer(&mut self, x: u16, y: u16, buttons: u8) -> io::Result<()> {
         let previous_buttons = self.pointer.map_or(0, |(_, _, buttons)| buttons);
-        self.sender
-            .blocking_send(ClientEvent::Pointer { x, y, buttons })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "input handler stopped"))?;
+        send_input_event(
+            self.sender,
+            ClientEvent::Pointer { x, y, buttons },
+            self.shutdown,
+        )?;
         if previous_buttons != buttons {
             crate::timestamped_log!(
                 "rfb: pointer button mask {previous_buttons:#04x} -> {buttons:#04x}"
@@ -2920,16 +2927,17 @@ impl Drop for ClientInputGuard<'_> {
     fn drop(&mut self) {
         if let Some((x, y, buttons)) = self.pointer {
             if buttons != 0 {
-                let _ = self
-                    .sender
-                    .try_send(ClientEvent::Pointer { x, y, buttons: 0 });
+                try_send_release(self.sender, ClientEvent::Pointer { x, y, buttons: 0 });
             }
         }
         for keysym in self.pressed_keys.drain() {
-            let _ = self.sender.try_send(ClientEvent::Key {
-                keysym,
-                pressed: false,
-            });
+            try_send_release(
+                self.sender,
+                ClientEvent::Key {
+                    keysym,
+                    pressed: false,
+                },
+            );
         }
     }
 }
@@ -3187,6 +3195,57 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 fn shutdown_error() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "server is shutting down")
+}
+
+/// Queue an input event for the portal-side handler without blocking forever.
+///
+/// The bounded event channel applies backpressure while the consumer is busy,
+/// but the wait must stay interruptible: on shutdown the main loop stops
+/// draining the channel, so an unconditional `blocking_send` could deadlock
+/// the client thread and the shutdown join with it.
+fn send_input_event(
+    sender: &tokio::sync::mpsc::Sender<ClientEvent>,
+    event: ClientEvent,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let mut event = event;
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(shutdown_error());
+        }
+        match sender.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "input handler stopped",
+                ));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                event = returned;
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Queue a release event when a client disconnects, bounded so teardown can
+/// never hang on a full channel.
+fn try_send_release(sender: &tokio::sync::mpsc::Sender<ClientEvent>, event: ClientEvent) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut event = event;
+    loop {
+        match sender.try_send(event) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                event = returned;
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 fn is_normal_disconnect(error: &io::Error) -> bool {
@@ -4222,9 +4281,21 @@ mod tests {
             ..rgb888_be
         };
         assert_eq!(rgb888_32.encode(&[255, 128, 0, 255]), [255, 128, 0, 255]);
-        assert_eq!(rgb888_32.zrle_bytes_per_pixel(), 3);
+        // CPIXEL stays four bytes when the negotiated depth exceeds 24.
+        assert_eq!(rgb888_32.zrle_bytes_per_pixel(), 4);
         assert_eq!(
-            &rgb888_32.encode_zrle(&[255, 128, 0, 255])[..3],
+            rgb888_32.encode_zrle(&[255, 128, 0, 255]),
+            rgb888_32.encode(&[255, 128, 0, 255])
+        );
+
+        let rgb888_le = PixelFormat {
+            depth: 24,
+            big_endian: false,
+            ..rgb888_be
+        };
+        assert_eq!(rgb888_le.zrle_bytes_per_pixel(), 3);
+        assert_eq!(
+            &rgb888_le.encode_zrle(&[255, 128, 0, 255])[..3],
             &[255, 128, 0]
         );
 
@@ -4638,8 +4709,9 @@ mod tests {
     #[test]
     fn releases_held_remote_inputs_when_client_guard_drops() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let shutdown = AtomicBool::new(false);
         {
-            let mut guard = ClientInputGuard::new(&sender);
+            let mut guard = ClientInputGuard::new(&sender, &shutdown);
             guard.key(0x61, true).unwrap();
             guard.pointer(12, 34, 1).unwrap();
         }

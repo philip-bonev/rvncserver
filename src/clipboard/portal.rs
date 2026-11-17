@@ -15,6 +15,7 @@
 //! XDG Desktop Portal clipboard backend.
 
 use std::future::Future;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -22,6 +23,10 @@ use lamco_portal::{ClipboardManager, PortalSessionHandle};
 
 use super::{ClipboardBackend, ClipboardListenerEvent};
 use tokio::sync::mpsc;
+
+/// Largest clipboard payload accepted from the desktop; matches the RFB
+/// cut-text limit.
+const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 /// Clipboard backend attached to an already-authorized portal session.
 pub struct PortalClipboard {
@@ -50,13 +55,15 @@ impl PortalClipboard {
         &self.mime_types
     }
 
-    /// Cache remote-owned text and announce it to the portal.
+    /// Announce remote-owned text to the portal and cache it on success, so a
+    /// failed announcement can never serve text that was never offered.
     pub async fn set_remote_text(&mut self, text: Vec<u8>) -> Result<(), String> {
-        self.remote_text = text;
         self.manager
             .announce_rdp_formats(self.session.ashpd_session(), self.mime_types.clone())
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.remote_text = text;
+        Ok(())
     }
 
     /// Reply to a portal selection-transfer request.
@@ -125,14 +132,16 @@ impl ClipboardBackend for PortalClipboard {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let data = self
-                .manager
-                .read_local_clipboard(self.session.ashpd_session(), &self.mime_types[0])
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut text = data;
-            text.truncate(1024 * 1024);
-            Ok(Some(text))
+            // A selection owner may offer only plain `text/plain`; try every
+            // accepted text MIME type before giving up.
+            let mut last_error = None;
+            for mime_type in &self.mime_types {
+                match read_portal_selection(&self.manager, &self.session, mime_type).await {
+                    Ok(text) => return Ok(Some(text)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| "no text MIME type was offered".to_string()))
         })
     }
 
@@ -150,4 +159,57 @@ impl ClipboardBackend for PortalClipboard {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move { self.provide_selection(serial, &mime_type).await })
     }
+}
+
+/// Read one portal selection with a hard payload bound.
+///
+/// `ClipboardManager::read_local_clipboard` reads the transfer to completion
+/// before any bound can be applied, so a large local selection would be
+/// allocated in full first. Reading the selection fd directly keeps the bound
+/// in force while the data is transferred.
+async fn read_portal_selection(
+    manager: &ClipboardManager,
+    session: &PortalSessionHandle,
+    mime_type: &str,
+) -> Result<Vec<u8>, String> {
+    let fd: OwnedFd = manager
+        .portal_clipboard()
+        .selection_read(session.ashpd_session(), mime_type)
+        .await
+        .map_err(|error| error.to_string())?
+        .into();
+    tokio::task::spawn_blocking(move || read_fd_bounded(fd))
+        .await
+        .map_err(|error| format!("clipboard read task failed: {error}"))?
+}
+
+fn read_fd_bounded(fd: OwnedFd) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::from(fd);
+    // The portal returns a non-blocking pipe descriptor; make reads blocking
+    // for the bounded loop below.
+    let raw_fd = file.as_raw_fd();
+    // SAFETY: raw_fd is a valid descriptor owned by `file` and fcntl reports
+    // failure through its return value.
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+    if flags != -1 {
+        // SAFETY: as above; clearing O_NONBLOCK makes reads blocking.
+        unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
+
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while output.len() < MAX_CLIPBOARD_BYTES {
+        let limit = buffer.len().min(MAX_CLIPBOARD_BYTES - output.len());
+        match file.read(&mut buffer[..limit]) {
+            Ok(0) => break,
+            // Only real end-of-data stops the transfer; an interrupted read
+            // must not silently truncate the selection.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("could not read local clipboard: {error}")),
+            Ok(size) => output.extend_from_slice(&buffer[..size]),
+        }
+    }
+    Ok(output)
 }

@@ -209,10 +209,18 @@ impl Frame {
         let source_sequence = frame.meta.header.as_ref().map(|header| header.seq);
 
         if is_fast_path {
+            // The producer's buffer may carry padding beyond the frame (SPA
+            // blocks can be larger than stride * height); trim so the packed
+            // `width * height * 4` invariant always holds.
+            let data = if data.len() == output_len {
+                Arc::clone(data)
+            } else {
+                Arc::new(data[..output_len].to_vec())
+            };
             return Ok(Self {
                 width: output_width,
                 height: output_height,
-                data: Arc::clone(data),
+                data,
                 damage,
                 source_sequence,
             });
@@ -641,6 +649,20 @@ mod tests {
         assert_eq!(frame.width, 2);
         assert_eq!(frame.height, 2);
         assert_eq!(frame.data.as_slice(), data.as_slice());
+    }
+
+    #[test]
+    fn trims_trailing_padding_on_the_fast_path() {
+        let mut data = vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+        data.extend_from_slice(&[99, 99, 99, 99]); // producer block padding
+        let source = video_frame(2, 2, 8, PixelFormat::BGRA, data);
+        let frame = Frame::from_video_frame(&source).unwrap();
+
+        assert_eq!(frame.data.len(), 2 * 2 * 4);
+        assert_eq!(
+            frame.data.as_slice(),
+            &[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+        );
     }
 
     #[test]

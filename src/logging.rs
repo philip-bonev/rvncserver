@@ -16,10 +16,10 @@
 
 use std::ffi::CString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -79,13 +79,13 @@ pub fn log(message: fmt::Arguments<'_>) {
         .as_mut()
     {
         if let Err(error) = rotating.rotate_if_needed(message.len().saturating_add(1) as u64) {
-            eprintln!("rvncserver: log rotation failed: {error}");
+            write_stderr(&format!("rvncserver: log rotation failed: {error}"));
         }
-        eprintln!("{message}");
+        write_stderr(&message);
         return;
     }
     if !JOURNAL_ENABLED.load(Ordering::Acquire) {
-        eprintln!("{message}");
+        write_stderr(&message);
         return;
     }
 
@@ -100,6 +100,16 @@ pub fn log(message: fmt::Arguments<'_>) {
     unsafe {
         libc::syslog(libc::LOG_INFO, c"%s".as_ptr(), message.as_ptr());
     }
+}
+
+/// Write one diagnostic line to stderr without ever panicking.
+///
+/// `eprintln!` aborts the process when the write fails (for example on a full
+/// disk), and a logging failure must never take the server down.
+fn write_stderr(message: &str) {
+    let mut stderr = io::stderr();
+    let _ = stderr.write_all(message.as_bytes());
+    let _ = stderr.write_all(b"\n");
 }
 
 impl RotatingFile {
@@ -184,11 +194,15 @@ fn rotated_path(path: &Path, index: usize) -> PathBuf {
 }
 
 fn open_log_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    // The creation mode only applies to new files; tighten pre-existing ones
+    // so log content is never world-readable.
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 fn redirect_output(file: &File) -> io::Result<()> {

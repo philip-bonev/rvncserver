@@ -25,6 +25,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -52,8 +53,37 @@ enum Command {
     Stop,
 }
 
+/// State of the visible selection, mutated under a single lock so content and
+/// generation can never change independently of each other.
+#[derive(Default)]
+struct SelectionState {
+    /// Text currently visible to local clipboard readers.
+    current: Option<Vec<u8>>,
+    /// Text most recently published to the compositor by this backend. Used
+    /// to recognize the echo of our own selection so it is not sent back to
+    /// the remote client as a "local" change.
+    published: Option<Vec<u8>>,
+    /// Incremented whenever the visible selection changes so a slower
+    /// transfer that finishes late cannot overwrite newer content.
+    generation: u64,
+}
+
 struct SharedText {
-    current: Mutex<Option<Vec<u8>>>,
+    state: Mutex<SelectionState>,
+}
+
+impl SharedText {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SelectionState::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SelectionState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Clipboard backend using the compositor's ext-data-control-v1 global.
@@ -74,8 +104,34 @@ struct State {
     device: ExtDataControlDeviceV1,
     offers: HashMap<ObjectId, Offer>,
     selected_offer: Option<ObjectId>,
+    selected_primary_offer: Option<ObjectId>,
+    /// Cleared by the protocol's `finished` event; the device must then not be
+    /// used for further requests.
+    device_alive: bool,
     text: Arc<SharedText>,
     events: mpsc::UnboundedSender<ClipboardListenerEvent>,
+}
+
+/// Bound on concurrent clipboard-send threads: a paste storm from a local
+/// application must not spawn unbounded threads.
+static ACTIVE_SENDS: AtomicUsize = AtomicUsize::new(0);
+const MAX_CONCURRENT_SENDS: usize = 16;
+
+fn acquire_send_slot() -> bool {
+    let previous = ACTIVE_SENDS.fetch_add(1, Ordering::SeqCst);
+    if previous < MAX_CONCURRENT_SENDS {
+        return true;
+    }
+    ACTIVE_SENDS.fetch_sub(1, Ordering::SeqCst);
+    false
+}
+
+struct SendSlotGuard;
+
+impl Drop for SendSlotGuard {
+    fn drop(&mut self) {
+        ACTIVE_SENDS.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl WaylandClipboard {
@@ -85,9 +141,7 @@ impl WaylandClipboard {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let (command_tx, command_rx) = std_mpsc::channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let text = Arc::new(SharedText {
-            current: Mutex::new(None),
-        });
+        let text = Arc::new(SharedText::new());
         let worker_text = Arc::clone(&text);
         let worker_events = events_tx.clone();
         let worker = thread::Builder::new()
@@ -118,7 +172,11 @@ impl WaylandClipboard {
                 Err(error)
             }
             Err(error) => {
-                let _ = worker.join();
+                // Never join on the timeout path: a wedged compositor can
+                // leave the worker blocked in a Wayland roundtrip forever.
+                // Dropping the command sender lets the worker exit as soon as
+                // it becomes responsive again.
+                drop(command_tx);
                 Err(format!("timed out initializing Wayland clipboard: {error}"))
             }
         }
@@ -146,12 +204,7 @@ impl ClipboardBackend for WaylandClipboard {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>> {
         Box::pin(async move {
-            let text = self
-                .text
-                .current
-                .lock()
-                .map_err(|_| "Wayland clipboard text lock was poisoned".to_string())?
-                .clone();
+            let text = self.text.lock().current.clone();
             Ok(text)
         })
     }
@@ -165,12 +218,9 @@ impl ClipboardBackend for WaylandClipboard {
                 .into_iter()
                 .take(MAX_CLIPBOARD_BYTES)
                 .collect::<Vec<_>>();
-            *self
-                .text
-                .current
-                .lock()
-                .map_err(|_| "Wayland clipboard text lock was poisoned".to_string())? =
-                Some(text.clone());
+            // The shared state is updated by the worker when the selection is
+            // actually published; caching here would report text that a failed
+            // send never made visible.
             self.command_tx
                 .send(Command::SetText(text))
                 .map_err(|_| "Wayland clipboard worker has stopped".to_string())
@@ -230,6 +280,8 @@ fn worker_init(
         device,
         offers: HashMap::new(),
         selected_offer: None,
+        selected_primary_offer: None,
+        device_alive: true,
         text,
         events,
     };
@@ -270,7 +322,11 @@ fn worker_loop(
     }
 }
 
-fn publish_text(connection: &mut Connection<State>, state: &State, text: Vec<u8>) {
+fn publish_text(connection: &mut Connection<State>, state: &mut State, text: Vec<u8>) {
+    if !state.device_alive {
+        crate::timestamped_log!("clipboard: Wayland data device is gone; dropping published text");
+        return;
+    }
     crate::timestamped_log!(
         "clipboard: publishing {} bytes through ext_data_control_v1",
         text.len()
@@ -281,21 +337,27 @@ fn publish_text(connection: &mut Connection<State>, state: &State, text: Vec<u8>
             source.offer(connection, mime_type);
         }
     }
-    let shared_text = Arc::clone(&state.text);
+    // Each source serves exactly the text it was created for. Reading shared
+    // state at paste time would serve whatever happens to be current by then.
+    let published_text = text.clone();
     connection.set_callback_for(
         source,
         move |ctx: EventCtx<'_, State, ExtDataControlSourceV1>| match ctx.event {
             ext_data_control_source_v1::Event::Send(args) => {
-                let text = shared_text
-                    .current
-                    .lock()
-                    .ok()
-                    .and_then(|text| text.clone())
-                    .unwrap_or_default();
                 let fd = args.fd;
+                if !acquire_send_slot() {
+                    crate::timestamped_log!(
+                        "clipboard: too many concurrent transfers; dropping one"
+                    );
+                    return;
+                }
+                let text = published_text.clone();
                 let _ = thread::Builder::new()
                     .name("rvnc-clipboard-send".into())
-                    .spawn(move || write_fd(fd, text));
+                    .spawn(move || {
+                        let _guard = SendSlotGuard;
+                        write_fd(fd, text)
+                    });
             }
             ext_data_control_source_v1::Event::Cancelled => {
                 ctx.proxy.destroy(ctx.conn);
@@ -304,8 +366,11 @@ fn publish_text(connection: &mut Connection<State>, state: &State, text: Vec<u8>
         },
     );
     state.device.set_selection(connection, Some(source));
-    if let Ok(mut current) = state.text.current.lock() {
-        *current = Some(text);
+    {
+        let mut selection = state.text.lock();
+        selection.current = Some(text.clone());
+        selection.published = Some(text);
+        selection.generation += 1;
     }
 }
 
@@ -330,16 +395,28 @@ fn data_device_callback(ctx: EventCtx<'_, State, ExtDataControlDeviceV1>) {
                     }
                 }
             }
+            // In-flight transfers for older selections must not overwrite the
+            // content that arrives after this event.
+            let generation = {
+                let mut selection = ctx.state.text.lock();
+                selection.generation += 1;
+                selection.generation
+            };
             let Some(offer) = ctx.state.offers.get(&id) else {
                 return;
             };
-            let Some(mime_type) = offer.mime_types.iter().find(|mime| {
-                let mime = mime.to_string_lossy();
-                TEXT_MIME_TYPES.contains(&mime.as_ref())
-            }) else {
-                if let Ok(mut current) = ctx.state.text.current.lock() {
-                    *current = None;
-                }
+            let Some(mime_type) = offer
+                .mime_types
+                .iter()
+                .find(|mime| {
+                    let mime = mime.to_string_lossy();
+                    TEXT_MIME_TYPES.contains(&mime.as_ref())
+                })
+                .cloned()
+            else {
+                let mut selection = ctx.state.text.lock();
+                selection.current = None;
+                selection.published = None;
                 return;
             };
             let mime = mime_type.to_string_lossy().into_owned();
@@ -348,19 +425,38 @@ fn data_device_callback(ctx: EventCtx<'_, State, ExtDataControlDeviceV1>) {
             let event_tx = ctx.state.events.clone();
             let text = Arc::clone(&ctx.state.text);
             let Ok((reader, writer)) = UnixStream::pair() else {
+                crate::timestamped_log!(
+                    "clipboard: could not create a transfer socket; selection dropped"
+                );
+                let mut selection = text.lock();
+                selection.current = None;
+                selection.published = None;
                 return;
             };
             let writer: OwnedFd = writer.into();
-            let Ok(mime_cstring) = CString::new(mime.clone()) else {
-                return;
-            };
-            proxy.receive(ctx.conn, mime_cstring, writer);
+            proxy.receive(ctx.conn, mime_type, writer);
             let _ = thread::Builder::new()
                 .name("rvnc-clipboard-receive".into())
                 .spawn(move || {
                     let bytes = read_fd(reader);
-                    if let Ok(mut current) = text.current.lock() {
-                        *current = Some(bytes);
+                    let echoed = {
+                        let mut selection = text.lock();
+                        if selection.generation != generation {
+                            return;
+                        }
+                        // The compositor also reports the selection we
+                        // published ourselves; forwarding it would echo the
+                        // remote client's own clipboard back at it.
+                        let echoed = selection.published.as_deref() == Some(bytes.as_slice());
+                        selection.current = Some(bytes);
+                        if !echoed {
+                            // The selection is genuinely local-owned again.
+                            selection.published = None;
+                        }
+                        echoed
+                    };
+                    if echoed {
+                        return;
                     }
                     let _ =
                         event_tx.send(ClipboardListenerEvent::LocalSelectionChanged(vec![mime]));
@@ -372,9 +468,50 @@ fn data_device_callback(ctx: EventCtx<'_, State, ExtDataControlDeviceV1>) {
                     old_offer.proxy.destroy(ctx.conn);
                 }
             }
-            if let Ok(mut current) = ctx.state.text.current.lock() {
-                *current = None;
+            let mut selection = ctx.state.text.lock();
+            selection.generation += 1;
+            selection.current = None;
+            selection.published = None;
+        }
+        ext_data_control_device_v1::Event::PrimarySelection(Some(id)) => {
+            // Primary-selection offers are unused, but the protocol requires
+            // destroying each offer once it is superseded; without this every
+            // mouse-selection change leaks an offer object.
+            if let Some(old_id) = ctx.state.selected_primary_offer.replace(id) {
+                if old_id != id {
+                    if let Some(old_offer) = ctx.state.offers.remove(&old_id) {
+                        old_offer.proxy.destroy(ctx.conn);
+                    }
+                }
             }
+        }
+        ext_data_control_device_v1::Event::PrimarySelection(None) => {
+            if let Some(old_id) = ctx.state.selected_primary_offer.take() {
+                if let Some(old_offer) = ctx.state.offers.remove(&old_id) {
+                    old_offer.proxy.destroy(ctx.conn);
+                }
+            }
+        }
+        ext_data_control_device_v1::Event::Finished => {
+            crate::timestamped_log!(
+                "clipboard: Wayland data control device is no longer valid; clipboard sharing stopped"
+            );
+            if let Some(old_id) = ctx.state.selected_offer.take()
+                && let Some(old_offer) = ctx.state.offers.remove(&old_id)
+            {
+                old_offer.proxy.destroy(ctx.conn);
+            }
+            if let Some(old_id) = ctx.state.selected_primary_offer.take()
+                && let Some(old_offer) = ctx.state.offers.remove(&old_id)
+            {
+                old_offer.proxy.destroy(ctx.conn);
+            }
+            ctx.state.device.destroy(ctx.conn);
+            ctx.state.device_alive = false;
+            let mut selection = ctx.state.text.lock();
+            selection.generation += 1;
+            selection.current = None;
+            selection.published = None;
         }
         _ => {}
     }
@@ -394,7 +531,11 @@ fn read_fd(mut stream: UnixStream) -> Vec<u8> {
     while output.len() < MAX_CLIPBOARD_BYTES {
         let limit = buffer.len().min(MAX_CLIPBOARD_BYTES - output.len());
         match stream.read(&mut buffer[..limit]) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // Only real end-of-data stops the transfer; an interrupted read
+            // must not silently truncate the selection.
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
             Ok(size) => output.extend_from_slice(&buffer[..size]),
         }
     }
@@ -405,7 +546,9 @@ fn write_fd(fd: OwnedFd, text: Vec<u8>) {
     // SAFETY: ownership of this descriptor was transferred to us by the
     // Wayland protocol event and it is consumed exactly once here.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
-    let _ = file.write_all(&text);
+    if let Err(error) = file.write_all(&text) {
+        crate::timestamped_log!("clipboard: could not send selection data: {error}");
+    }
 }
 
 use std::os::fd::IntoRawFd;

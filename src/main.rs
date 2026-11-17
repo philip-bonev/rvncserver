@@ -36,6 +36,10 @@ const STARTUP_STARTED: &str = "started";
 const STARTUP_ERROR_PREFIX: &str = "error: ";
 /// Upper bound for a startup report read from the child.
 const STARTUP_REPORT_LIMIT: u64 = 64 * 1024;
+/// How long the parent waits for the daemon's startup report. Starting may
+/// legitimately take minutes while the user answers the portal dialog, so the
+/// bound is generous; it only prevents an unbounded hang on a wedged child.
+const STARTUP_REPORT_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long the parent waits for a failed child to finish its cleanup.
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -321,8 +325,7 @@ fn setup_daemon_child(
 /// Returns [`ProcessSetup::DaemonParent`] only after the child reports that
 /// the server is fully started; a failed or missing report becomes an error.
 fn wait_for_startup(reader: &mut File, pid: libc::pid_t) -> io::Result<ProcessSetup> {
-    let mut bytes = Vec::new();
-    reader.take(STARTUP_REPORT_LIMIT).read_to_end(&mut bytes)?;
+    let bytes = read_startup_report(reader)?;
     match parse_startup_report(&String::from_utf8_lossy(&bytes)) {
         Ok(()) => Ok(ProcessSetup::DaemonParent(pid)),
         Err(detail) => {
@@ -332,6 +335,60 @@ fn wait_for_startup(reader: &mut File, pid: libc::pid_t) -> io::Result<ProcessSe
             Err(io::Error::other(detail))
         }
     }
+}
+
+/// Read the child's startup report with a hard deadline.
+///
+/// The pipe delivers EOF as soon as the child finishes reporting, but a child
+/// that wedges before reporting would otherwise block this process forever.
+fn read_startup_report(reader: &mut File) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now() + STARTUP_REPORT_TIMEOUT;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while (bytes.len() as u64) < STARTUP_REPORT_LIMIT {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(startup_report_timeout());
+        }
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor references a live file descriptor owned by the
+        // caller and poll reports failures through its return value.
+        let ready = unsafe {
+            libc::poll(
+                &mut descriptor,
+                1,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Err(startup_report_timeout());
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(bytes)
+}
+
+fn startup_report_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "daemon did not report startup in time; it may still be waiting for portal approval (check with --status)",
+    )
 }
 
 /// Interpret a startup report. `Ok(())` means the server is fully started.
@@ -467,6 +524,7 @@ impl PidFileReservation {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -733,11 +791,15 @@ fn remove_pid_file_if_matches(path: &Path, expected_contents: &str) {
 }
 
 fn open_log_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    // The creation mode only applies to new files; tighten pre-existing ones
+    // so log content is never world-readable.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 fn redirect_output(output: File) -> io::Result<()> {
@@ -856,5 +918,16 @@ mod tests {
             Err("daemon exited during startup without reporting a reason".to_string())
         );
         assert!(parse_startup_report("unexpected text").is_err());
+    }
+
+    #[test]
+    fn startup_report_read_stops_at_eof() {
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader: std::os::fd::OwnedFd = reader.into();
+        let mut reader = File::from(reader);
+        writer.write_all(b"started").unwrap();
+        drop(writer);
+
+        assert_eq!(read_startup_report(&mut reader).unwrap(), b"started");
     }
 }

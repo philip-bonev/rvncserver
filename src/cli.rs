@@ -40,7 +40,7 @@ pub const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
 pub const DEFAULT_MAX_CLIENTS: usize = 4;
 
 /// Largest accepted simultaneous RFB client limit.
-pub const MAX_CLIENTS_LIMIT: usize = 32;
+pub const MAX_CLIENTS_LIMIT: usize = 10;
 
 /// RFB encodings that the server may negotiate with a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,7 +352,7 @@ where
                 max_clients_set = true;
                 let value = take_value(inline_value, &mut args, "--max-clients")?;
                 max_clients = value.parse::<usize>().map_err(|_| {
-                    CliError::IncompatibleOptions("max_clients must be between 1 and 32")
+                    CliError::IncompatibleOptions("max_clients must be between 1 and 10")
                 })?;
             }
             "--capture-probe" => {
@@ -605,7 +605,7 @@ where
     }
     if !(1..=MAX_CLIENTS_LIMIT).contains(&max_clients) {
         return Err(CliError::IncompatibleOptions(
-            "max_clients must be between 1 and 32",
+            "max_clients must be between 1 and 10",
         ));
     }
     if !encodings_set {
@@ -935,7 +935,7 @@ Usage: rvncserver [OPTIONS]
 Options:
   --listen <ADDRESS>       IP address to bind (default: 127.0.0.1)
   --port <PORT>            TCP port to bind (default: 5900)
-  --max-clients <N>        Maximum simultaneous RFB clients (default: 4, max: 32)
+  --max-clients <N>        Maximum simultaneous RFB clients (default: 4, max: 10)
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
   --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt modes
@@ -1035,13 +1035,14 @@ mod tests {
     fn parses_and_validates_max_clients() {
         assert_eq!(config(&["--max-clients", "8"]).max_clients, 8);
         assert_eq!(config(&["--max-clients=1"]).max_clients, 1);
+        assert_eq!(config(&["--max-clients", "10"]).max_clients, 10);
         assert_eq!(
             parse(&["--max-clients", "0"]),
             Err(CliError::IncompatibleOptions(
-                "max_clients must be between 1 and 32"
+                "max_clients must be between 1 and 10"
             ))
         );
-        assert!(parse(&["--max-clients", "33"]).is_err());
+        assert!(parse(&["--max-clients", "11"]).is_err());
         assert!(parse(&["--max-clients", "many"]).is_err());
         assert!(parse(&["--max-clients", "2", "--max-clients", "3"]).is_err());
     }

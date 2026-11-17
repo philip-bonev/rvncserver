@@ -41,8 +41,12 @@ use crate::error::AppError;
 use crate::framebuffer::Frame;
 use crate::input::ClientEvent;
 
-const HELD_POINTER_BUTTON_MASK: u8 = 0b0110_0111;
-const WHEEL_BUTTON_MASK: u8 = 0b0001_1000;
+/// RFB button bits held down between events: left, middle, right, and Back
+/// (RFB buttons 1, 2, 3, and 8).
+const HELD_POINTER_BUTTON_MASK: u8 = 0b1000_0111;
+/// RFB button bits that represent transient wheel ticks: scroll up, down,
+/// left, and right (RFB buttons 4-7).
+const WHEEL_BUTTON_MASK: u8 = 0b0111_1000;
 
 /// Owner-only file holding the portal restore token across restarts.
 const RESTORE_TOKEN_FILE: &str = "portal-restore-token";
@@ -338,8 +342,7 @@ impl CaptureSession {
                     (0, 0x110), // BTN_LEFT
                     (1, 0x112), // BTN_MIDDLE
                     (2, 0x111), // BTN_RIGHT
-                    (5, 0x113), // BTN_SIDE
-                    (6, 0x114), // BTN_EXTRA
+                    (7, 0x116), // BTN_BACK (RFB button 8)
                 ] {
                     let bit = 1 << rfb_bit;
                     if (buttons ^ self.pointer_buttons) & bit != 0 {
@@ -364,13 +367,16 @@ impl CaptureSession {
                     }
                 }
 
-                // RFB represents wheel ticks as transient button presses.
-                for (rfb_bit, dy) in [(3, -1.0), (4, 1.0)] {
+                // RFB represents wheel steps as transient button presses:
+                // buttons 4-7 are scroll up, down, left, and right.
+                for (rfb_bit, dx, dy) in
+                    [(3, 0.0, -1.0), (4, 0.0, 1.0), (5, -1.0, 0.0), (6, 1.0, 0.0)]
+                {
                     let bit = 1 << rfb_bit;
                     if buttons & bit != 0 && old_buttons & bit == 0 {
                         self.manager
                             .remote_desktop()
-                            .notify_pointer_axis(self.session.ashpd_session(), 0.0, dy)
+                            .notify_pointer_axis(self.session.ashpd_session(), dx, dy)
                             .await?;
                     }
                 }
@@ -640,13 +646,16 @@ mod tests {
     #[test]
     fn pointer_mask_retains_button_state_until_release() {
         let pressed = merge_pointer_button_mask(0b0000_0001, 0b0000_0001);
-        assert_eq!(pressed & 0b0000_0111, 0b0000_0001);
+        assert_eq!(pressed & HELD_POINTER_BUTTON_MASK, 0b0000_0001);
 
         let released = merge_pointer_button_mask(0, 0);
-        assert_eq!(released & 0b0000_0111, 0);
+        assert_eq!(released & HELD_POINTER_BUTTON_MASK, 0);
 
-        let with_wheel = merge_pointer_button_mask(0b0100_0010, 0b0001_1000);
-        assert_eq!(with_wheel, 0b0101_1010);
+        // Held buttons (including Back) persist across events; wheel ticks
+        // are only remembered for edge detection and cleared afterwards.
+        let with_wheel = merge_pointer_button_mask(0b1000_0010, 0b0111_1000);
+        assert_eq!(with_wheel, 0b1111_1010);
+        assert_eq!(merge_pointer_button_mask(with_wheel, 0), 0b1000_0010);
     }
 
     #[test]
