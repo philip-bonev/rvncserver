@@ -20,15 +20,18 @@
 //! - [`security`] performs security negotiation and authentication crypto.
 //! - [`pixel`] describes client pixel formats.
 //! - [`damage`] accumulates and merges damaged framebuffer regions.
+//! - [`hextile`] and [`zrle`] implement the tile-based encodings.
 //! - [`encoding`] encodes framebuffer updates and schedules updates.
 //! - [`listener`] manages the TCP listener and per-client worker threads.
 
 mod auth;
 mod damage;
 mod encoding;
+mod hextile;
 mod listener;
 mod pixel;
 mod security;
+mod zrle;
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};

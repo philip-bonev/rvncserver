@@ -14,12 +14,14 @@
 
 //! Framebuffer update encodings and update scheduling.
 
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use flate2::{Compress, FlushCompress, Status};
+
+#[cfg(test)]
+use flate2::Compression;
 
 use crate::cli::RfbEncoding;
 use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
@@ -27,7 +29,9 @@ use crate::framebuffer::{DamageRect, Frame, FrameDamage, FrameStore};
 use super::damage::{
     MAX_UPDATE_RECTS, accumulate_damage, bounded_updates, damage_within, subtract_damage,
 };
+use super::hextile::send_hextile_rectangle;
 use super::pixel::PixelFormat;
+use super::zrle::send_zrle_rectangle;
 use super::{
     INITIAL_FRAME_TIMEOUT, WAIT_SLICE, invalid_data, read_u8, read_u16, send_empty_update,
     shutdown_error, validate_rectangle, write_all_interruptible,
@@ -50,9 +54,9 @@ const MAX_OFFSET_VISITS: usize = 200_000;
 
 const ENCODING_RAW: i32 = 0;
 
-const ENCODING_HEXTILE: i32 = 5;
+pub(super) const ENCODING_HEXTILE: i32 = 5;
 
-const ENCODING_ZRLE: i32 = 16;
+pub(super) const ENCODING_ZRLE: i32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Encoding {
@@ -322,7 +326,7 @@ fn ensure_frame_dimensions(frame: &Frame, width: u16, height: u16) -> io::Result
     Ok(())
 }
 
-fn send_update(
+pub(super) fn send_update(
     stream: &mut (impl Read + Write),
     frame: &Frame,
     rectangles: &[DamageRect],
@@ -780,7 +784,7 @@ fn send_zlib_rectangle(
     write_all_interruptible(stream, &compressed, shutdown)
 }
 
-fn compress_sync(compressor: &mut Compress, input: &[u8]) -> io::Result<Vec<u8>> {
+pub(super) fn compress_sync(compressor: &mut Compress, input: &[u8]) -> io::Result<Vec<u8>> {
     compress_sync_with_buffer_size(compressor, input, 8192)
 }
 
@@ -824,275 +828,7 @@ fn compress_sync_with_buffer_size(
     }
 }
 
-fn send_zrle_rectangle(
-    stream: &mut (impl Read + Write),
-    frame: &Frame,
-    rectangle: DamageRect,
-    pixel_format: PixelFormat,
-    compressor: &mut Compress,
-    shutdown: &AtomicBool,
-) -> io::Result<()> {
-    let right = rectangle
-        .x
-        .checked_add(rectangle.width)
-        .ok_or_else(|| invalid_data("ZRLE rectangle overflows"))?;
-    let bottom = rectangle
-        .y
-        .checked_add(rectangle.height)
-        .ok_or_else(|| invalid_data("ZRLE rectangle overflows"))?;
-    let tile_count = rectangle
-        .width
-        .div_ceil(64)
-        .checked_mul(rectangle.height.div_ceil(64))
-        .ok_or_else(|| invalid_data("ZRLE tile count overflows"))?;
-    let pixel_count = rectangle
-        .width
-        .checked_mul(rectangle.height)
-        .ok_or_else(|| invalid_data("ZRLE pixel count overflows"))?;
-    let c_pixel_size = pixel_format.zrle_bytes_per_pixel();
-    let capacity = usize::try_from(pixel_count)
-        .ok()
-        .and_then(|pixels| pixels.checked_mul(c_pixel_size))
-        .and_then(|bytes| bytes.checked_add(tile_count as usize))
-        .ok_or_else(|| invalid_data("ZRLE rectangle size overflows"))?;
-    let mut raw = Vec::new();
-    raw.try_reserve_exact(capacity)
-        .map_err(|error| io::Error::other(format!("could not allocate ZRLE rectangle: {error}")))?;
-
-    for tile_y in (rectangle.y..bottom).step_by(64) {
-        let tile_height = (bottom - tile_y).min(64);
-        for tile_x in (rectangle.x..right).step_by(64) {
-            let tile_width = (right - tile_x).min(64);
-            // ZRLE subencoding 0 is Raw.
-            raw.push(0);
-            for y in tile_y..tile_y + tile_height {
-                for x in tile_x..tile_x + tile_width {
-                    let bgra = frame_pixel(frame, x, y)?;
-                    let encoded = pixel_format.encode_zrle(&bgra);
-                    raw.extend_from_slice(&encoded[..c_pixel_size]);
-                }
-            }
-        }
-    }
-
-    let compressed = compress_sync(compressor, &raw)?;
-
-    let compressed_len = u32::try_from(compressed.len())
-        .map_err(|_| invalid_data("compressed ZRLE rectangle exceeds RFB limit"))?;
-    write_all_interruptible(stream, &compressed_len.to_be_bytes(), shutdown)?;
-    write_all_interruptible(stream, &compressed, shutdown)
-}
-
-#[derive(Clone, Copy)]
-struct HextileSubrect {
-    x: u8,
-    y: u8,
-    width: u8,
-    height: u8,
-    color: [u8; 4],
-}
-
-#[derive(Clone, Copy)]
-struct HextileTile {
-    x: u32,
-    y: u32,
-    width: u8,
-    height: u8,
-}
-
-fn send_hextile_rectangle(
-    stream: &mut (impl Read + Write),
-    frame: &Frame,
-    rectangle: DamageRect,
-    pixel_format: PixelFormat,
-    shutdown: &AtomicBool,
-) -> io::Result<()> {
-    let right = rectangle.x + rectangle.width;
-    let bottom = rectangle.y + rectangle.height;
-
-    for tile_y in (rectangle.y..bottom).step_by(16) {
-        let tile_height = (bottom - tile_y).min(16) as u8;
-        for tile_x in (rectangle.x..right).step_by(16) {
-            let tile_width = (right - tile_x).min(16) as u8;
-            send_hextile_tile(
-                stream,
-                frame,
-                HextileTile {
-                    x: tile_x,
-                    y: tile_y,
-                    width: tile_width,
-                    height: tile_height,
-                },
-                pixel_format,
-                shutdown,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-fn send_hextile_tile(
-    stream: &mut (impl Read + Write),
-    frame: &Frame,
-    tile: HextileTile,
-    pixel_format: PixelFormat,
-    shutdown: &AtomicBool,
-) -> io::Result<()> {
-    const BACKGROUND_SPECIFIED: u8 = 2;
-    const FOREGROUND_SPECIFIED: u8 = 4;
-    const ANY_SUBRECTS: u8 = 8;
-    const SUBRECTS_COLOURED: u8 = 16;
-
-    let HextileTile {
-        x: tile_x,
-        y: tile_y,
-        width: tile_width,
-        height: tile_height,
-    } = tile;
-    let bytes_per_pixel = pixel_format.bytes_per_pixel();
-    let mut frequencies = HashMap::<[u8; 4], usize>::with_capacity(16);
-    let mut background = [0u8; 4];
-    let mut most_frequent = 0usize;
-    for y in 0..u32::from(tile_height) {
-        for x in 0..u32::from(tile_width) {
-            let color = encoded_frame_pixel(frame, tile_x + x, tile_y + y, pixel_format)?;
-            let count = frequencies.entry(color).or_default();
-            *count += 1;
-            if *count > most_frequent {
-                most_frequent = *count;
-                background = color;
-            }
-        }
-    }
-
-    let mut subrects = Vec::<HextileSubrect>::new();
-    for y in 0..tile_height {
-        let mut x = 0u8;
-        while x < tile_width {
-            let color = encoded_frame_pixel(
-                frame,
-                tile_x + u32::from(x),
-                tile_y + u32::from(y),
-                pixel_format,
-            )?;
-            if color == background {
-                x += 1;
-                continue;
-            }
-
-            let run_start = x;
-            x += 1;
-            while x < tile_width
-                && encoded_frame_pixel(
-                    frame,
-                    tile_x + u32::from(x),
-                    tile_y + u32::from(y),
-                    pixel_format,
-                )? == color
-            {
-                x += 1;
-            }
-            let run_width = x - run_start;
-
-            if let Some(previous) = subrects.iter_mut().rev().find(|candidate| {
-                candidate.x == run_start
-                    && candidate.width == run_width
-                    && candidate.color == color
-                    && candidate.y + candidate.height == y
-            }) {
-                previous.height += 1;
-            } else {
-                if subrects.len() == u8::MAX as usize {
-                    return send_raw_hextile_tile(stream, frame, tile, pixel_format, shutdown);
-                }
-                subrects.push(HextileSubrect {
-                    x: run_start,
-                    y,
-                    width: run_width,
-                    height: 1,
-                    color,
-                });
-            }
-        }
-    }
-
-    let foreground = subrects.first().map(|subrect| subrect.color);
-    let single_foreground =
-        foreground.is_some_and(|color| subrects.iter().all(|subrect| subrect.color == color));
-    let bytes_per_subrect = if single_foreground { 2 } else { 6 };
-    let encoded_size = 1
-        + 4
-        + usize::from(!subrects.is_empty())
-        + subrects.len() * bytes_per_subrect
-        + if single_foreground { 4 } else { 0 };
-    let raw_size = 1 + usize::from(tile_width) * usize::from(tile_height) * bytes_per_pixel;
-
-    if !subrects.is_empty() && encoded_size >= raw_size {
-        return send_raw_hextile_tile(stream, frame, tile, pixel_format, shutdown);
-    }
-
-    let mut flags = BACKGROUND_SPECIFIED;
-    if !subrects.is_empty() {
-        flags |= ANY_SUBRECTS;
-        if single_foreground {
-            flags |= FOREGROUND_SPECIFIED;
-        } else {
-            flags |= SUBRECTS_COLOURED;
-        }
-    }
-    write_all_interruptible(stream, &[flags], shutdown)?;
-    write_all_interruptible(stream, &background[..bytes_per_pixel], shutdown)?;
-
-    if !subrects.is_empty() {
-        if single_foreground {
-            write_all_interruptible(
-                stream,
-                &foreground.unwrap_or([0; 4])[..bytes_per_pixel],
-                shutdown,
-            )?;
-        }
-        write_all_interruptible(stream, &[subrects.len() as u8], shutdown)?;
-        for subrect in subrects {
-            write_all_interruptible(stream, &[(subrect.x << 4) | subrect.y], shutdown)?;
-            write_all_interruptible(
-                stream,
-                &[((subrect.width - 1) << 4) | (subrect.height - 1)],
-                shutdown,
-            )?;
-            if !single_foreground {
-                write_all_interruptible(stream, &subrect.color[..bytes_per_pixel], shutdown)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn send_raw_hextile_tile(
-    stream: &mut (impl Read + Write),
-    frame: &Frame,
-    tile: HextileTile,
-    pixel_format: PixelFormat,
-    shutdown: &AtomicBool,
-) -> io::Result<()> {
-    let HextileTile {
-        x: tile_x,
-        y: tile_y,
-        width: tile_width,
-        height: tile_height,
-    } = tile;
-    write_all_interruptible(stream, &[1], shutdown)?; // Raw tile subencoding
-    for row in 0..u32::from(tile_height) {
-        for column in 0..u32::from(tile_width) {
-            let pixel = encoded_frame_pixel(frame, tile_x + column, tile_y + row, pixel_format)?;
-            write_all_interruptible(stream, &pixel[..pixel_format.bytes_per_pixel()], shutdown)?;
-        }
-    }
-    Ok(())
-}
-
-fn frame_pixel(frame: &Frame, x: u32, y: u32) -> io::Result<[u8; 4]> {
+pub(super) fn frame_pixel(frame: &Frame, x: u32, y: u32) -> io::Result<[u8; 4]> {
     let start = (y as usize)
         .checked_mul(frame.width as usize)
         .and_then(|pixel| pixel.checked_add(x as usize))
@@ -1108,13 +844,34 @@ fn frame_pixel(frame: &Frame, x: u32, y: u32) -> io::Result<[u8; 4]> {
     Ok([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
-fn encoded_frame_pixel(
+pub(super) fn encoded_frame_pixel(
     frame: &Frame,
     x: u32,
     y: u32,
     pixel_format: PixelFormat,
 ) -> io::Result<[u8; 4]> {
     Ok(pixel_format.encode(&frame_pixel(frame, x, y)?))
+}
+
+#[cfg(test)]
+pub(crate) fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> ClientUpdateState {
+    ClientUpdateState {
+        encoding,
+        copy_rect_enabled,
+        pixel_format: PixelFormat::DEFAULT,
+        last_sequence: 0,
+        pending_damage: Vec::new(),
+        pending_update: None,
+        zrle_compressor: Compress::new(Compression::default(), true),
+        zlib_compressor: Compress::new(Compression::default(), true),
+        client_pixels: None,
+        cursor_enabled: false,
+        rich_cursor_enabled: false,
+        pointer_pos_enabled: false,
+        cursor_snapshot: crate::cursor::CursorSnapshot::default(),
+        sent_cursor_shape_sequence: 0,
+        sent_cursor_position_sequence: 0,
+    }
 }
 
 #[cfg(test)]
@@ -1126,26 +883,6 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::Arc;
     use std::thread;
-
-    fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> ClientUpdateState {
-        ClientUpdateState {
-            encoding,
-            copy_rect_enabled,
-            pixel_format: PixelFormat::DEFAULT,
-            last_sequence: 0,
-            pending_damage: Vec::new(),
-            pending_update: None,
-            zrle_compressor: Compress::new(Compression::default(), true),
-            zlib_compressor: Compress::new(Compression::default(), true),
-            client_pixels: None,
-            cursor_enabled: false,
-            rich_cursor_enabled: false,
-            pointer_pos_enabled: false,
-            cursor_snapshot: crate::cursor::CursorSnapshot::default(),
-            sent_cursor_shape_sequence: 0,
-            sent_cursor_position_sequence: 0,
-        }
-    }
 
     #[test]
     fn rejects_zero_sized_rectangles() {
@@ -1292,58 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn zrle_encodes_raw_tiles_in_one_persistent_zlib_stream() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let frame = Frame::new(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 255]).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut compressor = Compress::new(Compression::default(), true);
-            let rectangle = DamageRect {
-                x: 0,
-                y: 0,
-                width: 2,
-                height: 1,
-            };
-            send_zrle_rectangle(
-                &mut stream,
-                &frame,
-                rectangle,
-                PixelFormat::DEFAULT,
-                &mut compressor,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-            send_zrle_rectangle(
-                &mut stream,
-                &frame,
-                rectangle,
-                PixelFormat::DEFAULT,
-                &mut compressor,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-        });
-
-        let mut client = TcpStream::connect(address).unwrap();
-        let mut decompressor = flate2::Decompress::new(true);
-        for _ in 0..2 {
-            let mut length = [0; 4];
-            client.read_exact(&mut length).unwrap();
-            let mut compressed = vec![0; u32::from_be_bytes(length) as usize];
-            client.read_exact(&mut compressed).unwrap();
-            let mut decoded = [0; 7];
-            let before = decompressor.total_out();
-            decompressor
-                .decompress(&compressed, &mut decoded, flate2::FlushDecompress::Sync)
-                .unwrap();
-            let written = (decompressor.total_out() - before) as usize;
-            assert_eq!(&decoded[..written], &[0, 1, 2, 3, 4, 5, 6]);
-        }
-        server.join().unwrap();
-    }
-
-    #[test]
     fn zlib_encodes_raw_pixels_in_one_persistent_stream() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -1449,76 +1134,6 @@ mod tests {
             ENCODING_COPY_RECT
         );
         assert_eq!(&update[16..], &[0, 0, 0, 0]);
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn hextile_encodes_solid_and_subrect_tiles() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let solid_pixels = [10, 20, 30, 255].repeat(4);
-        let solid_frame = Frame::new(2, 2, solid_pixels).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut state = test_update_state(Encoding::Hextile, false);
-            send_update(
-                &mut stream,
-                &solid_frame,
-                &[DamageRect {
-                    x: 0,
-                    y: 0,
-                    width: 2,
-                    height: 2,
-                }],
-                &mut state,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-        });
-
-        let mut client = TcpStream::connect(address).unwrap();
-        let mut update = [0u8; 21];
-        client.read_exact(&mut update).unwrap();
-        assert_eq!(&update[..4], &[0, 0, 0, 1]);
-        assert_eq!(
-            i32::from_be_bytes(update[12..16].try_into().unwrap()),
-            ENCODING_HEXTILE
-        );
-        assert_eq!(&update[16..], &[2, 10, 20, 30, 255]);
-        server.join().unwrap();
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut pixels = [1, 2, 3, 255].repeat(16);
-        pixels[24..28].copy_from_slice(&[4, 5, 6, 255]); // pixel (2, 1)
-        let frame = Frame::new(4, 4, pixels).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut state = test_update_state(Encoding::Hextile, false);
-            send_update(
-                &mut stream,
-                &frame,
-                &[DamageRect {
-                    x: 0,
-                    y: 0,
-                    width: 4,
-                    height: 4,
-                }],
-                &mut state,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-        });
-
-        let mut client = TcpStream::connect(address).unwrap();
-        let mut update = [0u8; 28];
-        client.read_exact(&mut update).unwrap();
-        assert_eq!(update[16], 14); // Background, foreground, one subrect.
-        assert_eq!(&update[17..21], &[1, 2, 3, 255]);
-        assert_eq!(&update[21..25], &[4, 5, 6, 255]);
-        assert_eq!(update[25], 1);
-        assert_eq!(update[26], 0x21); // x=2, y=1
-        assert_eq!(update[27], 0x00); // 1x1 subrect
         server.join().unwrap();
     }
 }
