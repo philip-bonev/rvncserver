@@ -385,7 +385,11 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
                             }
                         }
                         ClipboardListenerEvent::LocalSelectionChanged(mime_types) => {
-                            if !mime_types.iter().any(|mime| mime == "text/plain" || mime == "text/plain;charset=utf-8") {
+                            // MIME types are case-insensitive (RFC 2045).
+                            if !mime_types.iter().any(|mime| {
+                                mime.eq_ignore_ascii_case("text/plain")
+                                    || mime.eq_ignore_ascii_case("text/plain;charset=utf-8")
+                            }) {
                                 continue;
                             }
                             if let Some(service) = clipboard_service.as_mut() {

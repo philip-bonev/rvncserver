@@ -262,12 +262,28 @@ fn rotated_path(path: &Path, index: usize) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn open_log_file(path: &Path) -> io::Result<File> {
+/// Open (or create) the log file with owner-only permissions.
+///
+/// Symlinked log files are refused (`O_NOFOLLOW`): the configured path is a
+/// full path, and following a replacement link would redirect diagnostics
+/// wherever the link points.
+pub fn open_log_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)?;
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("log file {} must not be a symbolic link", path.display()),
+                )
+            } else {
+                error
+            }
+        })?;
     // The creation mode only applies to new files; tighten pre-existing ones
     // so log content is never world-readable.
     file.set_permissions(Permissions::from_mode(0o600))?;
@@ -362,6 +378,28 @@ mod tests {
         assert!(!staged.exists());
         fs::remove_file(rotated_path(&path, 1)).unwrap();
         fs::remove_file(rotated_path(&path, 2)).unwrap();
+    }
+
+    #[test]
+    fn log_file_symlinks_are_refused() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "rvncserver-log-link-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target.log");
+        fs::write(&target, "content").unwrap();
+        let link = directory.join("link.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(open_log_file(&link).is_err());
+        assert!(open_log_file(&target).is_ok());
+
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

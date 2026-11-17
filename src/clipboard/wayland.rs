@@ -489,8 +489,11 @@ fn data_device_callback(ctx: EventCtx<'_, State, ExtDataControlDeviceV1>) {
                 .mime_types
                 .iter()
                 .find(|mime| {
+                    // MIME types are case-insensitive (RFC 2045).
                     let mime = mime.to_string_lossy();
-                    TEXT_MIME_TYPES.contains(&mime.as_ref())
+                    TEXT_MIME_TYPES
+                        .iter()
+                        .any(|text| mime.eq_ignore_ascii_case(text))
                 })
                 .cloned()
             else {

@@ -241,7 +241,7 @@ fn configure_process(config: &Config) -> io::Result<ProcessSetup> {
                     "file log target requires a path",
                 )
             })?;
-            open_log_file(path)?
+            rvncserver::logging::open_log_file(path)?
         }
         LogTarget::Stderr | LogTarget::Journald => {
             OpenOptions::new().write(true).open("/dev/null")?
@@ -788,18 +788,6 @@ fn remove_pid_file_if_matches(path: &Path, expected_contents: &str) {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(active_config_path(path));
     }
-}
-
-fn open_log_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    // The creation mode only applies to new files; tighten pre-existing ones
-    // so log content is never world-readable.
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
 }
 
 fn redirect_output(output: File) -> io::Result<()> {

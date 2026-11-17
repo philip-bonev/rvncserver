@@ -704,12 +704,9 @@ impl PixelFormat {
         // Some clients report a nominal depth that differs from the number
         // of channel bits. Channel maxima and shifts define the actual
         // packed value, so validate the layout rather than rejecting that
-        // metadata mismatch. ZRLE still needs its omitted high byte unused.
-        if self.bits_per_pixel == 32 && self.depth == 24 && used_bits & 0xff00_0000 != 0 {
-            return Err(invalid_data(
-                "32bpp/depth-24 formats must leave the most significant byte unused",
-            ));
-        }
+        // metadata mismatch. Formats whose used bits sit in either byte-aligned
+        // trio are served with 3-byte ZRLE CPIXELs; `encode_zrle` omits the
+        // correct byte whichever end of the pixel is unused.
         Ok(())
     }
 }
@@ -4236,6 +4233,15 @@ mod tests {
         nominal_depth_mismatch[1] = 24;
         assert!(PixelFormat::from_wire(&nominal_depth_mismatch).is_ok());
 
+        // A depth-24 layout with channels packed into the three most
+        // significant bytes (for example RGBA byte order) is valid; ZRLE
+        // serves it with 3-byte CPIXELs.
+        let mut rgba_order = server_pixel_format();
+        rgba_order[10] = 24;
+        rgba_order[11] = 16;
+        rgba_order[12] = 8;
+        assert!(PixelFormat::from_wire(&rgba_order).is_ok());
+
         let mut wrong = server_pixel_format();
         wrong[10] = 0;
         assert!(PixelFormat::from_wire(&wrong).is_err());
@@ -4301,6 +4307,21 @@ mod tests {
         assert_eq!(rgb888_le.zrle_bytes_per_pixel(), 3);
         assert_eq!(
             &rgb888_le.encode_zrle(&[255, 128, 0, 255])[..3],
+            &[255, 128, 0]
+        );
+
+        // Channels in the three most significant bytes: the CPIXEL keeps
+        // those and omits the unused low byte.
+        let rgb888_rgba = PixelFormat {
+            big_endian: false,
+            red_shift: 24,
+            green_shift: 16,
+            blue_shift: 8,
+            ..rgb888_le
+        };
+        assert_eq!(rgb888_rgba.zrle_bytes_per_pixel(), 3);
+        assert_eq!(
+            &rgb888_rgba.encode_zrle(&[255, 128, 0, 255])[..3],
             &[255, 128, 0]
         );
 

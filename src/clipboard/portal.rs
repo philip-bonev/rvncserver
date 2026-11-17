@@ -70,7 +70,12 @@ impl PortalClipboard {
 
     /// Reply to a portal selection-transfer request.
     pub async fn provide_selection(&self, serial: u32, mime_type: &str) -> Result<(), String> {
-        let bytes = if self.mime_types.iter().any(|mime| mime == mime_type) {
+        // MIME types are case-insensitive (RFC 2045).
+        let bytes = if self
+            .mime_types
+            .iter()
+            .any(|mime| mime.eq_ignore_ascii_case(mime_type))
+        {
             self.remote_text.clone()
         } else {
             Vec::new()
