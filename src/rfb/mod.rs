@@ -19,10 +19,12 @@
 //! - [`auth`] loads credentials, TLS identities, and certificate summaries.
 //! - [`security`] performs security negotiation and authentication crypto.
 //! - [`pixel`] describes client pixel formats.
-//! - [`encoding`] encodes framebuffer updates and tracks update state.
+//! - [`damage`] accumulates and merges damaged framebuffer regions.
+//! - [`encoding`] encodes framebuffer updates and schedules updates.
 //! - [`listener`] manages the TCP listener and per-client worker threads.
 
 mod auth;
+mod damage;
 mod encoding;
 mod listener;
 mod pixel;
