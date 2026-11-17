@@ -469,6 +469,8 @@ pub struct FrameStore {
 #[derive(Debug, Default)]
 struct FrameStoreInner {
     latest: Option<(u64, Arc<Frame>)>,
+    /// When the newest frame was published; used to detect stale content.
+    published_at: Option<Instant>,
     damage_history: VecDeque<(u64, FrameDamage)>,
     last_source_sequence: Option<u64>,
     clients: usize,
@@ -517,8 +519,19 @@ impl FrameStore {
             inner.damage_history.pop_front();
         }
         inner.latest = Some((sequence, frame));
+        inner.published_at = Some(Instant::now());
         self.ready.notify_all();
         sequence
+    }
+
+    /// Age of the newest published frame, if any.
+    ///
+    /// A large age means capture has not produced anything recently: a
+    /// connecting client would start from stale content.
+    pub fn latest_age(&self) -> Option<Duration> {
+        self.lock()
+            .published_at
+            .map(|published| published.elapsed())
     }
 
     /// Return the latest frame and its sequence number.
@@ -856,6 +869,7 @@ mod tests {
         let store = FrameStore::new();
         assert!(!store.has_clients());
         assert_eq!(store.latest(), None);
+        assert_eq!(store.latest_age(), None);
 
         store.client_connected();
         assert!(store.has_clients());
@@ -864,6 +878,11 @@ mod tests {
         assert_eq!(store.publish(Arc::clone(&frame)), 1);
         assert_eq!(store.publish(frame), 2);
         assert_eq!(store.latest().unwrap().0, 2);
+        assert!(
+            store
+                .latest_age()
+                .is_some_and(|age| age < Duration::from_secs(1))
+        );
 
         store.client_disconnected();
         assert!(!store.has_clients());

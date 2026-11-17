@@ -36,6 +36,10 @@ use crate::rfb;
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+/// Warn when a connected client has seen no new captured frames for this long.
+const CAPTURE_STALL_WARNING: Duration = Duration::from_secs(10);
+/// Rate limit for the capture-stall warning.
+const CAPTURE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CAPTURE_RESTART_ATTEMPTS: usize = 3;
 const CAPTURE_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_RESTART_DELAYS: [Duration; CAPTURE_RESTART_ATTEMPTS - 1] =
@@ -186,6 +190,8 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
 
     let mut notify = capture.frame_notify();
     let mut last_frame_error: Option<Instant> = None;
+    let mut last_frame_seen = Instant::now();
+    let mut last_stall_warning: Option<Instant> = None;
     // Startup transitions may still be queued after the first frame. Discard
     // them so they are not mistaken for a later capture loss.
     let _ = capture.drain_state_events();
@@ -193,15 +199,18 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
 
     loop {
         while let Some(video_frame) = capture.try_recv_frame() {
+            last_frame_seen = Instant::now();
             if config.enable_cursor
                 && let Some(cursor) = crate::cursor::CursorUpdate::from_video_frame(&video_frame)
             {
                 store.publish_cursor(cursor);
             }
-            if !store.has_clients() {
-                continue;
-            }
 
+            // Publish every captured frame even while no client is connected.
+            // Capture is repaint-driven: discarding idle frames would freeze
+            // the store at the moment the previous client disconnected, and a
+            // client connecting later could see that stale image indefinitely
+            // while the screen stays static.
             match Frame::from_video_frame(&video_frame) {
                 Ok(frame) => {
                     store.publish(Arc::new(frame));
@@ -215,6 +224,20 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
                     }
                 }
             }
+        }
+
+        // A connected client only sees new content when capture produces
+        // frames; say so when it does not.
+        if store.has_clients()
+            && last_frame_seen.elapsed() >= CAPTURE_STALL_WARNING
+            && last_stall_warning
+                .is_none_or(|warned| warned.elapsed() >= CAPTURE_STALL_LOG_INTERVAL)
+        {
+            crate::timestamped_log!(
+                "capture: no frames for {}s while a client is connected; the compositor may have paused the stream and clients keep seeing the last captured image",
+                last_frame_seen.elapsed().as_secs()
+            );
+            last_stall_warning = Some(Instant::now());
         }
 
         for event in capture.drain_state_events() {

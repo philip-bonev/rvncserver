@@ -67,6 +67,9 @@ impl Drop for ClientConnectionGuard<'_> {
     }
 }
 
+/// Warn when a connecting client would start from a stale framebuffer.
+const STALE_FRAMEBUFFER_WARNING: Duration = Duration::from_secs(5);
+
 fn run_listener(
     listener: TcpListener,
     store: Arc<FrameStore>,
@@ -124,6 +127,14 @@ fn run_listener(
                             let _guard = guard;
                             crate::timestamped_log!("rfb: client connected from {address}");
                             store.client_connected();
+                            if let Some(age) = store.latest_age()
+                                && age >= STALE_FRAMEBUFFER_WARNING
+                            {
+                                crate::timestamped_log!(
+                                    "rfb: newest framebuffer is {}s old; the client starts with stale content until capture delivers a new frame",
+                                    age.as_secs()
+                                );
+                            }
                             let result = {
                                 let _connection_guard = ClientConnectionGuard(store.as_ref());
                                 handle_client(
