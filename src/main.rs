@@ -116,7 +116,7 @@ fn main() -> ExitCode {
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => match runtime.block_on(run_server(config, &notify_started)) {
+                    Ok(runtime) => match runtime.block_on(run_server(*config, &notify_started)) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(error) => {
                             if let Some(report) = startup.as_ref() {

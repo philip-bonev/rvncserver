@@ -78,6 +78,14 @@ const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const WAIT_SLICE: Duration = Duration::from_millis(250);
 const MAX_UPDATE_RECTS: usize = 128;
+/// How often keyboard events are summarized in the log. Individual key events
+/// are never logged at unbounded rates because typing would flood the log.
+const KEY_EVENT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Per-client bound for the CopyRect shadow of the client's framebuffer.
+/// Without a shadow CopyRect is simply not used.
+const MAX_SHADOW_PIXELS: usize = 4 * 1024 * 1024;
+/// Bound on the CopyRect source search across all candidate offsets.
+const MAX_OFFSET_VISITS: usize = 200_000;
 
 const ENCODING_RAW: i32 = 0;
 const ENCODING_HEXTILE: i32 = 5;
@@ -865,14 +873,13 @@ fn spawn_handshake_watchdog(
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let handle = thread::Builder::new()
         .name("rfb-handshake".to_string())
-        .spawn(move || match done_rx.recv_timeout(timeout) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        .spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
                 let _ = handshake_stream.shutdown(std::net::Shutdown::Both);
                 crate::timestamped_log!(
                     "rfb: closing client from {address} after handshake timeout"
                 );
             }
-            _ => {}
         })?;
     Ok((done_tx, handle))
 }
@@ -1070,6 +1077,8 @@ fn handle_client(
     let mut keyboard_input_warned = false;
     let mut pointer_input_warned = false;
     let mut received_button_mask = 0u8;
+    let mut key_events: usize = 0;
+    let mut key_event_report = Instant::now();
     let mut held_input = if config.input_enabled {
         input_tx.map(|sender| ClientInputGuard::new(sender, shutdown))
     } else {
@@ -1168,12 +1177,19 @@ fn handle_client(
                 let mut padding = [0u8; 2];
                 read_exact_interruptible(&mut stream, &mut padding, shutdown)?;
                 let keysym = read_u32(&mut stream, shutdown)?;
-                // Avoid logging keysyms or typed values, but expose whether
-                // ordinary keys (for example, the C in Ctrl+C) reach RFB.
-                crate::timestamped_log!(
-                    "rfb: received keyboard key {}",
-                    if down { "pressed" } else { "released" }
-                );
+                // Avoid logging keysyms or typed values. Keyboard events are
+                // summarized at a bounded rate so typing cannot flood the
+                // log; modifiers and control characters are rare and are
+                // logged individually for input diagnostics.
+                key_events += 1;
+                if key_event_report.elapsed() >= KEY_EVENT_LOG_INTERVAL {
+                    crate::timestamped_log!(
+                        "rfb: received {key_events} keyboard events in the last {} seconds",
+                        KEY_EVENT_LOG_INTERVAL.as_secs()
+                    );
+                    key_events = 0;
+                    key_event_report = Instant::now();
+                }
                 if is_modifier_keysym(keysym) {
                     crate::timestamped_log!(
                         "rfb: received modifier keysym {keysym:#x} {}",
@@ -2334,6 +2350,11 @@ fn update_client_shadow(
         let capacity = frame_width
             .checked_mul(frame_height)
             .ok_or_else(|| invalid_data("client framebuffer shadow size overflows"))?;
+        if capacity > MAX_SHADOW_PIXELS {
+            // Bounded per-client memory wins over CopyRect; without a shadow
+            // the encoding is simply not used.
+            return Ok(());
+        }
         let mut initial = Vec::new();
         initial.try_reserve_exact(capacity).map_err(|error| {
             io::Error::other(format!(
@@ -2394,11 +2415,16 @@ fn find_copy_source(
     let destination_pixel =
         encoded_frame_pixel(frame, rectangle.x, rectangle.y, pixel_format).ok()?;
     let mut tested = 0usize;
+    let mut visited = 0usize;
     let mut comparison_budget = MAX_COMPARE_PIXELS;
 
     for radius in 1..=SEARCH_RADIUS {
         for offset_y in -radius..=radius {
             for offset_x in -radius..=radius {
+                visited += 1;
+                if visited > MAX_OFFSET_VISITS {
+                    return None;
+                }
                 if offset_x.abs().max(offset_y.abs()) != radius {
                     continue;
                 }
@@ -2870,21 +2896,6 @@ impl<'a> ClientInputGuard<'a> {
             ClientEvent::Key { keysym, pressed },
             self.shutdown,
         )?;
-        crate::timestamped_log!(
-            "rfb: keyboard key {} queued for portal",
-            if pressed { "press" } else { "release" }
-        );
-        if is_modifier_keysym(keysym) {
-            crate::timestamped_log!(
-                "rfb: modifier keysym {keysym:#x} {}",
-                if pressed { "down" } else { "up" }
-            );
-        }
-        if pressed && is_ascii_control_keysym(keysym) {
-            crate::timestamped_log!(
-                "rfb: queued an ASCII control-character keysym for portal (value redacted)"
-            );
-        }
         if pressed {
             self.pressed_keys.insert(keysym);
         } else {
@@ -2894,17 +2905,11 @@ impl<'a> ClientInputGuard<'a> {
     }
 
     fn pointer(&mut self, x: u16, y: u16, buttons: u8) -> io::Result<()> {
-        let previous_buttons = self.pointer.map_or(0, |(_, _, buttons)| buttons);
         send_input_event(
             self.sender,
             ClientEvent::Pointer { x, y, buttons },
             self.shutdown,
         )?;
-        if previous_buttons != buttons {
-            crate::timestamped_log!(
-                "rfb: pointer button mask {previous_buttons:#04x} -> {buttons:#04x}"
-            );
-        }
         self.pointer = Some((x, y, buttons));
         Ok(())
     }

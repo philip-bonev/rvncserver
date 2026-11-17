@@ -137,7 +137,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Run the server with the given configuration.
-    Run(Config),
+    Run(Box<Config>),
     /// Print help and exit.
     Help,
     /// Print the application version and exit.
@@ -352,7 +352,7 @@ where
                 max_clients_set = true;
                 let value = take_value(inline_value, &mut args, "--max-clients")?;
                 max_clients = value.parse::<usize>().map_err(|_| {
-                    CliError::IncompatibleOptions("max_clients must be between 1 and 10")
+                    CliError::IncompatibleOptions("max_clients must be an integer between 1 and 10")
                 })?;
             }
             "--capture-probe" => {
@@ -755,18 +755,18 @@ where
             "log_max_size must be a positive byte count",
         ));
     }
+    // Rotation settings only apply to file logging. Contradictions on the
+    // command line are errors; inert rotation settings from the config file
+    // are ignored so the log target can be switched without editing it.
     if log_target != LogTarget::File
-        && (cli_log_max_size.is_some()
-            || configured_log_max_size.is_some()
-            || cli_log_max_rotations.is_some()
-            || file_config.log_max_rotations.is_some())
+        && (cli_log_max_size.is_some() || cli_log_max_rotations.is_some())
     {
         return Err(CliError::IncompatibleOptions(
             "log rotation requires the file log target",
         ));
     }
 
-    Ok(Command::Run(Config {
+    Ok(Command::Run(Box::new(Config {
         listen,
         port,
         capture_probe,
@@ -786,7 +786,7 @@ where
         log_max_rotations,
         pid_file: pid_file.or_else(default_pid_file_path),
         config_file: selected_config.filter(|path| path.exists()),
-    }))
+    })))
 }
 
 fn parse_encodings(value: &str) -> Result<Vec<RfbEncoding>, CliError> {
@@ -1004,7 +1004,7 @@ mod tests {
 
     fn config(args: &[&str]) -> Config {
         match parse(args) {
-            Ok(Command::Run(config)) => config,
+            Ok(Command::Run(config)) => *config,
             other => panic!("expected Run command, got {other:?}"),
         }
     }
@@ -1155,6 +1155,28 @@ mod tests {
 
         assert!(parse(&["--log-max-size", "100"]).is_err());
         assert!(parse(&["--log-file", "/tmp/rvncserver.log", "--log-max-size", "0"]).is_err());
+    }
+
+    #[test]
+    fn config_rotation_settings_do_not_block_a_cli_log_target_override() {
+        let path = std::env::temp_dir().join(format!(
+            "rvncserver-log-target-config-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(
+            &path,
+            r#"{"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
+        )
+        .unwrap();
+        let selected = config(&[
+            "--config",
+            &path.to_string_lossy(),
+            "--log-target",
+            "journald",
+        ]);
+        assert_eq!(selected.log_target, LogTarget::Journald);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

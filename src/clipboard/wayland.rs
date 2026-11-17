@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::future::Future;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,7 +43,7 @@ use wayrs_protocols::ext_data_control_v1::{
     ExtDataControlDeviceV1, ExtDataControlManagerV1, ExtDataControlOfferV1, ExtDataControlSourceV1,
 };
 
-use super::{ClipboardBackend, ClipboardListenerEvent};
+use super::{ClipboardBackend, ClipboardListenerEvent, ListenerFuture, TextFuture};
 
 const TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
@@ -89,6 +89,8 @@ impl SharedText {
 /// Clipboard backend using the compositor's ext-data-control-v1 global.
 pub struct WaylandClipboard {
     command_tx: std_mpsc::Sender<Command>,
+    /// Wake-up pipe write end; a byte here gets the worker out of its poll.
+    wake_tx: UnixStream,
     event_rx: Option<mpsc::UnboundedReceiver<ClipboardListenerEvent>>,
     text: Arc<SharedText>,
     worker: Option<JoinHandle<()>>,
@@ -141,6 +143,16 @@ impl WaylandClipboard {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let (command_tx, command_rx) = std_mpsc::channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (wake_tx, wake_rx) = UnixStream::pair()
+            .map_err(|error| format!("could not create a wake-up pipe: {error}"))?;
+        // Non-blocking on both ends: wake-ups are advisory and must never
+        // stall a sender or the worker's drain loop.
+        wake_tx
+            .set_nonblocking(true)
+            .map_err(|error| format!("could not configure the wake-up pipe: {error}"))?;
+        wake_rx
+            .set_nonblocking(true)
+            .map_err(|error| format!("could not configure the wake-up pipe: {error}"))?;
         let text = Arc::new(SharedText::new());
         let worker_text = Arc::clone(&text);
         let worker_events = events_tx.clone();
@@ -151,7 +163,7 @@ impl WaylandClipboard {
                 match result {
                     Ok(mut connection_state) => {
                         let _ = ready_tx.send(Ok(()));
-                        worker_loop(&mut connection_state, command_rx);
+                        worker_loop(&mut connection_state, command_rx, wake_rx);
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -163,6 +175,7 @@ impl WaylandClipboard {
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(Self {
                 command_tx,
+                wake_tx,
                 event_rx: Some(events_rx),
                 text,
                 worker: Some(worker),
@@ -181,18 +194,22 @@ impl WaylandClipboard {
             }
         }
     }
+
+    /// Queue a worker command and wake the worker's poll so it is handled
+    /// promptly instead of waiting for the next protocol event.
+    fn send_command(&self, command: Command) -> Result<(), String> {
+        self.command_tx
+            .send(command)
+            .map_err(|_| "Wayland clipboard worker has stopped".to_string())?;
+        // The write is advisory and the pipe is non-blocking; a full pipe
+        // already means the worker has wake-ups pending.
+        let _ = (&self.wake_tx).write_all(&[1]);
+        Ok(())
+    }
 }
 
 impl ClipboardBackend for WaylandClipboard {
-    fn start_listeners<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<mpsc::UnboundedReceiver<ClipboardListenerEvent>, String>>
-                + Send
-                + 'a,
-        >,
-    > {
+    fn start_listeners<'a>(&'a mut self) -> ListenerFuture<'a> {
         Box::pin(async move {
             self.event_rx
                 .take()
@@ -200,9 +217,7 @@ impl ClipboardBackend for WaylandClipboard {
         })
     }
 
-    fn read_text<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>> {
+    fn read_text<'a>(&'a mut self) -> TextFuture<'a> {
         Box::pin(async move {
             let text = self.text.lock().current.clone();
             Ok(text)
@@ -221,9 +236,7 @@ impl ClipboardBackend for WaylandClipboard {
             // The shared state is updated by the worker when the selection is
             // actually published; caching here would report text that a failed
             // send never made visible.
-            self.command_tx
-                .send(Command::SetText(text))
-                .map_err(|_| "Wayland clipboard worker has stopped".to_string())
+            self.send_command(Command::SetText(text))
         })
     }
 
@@ -237,7 +250,7 @@ impl ClipboardBackend for WaylandClipboard {
 
     fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let _ = self.command_tx.send(Command::Stop);
+            let _ = self.send_command(Command::Stop);
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
@@ -297,28 +310,95 @@ fn worker_init(
 fn worker_loop(
     connection_state: &mut (Connection<State>, State),
     commands: std_mpsc::Receiver<Command>,
+    wake_rx: UnixStream,
 ) {
     let (connection, state) = connection_state;
+    let mut wake_buffer = [0u8; 64];
     loop {
-        match commands.try_recv() {
-            Ok(Command::SetText(text)) => publish_text(connection, state, text),
-            Ok(Command::Stop) | Err(std_mpsc::TryRecvError::Disconnected) => break,
-            Err(std_mpsc::TryRecvError::Empty) => {}
+        loop {
+            match commands.try_recv() {
+                Ok(Command::SetText(text)) => publish_text(connection, state, text),
+                Ok(Command::Stop) | Err(std_mpsc::TryRecvError::Disconnected) => return,
+                Err(std_mpsc::TryRecvError::Empty) => break,
+            }
         }
         if let Err(error) = connection.recv_events(IoMode::NonBlocking) {
             if error.kind() != ErrorKind::WouldBlock {
                 crate::timestamped_log!("clipboard: Wayland event loop stopped: {error}");
-                break;
+                return;
             }
         }
         connection.dispatch_events(state);
-        if let Err(error) = connection.flush(IoMode::NonBlocking) {
-            if error.kind() != ErrorKind::WouldBlock {
+        match connection.flush(IoMode::NonBlocking) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                // A full socket buffer must be retried promptly; the poll
+                // below only waits for readable events.
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => {
                 crate::timestamped_log!("clipboard: Wayland request flush failed: {error}");
-                break;
+                return;
             }
         }
-        thread::sleep(Duration::from_millis(10));
+
+        // Block until the Wayland socket or the command wake-up pipe becomes
+        // readable instead of polling on a timer.
+        wait_for_work(connection.as_raw_fd(), &wake_rx);
+        drain_wake_ups(&wake_rx, &mut wake_buffer);
+    }
+}
+
+/// Block until the Wayland socket or the command wake-up pipe is readable.
+///
+/// The timeout is only a safety net for missed wake-ups; it is not a poll
+/// interval.
+fn wait_for_work(wayland_fd: std::os::fd::RawFd, wake_rx: &UnixStream) {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: wayland_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_rx.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: descriptors reference live file descriptors owned by the
+        // caller; poll reports failures through its return value.
+        let ready = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                1000,
+            )
+        };
+        if ready >= 0 {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
+    }
+}
+
+/// Consume pending wake-up bytes. End-of-file simply ends the drain; the
+/// command check at the top of the loop shuts the worker down.
+fn drain_wake_ups(wake_rx: &UnixStream, buffer: &mut [u8; 64]) {
+    // `Read` is implemented for `&UnixStream`; keep a mutable handle to it.
+    let mut handle = wake_rx;
+    loop {
+        match handle.read(buffer) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 

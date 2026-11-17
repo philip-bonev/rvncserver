@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use lamco_portal::{ClipboardManager, PortalSessionHandle};
 
-use super::{ClipboardBackend, ClipboardListenerEvent};
+use super::{ClipboardBackend, ClipboardListenerEvent, ListenerFuture, TextFuture};
 use tokio::sync::mpsc;
 
 /// Largest clipboard payload accepted from the desktop; matches the RFB
@@ -34,6 +34,7 @@ pub struct PortalClipboard {
     session: Arc<PortalSessionHandle>,
     mime_types: Vec<String>,
     remote_text: Vec<u8>,
+    listeners_started: bool,
 }
 
 impl PortalClipboard {
@@ -47,6 +48,7 @@ impl PortalClipboard {
                 "text/plain".to_string(),
             ],
             remote_text: Vec::new(),
+            listeners_started: false,
         }
     }
 
@@ -81,16 +83,12 @@ impl PortalClipboard {
 }
 
 impl ClipboardBackend for PortalClipboard {
-    fn start_listeners<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<mpsc::UnboundedReceiver<ClipboardListenerEvent>, String>>
-                + Send
-                + 'a,
-        >,
-    > {
+    fn start_listeners<'a>(&'a mut self) -> ListenerFuture<'a> {
         Box::pin(async move {
+            if self.listeners_started {
+                return Err("portal clipboard listeners already started".to_string());
+            }
+            self.listeners_started = true;
             let (transfer_tx, mut transfer_rx) = mpsc::unbounded_channel();
             let (owner_tx, mut owner_rx) = mpsc::unbounded_channel();
             self.manager
@@ -128,9 +126,7 @@ impl ClipboardBackend for PortalClipboard {
         })
     }
 
-    fn read_text<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>> {
+    fn read_text<'a>(&'a mut self) -> TextFuture<'a> {
         Box::pin(async move {
             // A selection owner may offer only plain `text/plain`; try every
             // accepted text MIME type before giving up.

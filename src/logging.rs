@@ -30,6 +30,9 @@ use flate2::write::GzEncoder;
 
 static JOURNAL_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROTATING_FILE: Mutex<Option<RotatingFile>> = Mutex::new(None);
+/// Serializes the slow archive pipeline (compression and the backup chain)
+/// so rotated files stay in order. Never held while log lines are written.
+static ROTATION_WORK: Mutex<()> = Mutex::new(());
 static ROTATION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct RotatingFile {
@@ -73,17 +76,34 @@ pub fn use_journald() {
 /// Write a diagnostic to the selected sink; stderr remains the default.
 pub fn log(message: fmt::Arguments<'_>) {
     let message = message.to_string();
-    if let Some(rotating) = ROTATING_FILE
+    let mut slot = ROTATING_FILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-    {
-        if let Err(error) = rotating.rotate_if_needed(message.len().saturating_add(1) as u64) {
-            write_stderr(&format!("rvncserver: log rotation failed: {error}"));
-        }
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(rotating) = slot.as_mut() {
+        let staged = match rotating.swap_if_needed(message.len().saturating_add(1) as u64) {
+            Ok(staged) => staged,
+            Err(error) => {
+                write_stderr(&format!("rvncserver: log rotation failed: {error}"));
+                None
+            }
+        };
         write_stderr(&message);
+        if let Some(staged) = staged {
+            let path = rotating.path.clone();
+            let max_rotations = rotating.max_rotations;
+            // Compression is slow and must never block writers; the log lock
+            // is released first and the work lock keeps backups in order.
+            drop(slot);
+            let _work = ROTATION_WORK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = archive_staged_log(&staged, &path, max_rotations) {
+                write_stderr(&format!("rvncserver: log rotation failed: {error}"));
+            }
+        }
         return;
     }
+    drop(slot);
     if !JOURNAL_ENABLED.load(Ordering::Acquire) {
         write_stderr(&message);
         return;
@@ -113,53 +133,71 @@ fn write_stderr(message: &str) {
 }
 
 impl RotatingFile {
-    fn rotate_if_needed(&mut self, incoming_size: u64) -> io::Result<()> {
+    /// Swap in a fresh log file when the size threshold would be exceeded and
+    /// return the staged old file for archiving.
+    ///
+    /// Only the cheap rename/reopen happens here; the slow compression runs
+    /// outside the log lock so concurrent writers never wait on a rotation.
+    fn swap_if_needed(&mut self, incoming_size: u64) -> io::Result<Option<PathBuf>> {
         io::stdout().flush()?;
         io::stderr().flush()?;
         if self.file.metadata()?.len().saturating_add(incoming_size) <= self.max_size {
-            return Ok(());
+            return Ok(None);
         }
 
-        rotate_paths(&self.path, self.max_rotations)?;
-        let file = open_log_file(&self.path)?;
-        redirect_output(&file)?;
-        self.file = file;
-        Ok(())
+        let staged = staged_log_path(&self.path);
+        fs::rename(&self.path, &staged)?;
+        match open_log_file(&self.path) {
+            Ok(file) => match redirect_output(&file) {
+                Ok(()) => {
+                    self.file = file;
+                    Ok(Some(staged))
+                }
+                Err(error) => {
+                    restore_staged_log(&self.path, &staged);
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                restore_staged_log(&self.path, &staged);
+                Err(error)
+            }
+        }
     }
 }
 
-fn rotate_paths(path: &Path, max_rotations: usize) -> io::Result<()> {
+/// Put a staged log file back after a failed swap so already-written lines
+/// stay in place.
+fn restore_staged_log(path: &Path, staged: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::rename(staged, path);
+}
+
+/// Compress a staged log into the `.1.gz` backup chain and shift older
+/// backups. On failure the staged file is kept: it is the only copy of those
+/// lines, and the error message reports where it lives.
+fn archive_staged_log(staged: &Path, path: &Path, max_rotations: usize) -> io::Result<()> {
+    compress_and_shift(staged, path, max_rotations).map_err(|error| {
+        io::Error::other(format!(
+            "{error}; unarchived log kept at {}",
+            staged.display()
+        ))
+    })
+}
+
+fn compress_and_shift(staged: &Path, path: &Path, max_rotations: usize) -> io::Result<()> {
     if max_rotations == 0 {
-        match fs::remove_file(path) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        }
+        return remove_if_exists(staged);
     }
 
-    let source = match File::open(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
     let temporary = temporary_gzip_path(path);
-    let result = (|| {
-        let destination = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        let mut encoder = GzEncoder::new(destination, Compression::default());
-        let mut source = source;
-        io::copy(&mut source, &mut encoder)?;
-        encoder.finish()?.sync_all()?;
+    if let Err(error) = gzip_file(staged, &temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
 
-        let oldest = rotated_path(path, max_rotations);
-        match fs::remove_file(&oldest) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+    let shift = (|| {
+        remove_if_exists(&rotated_path(path, max_rotations))?;
         for index in (1..max_rotations).rev() {
             let source = rotated_path(path, index);
             let destination = rotated_path(path, index + 1);
@@ -169,13 +207,44 @@ fn rotate_paths(path: &Path, max_rotations: usize) -> io::Result<()> {
                 Err(error) => return Err(error),
             }
         }
-        fs::rename(&temporary, rotated_path(path, 1))?;
-        fs::remove_file(path)
+        fs::rename(&temporary, rotated_path(path, 1))
     })();
-    if result.is_err() {
+    if let Err(error) = shift {
         let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
-    result
+    remove_if_exists(staged)
+}
+
+fn gzip_file(source_path: &Path, destination_path: &Path) -> io::Result<()> {
+    let mut source = File::open(source_path)?;
+    let destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination_path)?;
+    let mut encoder = GzEncoder::new(destination, Compression::default());
+    io::copy(&mut source, &mut encoder)?;
+    encoder.finish()?.sync_all()?;
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Unique name for a log file waiting to be archived.
+fn staged_log_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    // SAFETY: getpid has no preconditions and returns the current process ID.
+    let pid = unsafe { libc::getpid() };
+    let sequence = ROTATION_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    value.push(format!(".staged-{pid}-{sequence}"));
+    PathBuf::from(value)
 }
 
 fn temporary_gzip_path(path: &Path) -> PathBuf {
@@ -262,14 +331,15 @@ mod tests {
     }
 
     #[test]
-    fn rotation_keeps_only_the_configured_number_of_backups() {
+    fn archiving_keeps_only_the_configured_number_of_backups() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("rvncserver-log-{}-{unique}", std::process::id()));
-        fs::write(&path, "current").unwrap();
+        let staged = staged_log_path(&path);
+        fs::write(&staged, "current").unwrap();
         for (index, value) in [(1, "previous"), (2, "oldest")] {
             let file = File::create(rotated_path(&path, index)).unwrap();
             let mut encoder = GzEncoder::new(file, Compression::default());
@@ -277,7 +347,7 @@ mod tests {
             encoder.finish().unwrap();
         }
 
-        rotate_paths(&path, 2).unwrap();
+        archive_staged_log(&staged, &path, 2).unwrap();
 
         let read_gzip = |index| {
             let file = File::open(rotated_path(&path, index)).unwrap();
@@ -289,7 +359,31 @@ mod tests {
         assert_eq!(read_gzip(1), "current");
         assert_eq!(read_gzip(2), "previous");
         assert!(!path.exists());
+        assert!(!staged.exists());
         fs::remove_file(rotated_path(&path, 1)).unwrap();
         fs::remove_file(rotated_path(&path, 2)).unwrap();
+    }
+
+    #[test]
+    fn a_failed_archive_keeps_the_staged_log() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rvncserver-log-fail-{}-{unique}",
+            std::process::id()
+        ));
+        let staged = staged_log_path(&path);
+        fs::write(&staged, "current").unwrap();
+        // A directory at the backup name makes the shift fail.
+        fs::create_dir(rotated_path(&path, 1)).unwrap();
+
+        assert!(archive_staged_log(&staged, &path, 1).is_err());
+        assert!(staged.exists());
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "current");
+
+        let _ = fs::remove_file(&staged);
+        let _ = fs::remove_dir(rotated_path(&path, 1));
     }
 }

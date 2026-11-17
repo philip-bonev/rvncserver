@@ -30,8 +30,6 @@ use tokio::sync::mpsc;
 pub enum ClipboardEvent {
     /// The local desktop clipboard now has text available.
     LocalText(Vec<u8>),
-    /// A remote client supplied new text for the local desktop clipboard.
-    RemoteText(Vec<u8>),
 }
 
 /// Notifications emitted by a backend's listener task.
@@ -42,6 +40,19 @@ pub enum ClipboardListenerEvent {
     /// The local clipboard owner requests data for a MIME type.
     TransferRequest { serial: u32, mime_type: String },
 }
+
+/// Listener-startup future returned by [`ClipboardBackend::start_listeners`].
+pub type ListenerFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<mpsc::UnboundedReceiver<ClipboardListenerEvent>, String>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Local-text read future returned by [`ClipboardBackend::read_text`].
+pub type TextFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>>;
 
 /// Common operations provided by a desktop clipboard backend.
 ///
@@ -56,22 +67,12 @@ pub trait ClipboardBackend: Send {
     }
 
     /// Start backend-specific clipboard listeners.
-    fn start_listeners<'a>(
-        &'a mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<mpsc::UnboundedReceiver<ClipboardListenerEvent>, String>>
-                + Send
-                + 'a,
-        >,
-    > {
+    fn start_listeners<'a>(&'a mut self) -> ListenerFuture<'a> {
         Box::pin(async { Err("clipboard listeners are not implemented for this backend".into()) })
     }
 
     /// Read the current local clipboard text, if available.
-    fn read_text<'a>(
-        &'a mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>>;
+    fn read_text<'a>(&'a mut self) -> TextFuture<'a>;
 
     /// Publish text supplied by the connected remote client.
     fn write_text<'a>(
@@ -120,11 +121,6 @@ impl ClipboardService {
             .initialize()
             .await?;
         Ok(service)
-    }
-
-    /// Whether clipboard synchronization has an active backend.
-    pub fn is_enabled(&self) -> bool {
-        self.backend.is_some()
     }
 
     /// Start listeners and return normalized backend notifications.

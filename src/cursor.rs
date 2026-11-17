@@ -50,10 +50,10 @@ impl CursorShape {
         }
 
         let format = bitmap.format;
-        let bgra = PixelFormat::BGRA.to_spa().as_raw() as u32;
-        let bgrx = PixelFormat::BGRx.to_spa().as_raw() as u32;
-        let rgba = PixelFormat::RGBA.to_spa().as_raw() as u32;
-        let rgbx = PixelFormat::RGBx.to_spa().as_raw() as u32;
+        let bgra = PixelFormat::BGRA.to_spa().as_raw();
+        let bgrx = PixelFormat::BGRx.to_spa().as_raw();
+        let rgba = PixelFormat::RGBA.to_spa().as_raw();
+        let rgbx = PixelFormat::RGBx.to_spa().as_raw();
         if ![bgra, bgrx, rgba, rgbx].contains(&format) {
             return Err("PipeWire cursor pixel format is unsupported");
         }
@@ -121,8 +121,9 @@ impl CursorShape {
 /// One cursor metadata update from PipeWire.
 #[derive(Debug, Clone)]
 pub struct CursorUpdate {
-    /// Pointer position in the captured stream.
-    pub position: (i32, i32),
+    /// Pointer position in the captured stream, or `None` when the cursor is
+    /// outside the captured region and must not be drawn.
+    pub position: Option<(i32, i32)>,
     /// New shape, if this metadata carried a bitmap.
     pub shape: Option<CursorShape>,
 }
@@ -140,7 +141,7 @@ impl CursorUpdate {
             }
         });
         Self {
-            position: metadata.position,
+            position: Some(metadata.position),
             shape,
         }
     }
@@ -150,11 +151,29 @@ impl CursorUpdate {
         let metadata = frame.meta.cursor.as_ref()?;
         let mut update = Self::from_pipewire(metadata);
         if let Some(crop) = frame.meta.crop.as_ref() {
-            update.position.0 = update.position.0.saturating_sub(crop.x);
-            update.position.1 = update.position.1.saturating_sub(crop.y);
+            update.position = update
+                .position
+                .and_then(|position| map_cursor_position(position, crop));
         }
         Some(update)
     }
+}
+
+/// Map a stream cursor position into cropped-frame coordinates.
+///
+/// A cursor outside the visible region becomes `None`: drawing it clamped to
+/// an edge would show a phantom cursor that is not actually on screen.
+fn map_cursor_position(
+    position: (i32, i32),
+    crop: &lamco_pipewire::CropRegion,
+) -> Option<(i32, i32)> {
+    let x = position.0.checked_sub(crop.x)?;
+    let y = position.1.checked_sub(crop.y)?;
+    let inside = x >= 0
+        && y >= 0
+        && u32::try_from(x).is_ok_and(|x| x < crop.width)
+        && u32::try_from(y).is_ok_and(|y| y < crop.height);
+    inside.then_some((x, y))
 }
 
 /// Snapshot consumed by an RFB client when sending cursor pseudo-encodings.
@@ -185,8 +204,8 @@ impl CursorStore {
     /// Publish compositor cursor metadata, preserving shape on position-only updates.
     pub fn publish(&self, update: CursorUpdate) {
         let mut state = self.lock();
-        if state.position != Some(update.position) {
-            state.position = Some(update.position);
+        if state.position != update.position {
+            state.position = update.position;
             state.position_sequence = state.position_sequence.wrapping_add(1);
         }
         if let Some(shape) = update.shape {
@@ -223,11 +242,11 @@ mod tests {
             pixels: Arc::new(vec![1, 2, 3, 255]),
         };
         store.publish(CursorUpdate {
-            position: (10, 20),
+            position: Some((10, 20)),
             shape: Some(shape.clone()),
         });
         store.publish(CursorUpdate {
-            position: (11, 20),
+            position: Some((11, 20)),
             shape: None,
         });
 
@@ -241,7 +260,7 @@ mod tests {
     #[test]
     fn pipewire_bgra_cursor_is_normalized_with_its_hotspot() {
         let bitmap = CursorBitmap {
-            format: PixelFormat::BGRA.to_spa().as_raw() as u32,
+            format: PixelFormat::BGRA.to_spa().as_raw(),
             width: 1,
             height: 1,
             stride: 4,
@@ -250,5 +269,21 @@ mod tests {
         let shape = CursorShape::from_pipewire(&bitmap, (0, 0)).unwrap();
         assert_eq!((shape.width, shape.height), (1, 1));
         assert_eq!(&*shape.pixels, &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn cursor_outside_the_crop_region_is_hidden() {
+        let crop = lamco_pipewire::CropRegion {
+            x: 10,
+            y: 20,
+            width: 5,
+            height: 5,
+        };
+        assert_eq!(map_cursor_position((12, 23), &crop), Some((2, 3)));
+        // Left of, above, right of, and below the visible region.
+        assert_eq!(map_cursor_position((9, 23), &crop), None);
+        assert_eq!(map_cursor_position((12, 19), &crop), None);
+        assert_eq!(map_cursor_position((15, 23), &crop), None);
+        assert_eq!(map_cursor_position((12, 25), &crop), None);
     }
 }

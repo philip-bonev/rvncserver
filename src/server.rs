@@ -31,7 +31,7 @@ use crate::clipboard::{
 };
 use crate::error::AppError;
 use crate::framebuffer::{Frame, FrameDamage, FrameStore};
-use crate::input::ClientEvent;
+use crate::input::{ClientEvent, latin1_to_utf8, utf8_to_latin1};
 use crate::rfb;
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
@@ -516,18 +516,4 @@ fn is_permission_denial(error: &str) -> bool {
         || lower.contains("canceled")
         || lower.contains("permission")
         || lower.contains("not authorized")
-}
-
-fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
-    data.iter()
-        .map(|byte| char::from(*byte))
-        .collect::<String>()
-        .into_bytes()
-}
-
-fn utf8_to_latin1(data: &[u8]) -> Vec<u8> {
-    String::from_utf8_lossy(data)
-        .chars()
-        .map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?'))
-        .collect()
 }

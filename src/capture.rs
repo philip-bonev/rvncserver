@@ -310,23 +310,15 @@ impl CaptureSession {
                         pressed,
                     )
                     .await?;
-                crate::timestamped_log!(
-                    "input: portal keyboard key {} forwarded",
-                    if pressed { "press" } else { "release" }
-                );
-                if matches!(keysym, 0xffe1..=0xffee) {
-                    crate::timestamped_log!(
-                        "input: portal modifier keysym {keysym:#x} {}",
-                        if pressed { "pressed" } else { "released" }
-                    );
-                }
             }
             ClientEvent::Pointer { x, y, buttons } => {
                 let stream = self.session.streams.first().ok_or_else(|| {
                     AppError::Capture("portal session has no input target stream".to_string())
                 })?;
-                let x = x.min(self.stream_size.0.saturating_sub(1) as u16);
-                let y = y.min(self.stream_size.1.saturating_sub(1) as u16);
+                let x =
+                    x.min(u16::try_from(self.stream_size.0.saturating_sub(1)).unwrap_or(u16::MAX));
+                let y =
+                    y.min(u16::try_from(self.stream_size.1.saturating_sub(1)).unwrap_or(u16::MAX));
                 let old_buttons = self.pointer_buttons;
                 self.manager
                     .remote_desktop()
@@ -595,23 +587,6 @@ fn merge_pointer_button_mask(current: u8, event: u8) -> u8 {
     (current & HELD_POINTER_BUTTON_MASK) | (event & WHEEL_BUTTON_MASK)
 }
 
-#[cfg(test)]
-fn latin1_to_utf8(data: &[u8]) -> Vec<u8> {
-    let mut text = String::with_capacity(data.len());
-    for byte in data {
-        text.push(char::from(*byte));
-    }
-    text.into_bytes()
-}
-
-#[cfg(test)]
-fn utf8_to_latin1(data: &[u8]) -> Vec<u8> {
-    String::from_utf8_lossy(data)
-        .chars()
-        .map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?'))
-        .collect()
-}
-
 fn persistence_is_unsupported(error: &PortalError) -> bool {
     match error {
         PortalError::SessionCreation(message) => {
@@ -635,12 +610,6 @@ mod tests {
         assert!(!CaptureConfig::default().enable_input);
         assert!(!CaptureConfig::default().enable_clipboard);
         assert!(!StreamConfig::new("test").dmabuf_passthrough);
-    }
-
-    #[test]
-    fn converts_rfb_latin1_and_portal_utf8_clipboard_text() {
-        assert_eq!(latin1_to_utf8(&[b'A', 0xe9]), "Aé".as_bytes());
-        assert_eq!(utf8_to_latin1("Aé€".as_bytes()), [b'A', 0xe9, b'?']);
     }
 
     #[test]
