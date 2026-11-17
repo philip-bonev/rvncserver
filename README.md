@@ -311,9 +311,9 @@ This captures one normalized frame and writes it as a binary PPM file.
 - Input and clipboard forwarding are disabled by default and require explicit
   CLI opt-in and portal permission. Clipboard support is text-only; RFB's
   Latin-1 text is converted to/from UTF-8 for the desktop portal.
-- Tight and other encodings are not implemented. ZRLE currently emits Raw
-  tiles, so it provides zlib compression but does not yet use its palette or
-  run-length tile modes. CopyRect source discovery is deliberately bounded to
+- Tight and other encodings are not implemented. ZRLE picks the smallest tile
+  subencoding per 64×64 tile: solid, packed palette, palette RLE, plain RLE,
+  or raw. CopyRect source discovery is deliberately bounded to
   nearby regions and only runs after the client has received a full framebuffer.
   Hextile sends complex or noisy 16×16 tiles as Raw within the Hextile rectangle.
 - DMA-BUF negotiation is requested where available, but direct FD passthrough
