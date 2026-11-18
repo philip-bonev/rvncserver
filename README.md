@@ -374,7 +374,8 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 - macOS Screen Sharing is the primary test client. Framebuffer updates,
   keyboard and pointer input (including modifiers and special keys), and
-  connection handling were exercised through it.
+  connection handling were exercised through it — including sustained
+  day-to-day development done over the VNC session itself.
 - COSMIC Wayland session on Pop!_OS, with `xdg-desktop-portal-cosmic`,
   PipeWire 1.6.8, and a 1920x1080 output. Capture and a full 1920x1080 Raw
   framebuffer update were verified with a local RFB protocol client. COSMIC
