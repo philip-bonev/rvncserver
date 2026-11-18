@@ -227,6 +227,8 @@ fn handle_client(
         sent_cursor_shape_sequence: 0,
         sent_cursor_position_sequence: 0,
         drawn_cursor: None,
+        desktop_size_enabled: false,
+        session_size: (config.width, config.height),
     };
     let mut last_client_message = Instant::now();
     let mut keyboard_input_warned = false;
@@ -246,14 +248,7 @@ fn handle_client(
         }
 
         if update_state.pending_update.is_some() {
-            service_pending_update(
-                &mut stream,
-                store,
-                config.width,
-                config.height,
-                &mut update_state,
-                shutdown,
-            )?;
+            service_pending_update(&mut stream, store, &mut update_state, shutdown)?;
         }
 
         let Some(message_type) = read_message_type(&mut stream, shutdown, clipboard_rx)? else {
@@ -307,6 +302,7 @@ fn handle_client(
                 }
                 update_state.rich_cursor_enabled = preferences.rich_cursor;
                 update_state.pointer_pos_enabled = preferences.pointer_pos;
+                update_state.desktop_size_enabled = preferences.desktop_size;
                 if update_state.copy_rect_enabled != preferences.copy_rect {
                     update_state.client_pixels = None;
                 }
@@ -332,14 +328,7 @@ fn handle_client(
                 );
             }
             3 => {
-                handle_update_request(
-                    &mut stream,
-                    store,
-                    config.width,
-                    config.height,
-                    &mut update_state,
-                    shutdown,
-                )?;
+                handle_update_request(&mut stream, store, &mut update_state, shutdown)?;
             }
             4 => {
                 let down = read_u8(&mut stream, shutdown)? != 0;
@@ -1441,6 +1430,180 @@ mod tests {
         assert_eq!(u32::from_be_bytes(message[4..8].try_into().unwrap()), 5);
         assert_eq!(&message[8..], b"hello");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn clients_with_desktop_size_receive_live_resizes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(FrameStore::new());
+        store.publish(Arc::new(Frame::new(2, 2, vec![1; 16]).unwrap()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_store = Arc::clone(&store);
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            let (_clipboard_tx, mut clipboard_rx) = tokio::sync::broadcast::channel(1);
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+            let config = RfbConfig {
+                width: 2,
+                height: 2,
+                name: "test".to_string(),
+                input_enabled: false,
+                cursor_enabled: false,
+                clipboard_enabled: false,
+                max_clients: 4,
+                client_timeout: Duration::ZERO,
+                handshake_timeout: Duration::from_secs(60),
+                encodings: None,
+                authentication: None,
+            };
+            handle_client(
+                stream,
+                &server_store,
+                &config,
+                &server_shutdown,
+                Some(&input_tx),
+                &mut clipboard_rx,
+                None,
+                &AuthLimiter::new(),
+            )
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut version = [0u8; 12];
+        client.read_exact(&mut version).unwrap();
+        client.write_all(RFB_VERSION).unwrap();
+        let mut security_types = [0u8; 2];
+        client.read_exact(&mut security_types).unwrap();
+        client.write_all(&[SECURITY_TYPE_NONE as u8]).unwrap();
+        let mut security_result = [0u8; 4];
+        client.read_exact(&mut security_result).unwrap();
+        client.write_all(&[1]).unwrap();
+        let mut server_init = [0u8; 24];
+        client.read_exact(&mut server_init).unwrap();
+        let mut name = [0u8; 4];
+        client.read_exact(&mut name).unwrap();
+        // Advertise DesktopSize plus raw.
+        let mut encodings = vec![2u8, 0];
+        encodings.extend_from_slice(&2u16.to_be_bytes());
+        encodings.extend_from_slice(&(-223i32).to_be_bytes());
+        encodings.extend_from_slice(&0i32.to_be_bytes());
+        client.write_all(&encodings).unwrap();
+
+        // First refresh: content at the initial size.
+        let mut request = vec![3u8, 0];
+        for value in [0u16, 0, 2, 2] {
+            request.extend_from_slice(&value.to_be_bytes());
+        }
+        client.write_all(&request).unwrap();
+        let mut header = [0u8; 16];
+        client.read_exact(&mut header).unwrap();
+        let mut content = [0u8; 16];
+        client.read_exact(&mut content).unwrap();
+
+        // The desktop grows; the pending request is answered with DesktopSize.
+        store.publish(Arc::new(Frame::new(3, 3, vec![2; 36]).unwrap()));
+        client.write_all(&[3u8, 1, 0, 0, 0, 0, 0, 2, 0, 2]).unwrap();
+        let mut resize = [0u8; 16];
+        client.read_exact(&mut resize).unwrap();
+        assert_eq!(&resize[8..10], &[0, 3]);
+        assert_eq!(&resize[10..12], &[0, 3]);
+        assert_eq!(i32::from_be_bytes(resize[12..16].try_into().unwrap()), -223);
+
+        // The follow-up refresh carries the content of the new size.
+        let mut request = vec![3u8, 0];
+        for value in [0u16, 0, 3, 3] {
+            request.extend_from_slice(&value.to_be_bytes());
+        }
+        client.write_all(&request).unwrap();
+        let mut header = [0u8; 16];
+        client.read_exact(&mut header).unwrap();
+        let mut content = vec![0u8; 36];
+        client.read_exact(&mut content).unwrap();
+        assert_eq!(content, vec![2u8; 36]);
+
+        drop(client);
+        let _ = server.join().unwrap();
+    }
+
+    #[test]
+    fn clients_without_desktop_size_are_disconnected_on_resize() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(FrameStore::new());
+        store.publish(Arc::new(Frame::new(2, 2, vec![1; 16]).unwrap()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_store = Arc::clone(&store);
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            let (_clipboard_tx, mut clipboard_rx) = tokio::sync::broadcast::channel(1);
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+            let config = RfbConfig {
+                width: 2,
+                height: 2,
+                name: "test".to_string(),
+                input_enabled: false,
+                cursor_enabled: false,
+                clipboard_enabled: false,
+                max_clients: 4,
+                client_timeout: Duration::ZERO,
+                handshake_timeout: Duration::from_secs(60),
+                encodings: None,
+                authentication: None,
+            };
+            handle_client(
+                stream,
+                &server_store,
+                &config,
+                &server_shutdown,
+                Some(&input_tx),
+                &mut clipboard_rx,
+                None,
+                &AuthLimiter::new(),
+            )
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut version = [0u8; 12];
+        client.read_exact(&mut version).unwrap();
+        client.write_all(RFB_VERSION).unwrap();
+        let mut security_types = [0u8; 2];
+        client.read_exact(&mut security_types).unwrap();
+        client.write_all(&[SECURITY_TYPE_NONE as u8]).unwrap();
+        let mut security_result = [0u8; 4];
+        client.read_exact(&mut security_result).unwrap();
+        client.write_all(&[1]).unwrap();
+        let mut server_init = [0u8; 24];
+        client.read_exact(&mut server_init).unwrap();
+        let mut name = [0u8; 4];
+        client.read_exact(&mut name).unwrap();
+        // First refresh: content at the initial size.
+        let mut request = vec![3u8, 0];
+        for value in [0u16, 0, 2, 2] {
+            request.extend_from_slice(&value.to_be_bytes());
+        }
+        client.write_all(&request).unwrap();
+        let mut header = [0u8; 16];
+        client.read_exact(&mut header).unwrap();
+        let mut content = [0u8; 16];
+        client.read_exact(&mut content).unwrap();
+
+        store.publish(Arc::new(Frame::new(3, 3, vec![2; 36]).unwrap()));
+        client.write_all(&[3u8, 1, 0, 0, 0, 0, 0, 2, 0, 2]).unwrap();
+        // Without the pseudo-encoding the connection is closed, as before.
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        assert!(server.join().unwrap().is_err());
     }
 
     #[test]

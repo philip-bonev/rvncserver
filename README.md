@@ -328,18 +328,18 @@ This captures one normalized frame and writes it as a binary PPM file.
   non-linear or non-mappable buffers may be skipped or unreadable.
 - Non-identity buffer transforms are rejected rather than displayed
   incorrectly.
-- The framebuffer dimensions are fixed at startup. A later display resolution
-  change causes the client connection to be closed rather than resized.
+- Resolution changes are announced live through the DesktopSize
+  pseudo-encoding; clients that do not support it are disconnected on a
+  resolution change, as before.
 - The server requests application-scoped portal permission persistence and
   stores the restore token in an owner-only state file. If the backend
   explicitly rejects persistence, it reports the fallback and retries capture
   with non-persistent permissions. A rejected stored token is discarded and
   session creation is retried once without it. Other portal errors are not
   retried.
-- Capture loss is handled by recreating the portal and PipeWire session. The
-  restarted stream must have the same dimensions as the running RFB session;
-  otherwise the server exits so a service manager can restart it with a new
-  framebuffer size. Live RFB desktop resizing is not implemented.
+- Capture loss is handled by recreating the portal and PipeWire session. A
+  restarted stream with different dimensions resizes the desktop live; the
+  server keeps running.
 - Capture-loss detection uses PipeWire stream state events (`Error` and
   `Unconnected`). A stream that stops producing frames without reporting a
   state change is not treated as lost, and a paused stream is left alone. A

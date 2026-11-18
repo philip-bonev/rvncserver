@@ -503,6 +503,12 @@ impl FrameStore {
             .as_ref()
             .map_or(1, |(sequence, _)| sequence + 1);
         let mut damage = frame.damage.clone();
+        // A size change invalidates the client's framebuffer entirely.
+        if inner.latest.as_ref().is_some_and(|(_, previous)| {
+            (previous.width, previous.height) != (frame.width, frame.height)
+        }) {
+            damage = FrameDamage::Full;
+        }
         if let Some(source_sequence) = frame.source_sequence {
             if inner
                 .last_source_sequence
@@ -923,6 +929,19 @@ mod tests {
             }])
         );
         assert_eq!(store.changes_since(0).unwrap().damage, FrameDamage::Full);
+    }
+
+    #[test]
+    fn frame_store_forces_full_damage_on_size_change() {
+        let store = FrameStore::new();
+        let mut first = Frame::new(2, 2, vec![1; 16]).unwrap();
+        first.damage = FrameDamage::Regions(Vec::new());
+        store.publish(Arc::new(first));
+
+        let mut resized = Frame::new(3, 3, vec![2; 36]).unwrap();
+        resized.damage = FrameDamage::Regions(Vec::new());
+        store.publish(Arc::new(resized));
+        assert_eq!(store.changes_since(1).unwrap().damage, FrameDamage::Full);
     }
 
     #[test]

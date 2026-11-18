@@ -45,6 +45,9 @@ const ENCODING_POINTER_POS: i32 = -232;
 
 const ENCODING_RICH_CURSOR: i32 = -239;
 
+/// Pseudo-encoding announcing a framebuffer size change (DesktopSize).
+const ENCODING_DESKTOP_SIZE: i32 = -223;
+
 /// Per-client bound for the CopyRect shadow of the client's framebuffer.
 /// Without a shadow CopyRect is simply not used.
 const MAX_SHADOW_PIXELS: usize = 4 * 1024 * 1024;
@@ -96,6 +99,10 @@ pub(super) struct ClientUpdateState {
     /// Cursor rectangle and shape sequence most recently composited into the
     /// image for clients without cursor pseudo-encodings.
     pub(super) drawn_cursor: Option<(DamageRect, u64)>,
+    /// Whether the client announced the DesktopSize pseudo-encoding.
+    pub(super) desktop_size_enabled: bool,
+    /// Framebuffer size most recently announced to this client.
+    pub(super) session_size: (u16, u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +111,7 @@ pub(super) struct EncodingPreferences {
     pub(super) copy_rect: bool,
     pub(super) rich_cursor: bool,
     pub(super) pointer_pos: bool,
+    pub(super) desktop_size: bool,
 }
 
 #[cfg(test)]
@@ -119,6 +127,7 @@ pub(super) fn select_encodings_with_allowlist(
     let mut copy_rect = false;
     let mut rich_cursor = false;
     let mut pointer_pos = false;
+    let mut desktop_size = false;
     for encoding in encodings.chunks_exact(4) {
         let value = i32::from_be_bytes([encoding[0], encoding[1], encoding[2], encoding[3]]);
         if value == ENCODING_RICH_CURSOR {
@@ -127,6 +136,10 @@ pub(super) fn select_encodings_with_allowlist(
         }
         if value == ENCODING_POINTER_POS {
             pointer_pos = true;
+            continue;
+        }
+        if value == ENCODING_DESKTOP_SIZE {
+            desktop_size = true;
             continue;
         }
         let candidate = match value {
@@ -171,6 +184,7 @@ pub(super) fn select_encodings_with_allowlist(
             copy_rect,
             rich_cursor,
             pointer_pos,
+            desktop_size,
         })
         .ok_or_else(|| invalid_data("client did not offer a supported framebuffer encoding"))
 }
@@ -178,8 +192,6 @@ pub(super) fn select_encodings_with_allowlist(
 pub(super) fn handle_update_request(
     stream: &mut (impl Read + Write),
     store: &FrameStore,
-    width: u16,
-    height: u16,
     state: &mut ClientUpdateState,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
@@ -189,6 +201,7 @@ pub(super) fn handle_update_request(
     let rectangle_width = read_u16(stream, shutdown)?;
     let rectangle_height = read_u16(stream, shutdown)?;
 
+    let (width, height) = state.session_size;
     validate_rectangle(x, y, rectangle_width, rectangle_height, width, height)?;
 
     let requested = DamageRect {
@@ -220,12 +233,16 @@ pub(super) fn handle_update_request(
                 },
             },
         };
-        ensure_frame_dimensions(&changes.frame, width, height)?;
+        if sync_session_size(stream, state, &changes.frame, shutdown)? {
+            // The DesktopSize update answered this request; the client asks
+            // again for the content of its new framebuffer.
+            return Ok(());
+        }
         accumulate_damage(
             &mut state.pending_damage,
             changes.damage,
-            u32::from(width),
-            u32::from(height),
+            changes.frame.width,
+            changes.frame.height,
         );
         state.last_sequence = changes.sequence;
 
@@ -247,17 +264,16 @@ pub(super) fn handle_update_request(
     }
 
     state.pending_update = Some(requested);
-    service_pending_update(stream, store, width, height, state, shutdown)
+    service_pending_update(stream, store, state, shutdown)
 }
 
 pub(super) fn service_pending_update(
     stream: &mut (impl Read + Write),
     store: &FrameStore,
-    width: u16,
-    height: u16,
     state: &mut ClientUpdateState,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
+    let (width, height) = state.session_size;
     state.cursor_snapshot = store.cursor_snapshot();
     let requested = match state.pending_update {
         Some(requested) => requested,
@@ -265,12 +281,16 @@ pub(super) fn service_pending_update(
     };
 
     let changed_frame = if let Some(changes) = store.changes_since(state.last_sequence) {
-        ensure_frame_dimensions(&changes.frame, width, height)?;
+        if sync_session_size(stream, state, &changes.frame, shutdown)? {
+            // The DesktopSize update answered the pending request.
+            state.pending_update = None;
+            return Ok(());
+        }
         accumulate_damage(
             &mut state.pending_damage,
             changes.damage,
-            u32::from(width),
-            u32::from(height),
+            changes.frame.width,
+            changes.frame.height,
         );
         state.last_sequence = changes.sequence;
         Some(changes.frame)
@@ -329,7 +349,6 @@ pub(super) fn service_pending_update(
             .map(|(_, frame)| frame)
             .ok_or_else(|| invalid_data("framebuffer is unavailable"))?,
     };
-    ensure_frame_dimensions(&frame, width, height)?;
     send_update(stream, &frame, &updates, state, shutdown)?;
     subtract_damage(&mut state.pending_damage, requested);
     state.pending_update = None;
@@ -361,14 +380,53 @@ fn wait_for_frame(
     }
 }
 
-fn ensure_frame_dimensions(frame: &Frame, width: u16, height: u16) -> io::Result<()> {
-    if frame.width != u32::from(width) || frame.height != u32::from(height) {
+/// Send a DesktopSize pseudo-rectangle announcing a new framebuffer size.
+fn send_desktop_size(
+    stream: &mut (impl Read + Write),
+    size: (u16, u16),
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    let mut header = [0u8; 4];
+    header[2..4].copy_from_slice(&1u16.to_be_bytes());
+    write_all_interruptible(stream, &header, shutdown)?;
+    let mut rectangle = [0u8; 12];
+    rectangle[4..6].copy_from_slice(&size.0.to_be_bytes());
+    rectangle[6..8].copy_from_slice(&size.1.to_be_bytes());
+    rectangle[8..12].copy_from_slice(&ENCODING_DESKTOP_SIZE.to_be_bytes());
+    write_all_interruptible(stream, &rectangle, shutdown)
+}
+
+/// Announce a framebuffer resize to the client when the frame no longer
+/// matches the size it was told about.
+///
+/// The resize invalidates the client's framebuffer, so its cached state is
+/// dropped and the caller must not reuse damage accumulated for the old
+/// size. Returns `true` when a resize was announced.
+pub(super) fn sync_session_size(
+    stream: &mut (impl Read + Write),
+    state: &mut ClientUpdateState,
+    frame: &Frame,
+    shutdown: &AtomicBool,
+) -> io::Result<bool> {
+    let size = match (u16::try_from(frame.width), u16::try_from(frame.height)) {
+        (Ok(width), Ok(height)) => (width, height),
+        _ => return Err(invalid_data("framebuffer size exceeds RFB limits")),
+    };
+    if size == state.session_size {
+        return Ok(false);
+    }
+    if !state.desktop_size_enabled {
         return Err(invalid_data(format!(
-            "captured frame is {}x{}, but the RFB session is {}x{}",
-            frame.width, frame.height, width, height
+            "desktop size changed to {}x{}, but the client does not support DesktopSize",
+            size.0, size.1
         )));
     }
-    Ok(())
+    send_desktop_size(stream, size, shutdown)?;
+    state.session_size = size;
+    state.client_pixels = None;
+    state.pending_damage.clear();
+    state.drawn_cursor = None;
+    Ok(true)
 }
 
 pub(super) fn send_update(
@@ -1064,6 +1122,8 @@ pub(crate) fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> 
         sent_cursor_shape_sequence: 0,
         sent_cursor_position_sequence: 0,
         drawn_cursor: None,
+        desktop_size_enabled: false,
+        session_size: (1, 1),
     }
 }
 
@@ -1129,6 +1189,7 @@ mod tests {
                 copy_rect: true,
                 rich_cursor: false,
                 pointer_pos: false,
+                desktop_size: false,
             }
         );
         let raw_only = [RfbEncoding::Raw];
@@ -1139,6 +1200,7 @@ mod tests {
                 copy_rect: false,
                 rich_cursor: false,
                 pointer_pos: false,
+                desktop_size: false,
             }
         );
         assert!(select_encodings(&42i32.to_be_bytes()).is_err());
@@ -1380,6 +1442,74 @@ mod tests {
             })
         );
         assert_eq!(cursor_rect(&shape, (-10, -10), 4, 4), None);
+    }
+
+    #[test]
+    fn desktop_size_announcement_invalidates_client_state() {
+        let mut state = test_update_state(Encoding::Raw, false);
+        state.desktop_size_enabled = true;
+        state.session_size = (2, 2);
+        state.pending_damage = vec![DamageRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        }];
+        state.drawn_cursor = Some((
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            3,
+        ));
+        state.client_pixels = Some(vec![[0; 4]; 4]);
+
+        let frame = Frame::new(3, 3, vec![7; 36]).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        assert!(sync_session_size(&mut out, &mut state, &frame, &AtomicBool::new(false)).unwrap());
+        assert_eq!(state.session_size, (3, 3));
+        assert!(state.client_pixels.is_none());
+        assert!(state.pending_damage.is_empty());
+        assert!(state.drawn_cursor.is_none());
+        // A DesktopSize update: header (4) and one rectangle (12), no data.
+        let bytes = out.into_inner();
+        assert_eq!(bytes.len(), 4 + 12);
+        assert_eq!(&bytes[4..6], &[0, 0]);
+        assert_eq!(&bytes[8..10], &[0, 3]);
+        assert_eq!(&bytes[10..12], &[0, 3]);
+        assert_eq!(i32::from_be_bytes(bytes[12..16].try_into().unwrap()), -223);
+
+        // The same size announces nothing.
+        let mut out = Cursor::new(Vec::new());
+        assert!(!sync_session_size(&mut out, &mut state, &frame, &AtomicBool::new(false)).unwrap());
+        assert!(out.into_inner().is_empty());
+
+        // Clients without the pseudo-encoding are disconnected instead.
+        let mut plain = test_update_state(Encoding::Raw, false);
+        plain.session_size = (2, 2);
+        assert!(
+            sync_session_size(
+                &mut Cursor::new(Vec::new()),
+                &mut plain,
+                &frame,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_size_support_is_detected_from_the_encoding_list() {
+        let mut offered = ENCODING_RAW.to_be_bytes().to_vec();
+        offered.extend_from_slice(&ENCODING_DESKTOP_SIZE.to_be_bytes());
+        assert!(select_encodings(&offered).unwrap().desktop_size);
+        assert!(
+            !select_encodings(&ENCODING_RAW.to_be_bytes())
+                .unwrap()
+                .desktop_size
+        );
     }
 
     #[test]

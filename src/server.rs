@@ -334,19 +334,6 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
             // Discard the restarted stream's startup transitions for the same
             // reason as at initial startup.
             let _ = session.drain_state_events();
-            if first.frame.width != u32::from(width) || first.frame.height != u32::from(height) {
-                crate::timestamped_log!(
-                    "capture: restarted stream is {}x{}, but the RFB session is fixed at {}x{}; exiting for supervisor restart",
-                    first.frame.width,
-                    first.frame.height,
-                    width,
-                    height
-                );
-                session.shutdown();
-                return Err(AppError::Capture(
-                    "capture stream dimensions changed after reinitialization".to_string(),
-                ));
-            }
             let mut first_frame = first.frame;
             // The restarted capture has no continuity with the old stream.
             // Force a full refresh so every client replaces its framebuffer.
