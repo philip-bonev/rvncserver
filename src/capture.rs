@@ -103,6 +103,31 @@ pub struct CapturedFrame {
     pub cursor: Option<CursorUpdate>,
 }
 
+/// XKB keycodes (Linux evdev codes plus 8, the convention used by the
+/// RemoteDesktop portal) for the stateful modifier keysyms.
+///
+/// Lock keys such as Caps_Lock and Num_Lock are deliberately excluded:
+/// injecting them twice would toggle them twice, and unlike modifiers their
+/// press is not idempotent.
+fn modifier_keycode(keysym: u32) -> Option<i32> {
+    Some(match keysym {
+        0xffe1 => 50,  // Shift_L
+        0xffe2 => 62,  // Shift_R
+        0xffe3 => 37,  // Control_L
+        0xffe4 => 105, // Control_R
+        0xffe7 => 133, // Meta_L
+        0xffe8 => 134, // Meta_R
+        0xffe9 => 64,  // Alt_L
+        0xffea => 108, // Alt_R
+        0xffeb => 133, // Super_L
+        0xffec => 134, // Super_R
+        0xffed => 133, // Hyper_L
+        0xffee => 134, // Hyper_R
+        0xfe03 => 108, // ISO_Level3_Shift (AltGr)
+        _ => return None,
+    })
+}
+
 impl CaptureSession {
     /// Create a portal session and connect the first advertised screen stream
     /// to a PipeWire stream.
@@ -300,7 +325,27 @@ impl CaptureSession {
     pub async fn handle_client_event(&mut self, event: ClientEvent) -> Result<(), AppError> {
         match event {
             ClientEvent::Key { keysym, pressed } => {
-                self.manager
+                // Some compositors fail to translate special keysyms into
+                // effective keys. Inject modifier keys through both the
+                // keysym and the keycode paths: for stateful modifiers the
+                // duplicate events are idempotent, so this works whichever
+                // path the compositor supports.
+                let mut injected = false;
+                if let Some(keycode) = modifier_keycode(keysym) {
+                    match self
+                        .manager
+                        .remote_desktop()
+                        .notify_keyboard_keycode(self.session.ashpd_session(), keycode, pressed)
+                        .await
+                    {
+                        Ok(()) => injected = true,
+                        Err(error) => crate::timestamped_log!(
+                            "input: portal rejected modifier keycode {keycode}: {error}"
+                        ),
+                    }
+                }
+                match self
+                    .manager
                     .remote_desktop()
                     .notify_keyboard_keysym(
                         self.session.ashpd_session(),
@@ -309,7 +354,16 @@ impl CaptureSession {
                         })?,
                         pressed,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) if injected => {
+                        crate::timestamped_log!(
+                            "input: portal rejected modifier keysym {keysym:#x} but its keycode worked: {error}"
+                        );
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             ClientEvent::Pointer { x, y, buttons } => {
                 let stream = self.session.streams.first().ok_or_else(|| {
@@ -610,6 +664,20 @@ mod tests {
         assert!(!CaptureConfig::default().enable_input);
         assert!(!CaptureConfig::default().enable_clipboard);
         assert!(!StreamConfig::new("test").dmabuf_passthrough);
+    }
+
+    #[test]
+    fn modifier_keys_map_to_xkb_keycodes_and_locks_do_not() {
+        assert_eq!(modifier_keycode(0xffe3), Some(37)); // Control_L
+        assert_eq!(modifier_keycode(0xffe1), Some(50)); // Shift_L
+        assert_eq!(modifier_keycode(0xffe9), Some(64)); // Alt_L
+        assert_eq!(modifier_keycode(0xffeb), Some(133)); // Super_L
+        assert_eq!(modifier_keycode(0xfe03), Some(108)); // AltGr
+        // Lock keys stay on the keysym-only path: injecting them twice
+        // would toggle them twice.
+        assert_eq!(modifier_keycode(0xffe5), None); // Caps_Lock
+        assert_eq!(modifier_keycode(0xff7f), None); // Num_Lock
+        assert_eq!(modifier_keycode(0x72), None); // 'r'
     }
 
     #[test]
