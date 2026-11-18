@@ -103,29 +103,73 @@ pub struct CapturedFrame {
     pub cursor: Option<CursorUpdate>,
 }
 
-/// XKB keycodes (Linux evdev codes plus 8, the convention used by the
-/// RemoteDesktop portal) for the stateful modifier keysyms.
+/// Linux evdev keycodes for the non-printable keysyms.
 ///
-/// Lock keys such as Caps_Lock and Num_Lock are deliberately excluded:
-/// injecting them twice would toggle them twice, and unlike modifiers their
-/// press is not idempotent.
-fn modifier_keycode(keysym: u32) -> Option<i32> {
+/// The RemoteDesktop portal takes raw evdev keycodes on the keycode path
+/// ("evdev keycodes and xkb keysyms"). Several compositors silently ignore
+/// special keysyms, so the keycode path is the reliable one.
+fn special_keycode(keysym: u32) -> Option<i32> {
     Some(match keysym {
-        0xffe1 => 50,  // Shift_L
-        0xffe2 => 62,  // Shift_R
-        0xffe3 => 37,  // Control_L
-        0xffe4 => 105, // Control_R
-        0xffe7 => 133, // Meta_L
-        0xffe8 => 134, // Meta_R
-        0xffe9 => 64,  // Alt_L
-        0xffea => 108, // Alt_R
-        0xffeb => 133, // Super_L
-        0xffec => 134, // Super_R
-        0xffed => 133, // Hyper_L
-        0xffee => 134, // Hyper_R
-        0xfe03 => 108, // ISO_Level3_Shift (AltGr)
+        // Stateful modifiers.
+        0xffe1 => 42,  // Shift_L
+        0xffe2 => 54,  // Shift_R
+        0xffe3 => 29,  // Control_L
+        0xffe4 => 97,  // Control_R
+        0xffe7 => 125, // Meta_L
+        0xffe8 => 126, // Meta_R
+        0xffe9 => 56,  // Alt_L
+        0xffea => 100, // Alt_R
+        0xffeb => 125, // Super_L
+        0xffec => 126, // Super_R
+        0xffed => 125, // Hyper_L
+        0xffee => 126, // Hyper_R
+        0xfe03 => 100, // ISO_Level3_Shift (AltGr)
+        // Lock keys.
+        0xffe5 => 58, // Caps_Lock
+        0xff7f => 69, // Num_Lock
+        0xff14 => 70, // Scroll_Lock
+        // Editing and navigation.
+        0xff08 => 14,  // BackSpace
+        0xff09 => 15,  // Tab
+        0xff0d => 28,  // Return
+        0xff1b => 1,   // Escape
+        0xff13 => 119, // Pause
+        0xff61 => 99,  // Print
+        0xff67 => 127, // Menu
+        0xff8d => 96,  // KP_Enter
+        0xffff => 111, // Delete
+        0xff50 => 102, // Home
+        0xff51 => 105, // Left
+        0xff52 => 103, // Up
+        0xff53 => 106, // Right
+        0xff54 => 108, // Down
+        0xff55 => 104, // Page_Up
+        0xff56 => 109, // Page_Down
+        0xff57 => 107, // End
+        0xff63 => 110, // Insert
+        // Function keys.
+        0xffbe => 59, // F1
+        0xffbf => 60, // F2
+        0xffc0 => 61, // F3
+        0xffc1 => 62, // F4
+        0xffc2 => 63, // F5
+        0xffc3 => 64, // F6
+        0xffc4 => 65, // F7
+        0xffc5 => 66, // F8
+        0xffc6 => 67, // F9
+        0xffc7 => 68, // F10
+        0xffc8 => 87, // F11
+        0xffc9 => 88, // F12
         _ => return None,
     })
+}
+
+/// Stateful modifiers whose press is idempotent, so injecting them through
+/// both the keycode and the keysym paths is harmless and keeps working on
+/// backends that support only one of the two. Every other key uses a single
+/// path to avoid double effects (two arrow steps, a lock toggled twice).
+fn is_stateful_modifier(keysym: u32) -> bool {
+    matches!(keysym, 0xffe1..=0xffe4 | 0xffe7..=0xffee | 0xfe03)
 }
 
 impl CaptureSession {
@@ -325,13 +369,11 @@ impl CaptureSession {
     pub async fn handle_client_event(&mut self, event: ClientEvent) -> Result<(), AppError> {
         match event {
             ClientEvent::Key { keysym, pressed } => {
-                // Some compositors fail to translate special keysyms into
-                // effective keys. Inject modifier keys through both the
-                // keysym and the keycode paths: for stateful modifiers the
-                // duplicate events are idempotent, so this works whichever
-                // path the compositor supports.
+                // Special keysyms are silently ignored by some compositors,
+                // while the keycode path is reliable, so non-printable keys
+                // are injected as evdev keycodes first.
                 let mut injected = false;
-                if let Some(keycode) = modifier_keycode(keysym) {
+                if let Some(keycode) = special_keycode(keysym) {
                     match self
                         .manager
                         .remote_desktop()
@@ -340,29 +382,36 @@ impl CaptureSession {
                     {
                         Ok(()) => injected = true,
                         Err(error) => crate::timestamped_log!(
-                            "input: portal rejected modifier keycode {keycode}: {error}"
+                            "input: portal rejected special keycode {keycode}: {error}"
                         ),
                     }
                 }
-                match self
-                    .manager
-                    .remote_desktop()
-                    .notify_keyboard_keysym(
-                        self.session.ashpd_session(),
-                        i32::try_from(keysym).map_err(|_| {
-                            AppError::Capture(format!("RFB keysym {keysym:#x} is out of range"))
-                        })?,
-                        pressed,
-                    )
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(error) if injected => {
-                        crate::timestamped_log!(
-                            "input: portal rejected modifier keysym {keysym:#x} but its keycode worked: {error}"
-                        );
+                // Stateful modifiers are additionally injected through the
+                // keysym path: their duplicates are idempotent and this keeps
+                // working on backends that support only one of the two paths.
+                // Every other key uses the keysym path only when the keycode
+                // path failed, to avoid double effects like two arrow steps.
+                if is_stateful_modifier(keysym) || !injected {
+                    match self
+                        .manager
+                        .remote_desktop()
+                        .notify_keyboard_keysym(
+                            self.session.ashpd_session(),
+                            i32::try_from(keysym).map_err(|_| {
+                                AppError::Capture(format!("RFB keysym {keysym:#x} is out of range"))
+                            })?,
+                            pressed,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if injected => {
+                            crate::timestamped_log!(
+                                "input: portal rejected modifier keysym {keysym:#x} but its keycode worked: {error}"
+                            );
+                        }
+                        Err(error) => return Err(error.into()),
                     }
-                    Err(error) => return Err(error.into()),
                 }
             }
             ClientEvent::Pointer { x, y, buttons } => {
@@ -667,17 +716,26 @@ mod tests {
     }
 
     #[test]
-    fn modifier_keys_map_to_xkb_keycodes_and_locks_do_not() {
-        assert_eq!(modifier_keycode(0xffe3), Some(37)); // Control_L
-        assert_eq!(modifier_keycode(0xffe1), Some(50)); // Shift_L
-        assert_eq!(modifier_keycode(0xffe9), Some(64)); // Alt_L
-        assert_eq!(modifier_keycode(0xffeb), Some(133)); // Super_L
-        assert_eq!(modifier_keycode(0xfe03), Some(108)); // AltGr
-        // Lock keys stay on the keysym-only path: injecting them twice
-        // would toggle them twice.
-        assert_eq!(modifier_keycode(0xffe5), None); // Caps_Lock
-        assert_eq!(modifier_keycode(0xff7f), None); // Num_Lock
-        assert_eq!(modifier_keycode(0x72), None); // 'r'
+    fn special_keys_map_to_evdev_keycodes() {
+        assert_eq!(special_keycode(0xffe3), Some(29)); // Control_L
+        assert_eq!(special_keycode(0xffe1), Some(42)); // Shift_L
+        assert_eq!(special_keycode(0xffe9), Some(56)); // Alt_L
+        assert_eq!(special_keycode(0xffeb), Some(125)); // Super_L
+        assert_eq!(special_keycode(0xfe03), Some(100)); // AltGr
+        assert_eq!(special_keycode(0xffe5), Some(58)); // Caps_Lock
+        assert_eq!(special_keycode(0xff51), Some(105)); // Left
+        assert_eq!(special_keycode(0xffc2), Some(63)); // F5
+        assert_eq!(special_keycode(0xff0d), Some(28)); // Return
+        assert_eq!(special_keycode(0x72), None); // 'r'
+        assert_eq!(special_keycode(0x41), None); // 'A'
+    }
+
+    #[test]
+    fn only_stateful_modifiers_use_both_injection_paths() {
+        assert!(is_stateful_modifier(0xffe3)); // Control_L
+        assert!(is_stateful_modifier(0xfe03)); // AltGr
+        assert!(!is_stateful_modifier(0xffe5)); // Caps_Lock would toggle twice
+        assert!(!is_stateful_modifier(0xff51)); // arrows would move twice
     }
 
     #[test]
