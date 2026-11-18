@@ -24,9 +24,9 @@ use std::sync::atomic::AtomicBool;
 
 use flate2::Compress;
 
-use crate::framebuffer::{DamageRect, Frame};
+use crate::framebuffer::DamageRect;
 
-use super::encoding::{compress_sync, frame_pixel};
+use super::encoding::{FrameView, compress_sync};
 use super::pixel::PixelFormat;
 use super::{invalid_data, write_all_interruptible};
 
@@ -37,7 +37,7 @@ const MAX_PACKED_PALETTE: usize = 16;
 
 pub(super) fn send_zrle_rectangle(
     stream: &mut (impl Read + Write),
-    frame: &Frame,
+    view: &FrameView<'_>,
     rectangle: DamageRect,
     pixel_format: PixelFormat,
     compressor: &mut Compress,
@@ -77,7 +77,7 @@ pub(super) fn send_zrle_rectangle(
             let mut pixels = Vec::with_capacity(tile_width as usize * tile_height as usize);
             for y in tile_y..tile_y + tile_height {
                 for x in tile_x..tile_x + tile_width {
-                    let bgra = frame_pixel(frame, x, y)?;
+                    let bgra = view.pixel(x, y)?;
                     pixels.push(pixel_format.encode_zrle(&bgra));
                 }
             }
@@ -304,7 +304,7 @@ mod tests {
             };
             send_zrle_rectangle(
                 &mut stream,
-                &frame,
+                &FrameView::plain(&frame),
                 rectangle,
                 PixelFormat::DEFAULT,
                 &mut compressor,
@@ -313,7 +313,7 @@ mod tests {
             .unwrap();
             send_zrle_rectangle(
                 &mut stream,
-                &frame,
+                &FrameView::plain(&frame),
                 rectangle,
                 PixelFormat::DEFAULT,
                 &mut compressor,
@@ -625,7 +625,7 @@ mod tests {
         let mut stream = Cursor::new(Vec::new());
         send_zrle_rectangle(
             &mut stream,
-            &frame,
+            &FrameView::plain(&frame),
             rectangle,
             PixelFormat::DEFAULT,
             &mut compressor,

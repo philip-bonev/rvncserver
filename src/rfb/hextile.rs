@@ -18,9 +18,9 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::AtomicBool;
 
-use crate::framebuffer::{DamageRect, Frame};
+use crate::framebuffer::DamageRect;
 
-use super::encoding::encoded_frame_pixel;
+use super::encoding::{FrameView, encoded_frame_pixel};
 use super::pixel::PixelFormat;
 use super::write_all_interruptible;
 
@@ -43,7 +43,7 @@ struct HextileTile {
 
 pub(super) fn send_hextile_rectangle(
     stream: &mut (impl Read + Write),
-    frame: &Frame,
+    view: &FrameView<'_>,
     rectangle: DamageRect,
     pixel_format: PixelFormat,
     shutdown: &AtomicBool,
@@ -57,7 +57,7 @@ pub(super) fn send_hextile_rectangle(
             let tile_width = (right - tile_x).min(16) as u8;
             send_hextile_tile(
                 stream,
-                frame,
+                view,
                 HextileTile {
                     x: tile_x,
                     y: tile_y,
@@ -75,7 +75,7 @@ pub(super) fn send_hextile_rectangle(
 
 fn send_hextile_tile(
     stream: &mut (impl Read + Write),
-    frame: &Frame,
+    view: &FrameView<'_>,
     tile: HextileTile,
     pixel_format: PixelFormat,
     shutdown: &AtomicBool,
@@ -97,7 +97,7 @@ fn send_hextile_tile(
     let mut most_frequent = 0usize;
     for y in 0..u32::from(tile_height) {
         for x in 0..u32::from(tile_width) {
-            let color = encoded_frame_pixel(frame, tile_x + x, tile_y + y, pixel_format)?;
+            let color = encoded_frame_pixel(view, tile_x + x, tile_y + y, pixel_format)?;
             let count = frequencies.entry(color).or_default();
             *count += 1;
             if *count > most_frequent {
@@ -112,7 +112,7 @@ fn send_hextile_tile(
         let mut x = 0u8;
         while x < tile_width {
             let color = encoded_frame_pixel(
-                frame,
+                view,
                 tile_x + u32::from(x),
                 tile_y + u32::from(y),
                 pixel_format,
@@ -126,7 +126,7 @@ fn send_hextile_tile(
             x += 1;
             while x < tile_width
                 && encoded_frame_pixel(
-                    frame,
+                    view,
                     tile_x + u32::from(x),
                     tile_y + u32::from(y),
                     pixel_format,
@@ -145,7 +145,7 @@ fn send_hextile_tile(
                 previous.height += 1;
             } else {
                 if subrects.len() == u8::MAX as usize {
-                    return send_raw_hextile_tile(stream, frame, tile, pixel_format, shutdown);
+                    return send_raw_hextile_tile(stream, view, tile, pixel_format, shutdown);
                 }
                 subrects.push(HextileSubrect {
                     x: run_start,
@@ -170,7 +170,7 @@ fn send_hextile_tile(
     let raw_size = 1 + usize::from(tile_width) * usize::from(tile_height) * bytes_per_pixel;
 
     if !subrects.is_empty() && encoded_size >= raw_size {
-        return send_raw_hextile_tile(stream, frame, tile, pixel_format, shutdown);
+        return send_raw_hextile_tile(stream, view, tile, pixel_format, shutdown);
     }
 
     let mut flags = BACKGROUND_SPECIFIED;
@@ -212,7 +212,7 @@ fn send_hextile_tile(
 
 fn send_raw_hextile_tile(
     stream: &mut (impl Read + Write),
-    frame: &Frame,
+    view: &FrameView<'_>,
     tile: HextileTile,
     pixel_format: PixelFormat,
     shutdown: &AtomicBool,
@@ -226,7 +226,7 @@ fn send_raw_hextile_tile(
     write_all_interruptible(stream, &[1], shutdown)?; // Raw tile subencoding
     for row in 0..u32::from(tile_height) {
         for column in 0..u32::from(tile_width) {
-            let pixel = encoded_frame_pixel(frame, tile_x + column, tile_y + row, pixel_format)?;
+            let pixel = encoded_frame_pixel(view, tile_x + column, tile_y + row, pixel_format)?;
             write_all_interruptible(stream, &pixel[..pixel_format.bytes_per_pixel()], shutdown)?;
         }
     }

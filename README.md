@@ -307,7 +307,9 @@ This captures one normalized frame and writes it as a binary PPM file.
   TCP keepalive (60 seconds idle, then three probes at 10-second intervals).
 - The authentication and initialization phase has a fixed 60-second timeout;
   it is not configurable.
-- The cursor is not embedded in the captured image.
+- With `--enable-cursor`, clients without cursor pseudo-encodings get
+  the cursor composited into the image instead. CopyRect is disabled for
+  such clients because the server cannot verify their composited pixels.
 - Input and clipboard forwarding are disabled by default and require explicit
   CLI opt-in and portal permission. Clipboard support is text-only; RFB's
   Latin-1 text is converted to/from UTF-8 for the desktop portal.

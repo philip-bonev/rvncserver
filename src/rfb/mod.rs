@@ -255,6 +255,7 @@ fn handle_client(
         cursor_snapshot: crate::cursor::CursorSnapshot::default(),
         sent_cursor_shape_sequence: 0,
         sent_cursor_position_sequence: 0,
+        drawn_cursor: None,
     };
     let mut keyboard_input_warned = false;
     let mut pointer_input_warned = false;

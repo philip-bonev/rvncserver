@@ -93,6 +93,9 @@ pub(super) struct ClientUpdateState {
     pub(super) cursor_snapshot: crate::cursor::CursorSnapshot,
     pub(super) sent_cursor_shape_sequence: u64,
     pub(super) sent_cursor_position_sequence: u64,
+    /// Cursor rectangle and shape sequence most recently composited into the
+    /// image for clients without cursor pseudo-encodings.
+    pub(super) drawn_cursor: Option<(DamageRect, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +232,17 @@ pub(super) fn handle_update_request(
         let updates = vec![requested];
         send_update(stream, &changes.frame, &updates, state, shutdown)?;
         subtract_damage(&mut state.pending_damage, requested);
+        if embed_cursor(state) {
+            // The full requested region was redrawn, so any embedded cursor
+            // within it is up to date.
+            state.drawn_cursor = state
+                .cursor_snapshot
+                .shape
+                .as_deref()
+                .zip(state.cursor_snapshot.position)
+                .and_then(|(shape, position)| cursor_rect(shape, position, width, height))
+                .map(|rect| (rect, state.cursor_snapshot.shape_sequence));
+        }
         return Ok(());
     }
 
@@ -263,6 +277,37 @@ pub(super) fn service_pending_update(
     } else {
         None
     };
+
+    // With the cursor composited into the image, its movement and shape
+    // changes are damage like any other content change.
+    if embed_cursor(state) {
+        let current = state
+            .cursor_snapshot
+            .shape
+            .as_deref()
+            .zip(state.cursor_snapshot.position)
+            .and_then(|(shape, position)| cursor_rect(shape, position, width, height))
+            .map(|rect| (rect, state.cursor_snapshot.shape_sequence));
+        if current != state.drawn_cursor {
+            let frame_width = u32::from(width);
+            let frame_height = u32::from(height);
+            for rect in [
+                state.drawn_cursor.map(|(rect, _)| rect),
+                current.map(|(rect, _)| rect),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                accumulate_damage(
+                    &mut state.pending_damage,
+                    FrameDamage::Regions(vec![rect]),
+                    frame_width,
+                    frame_height,
+                );
+            }
+            state.drawn_cursor = current;
+        }
+    }
 
     let updates = damage_within(&state.pending_damage, requested);
     let cursor_update_pending = state.cursor_enabled
@@ -347,6 +392,24 @@ pub(super) fn send_update(
         && state.pointer_pos_enabled
         && state.cursor_snapshot.position.is_some()
         && state.cursor_snapshot.position_sequence != state.sent_cursor_position_sequence;
+    // Clients without cursor pseudo-encodings receive the cursor as part of
+    // the image. CopyRect is disabled for them: the client's shadow would not
+    // contain the overlaid pixels.
+    let embed = embed_cursor(state);
+    let view = FrameView::new(
+        frame,
+        if embed {
+            state
+                .cursor_snapshot
+                .shape
+                .as_deref()
+                .zip(state.cursor_snapshot.position)
+        } else {
+            None
+        },
+    );
+    let shadow_enabled = state.copy_rect_enabled && !embed;
+
     let rectangle_count =
         rectangles.len() + usize::from(send_cursor) + usize::from(send_pointer_pos);
     let rectangle_count = u16::try_from(rectangle_count)
@@ -384,11 +447,11 @@ pub(super) fn send_update(
         let height = u16::try_from(rect.height)
             .map_err(|_| invalid_data("rectangle height exceeds RFB limit"))?;
 
-        let copy_source = if state.copy_rect_enabled {
+        let copy_source = if shadow_enabled {
             state
                 .client_pixels
                 .as_deref()
-                .and_then(|shadow| find_copy_source(frame, shadow, *rect, state.pixel_format))
+                .and_then(|shadow| find_copy_source(&view, shadow, *rect, state.pixel_format))
         } else {
             None
         };
@@ -408,16 +471,16 @@ pub(super) fn send_update(
         if let Some((source_x, source_y)) = copy_source {
             write_all_interruptible(stream, &source_x.to_be_bytes(), shutdown)?;
             write_all_interruptible(stream, &source_y.to_be_bytes(), shutdown)?;
-            if state.copy_rect_enabled {
-                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            if shadow_enabled {
+                update_client_shadow(&view, *rect, state.pixel_format, &mut state.client_pixels)?;
             }
             continue;
         }
 
         if state.encoding == Encoding::Hextile {
-            send_hextile_rectangle(stream, frame, *rect, state.pixel_format, shutdown)?;
-            if state.copy_rect_enabled {
-                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            send_hextile_rectangle(stream, &view, *rect, state.pixel_format, shutdown)?;
+            if shadow_enabled {
+                update_client_shadow(&view, *rect, state.pixel_format, &mut state.client_pixels)?;
             }
             continue;
         }
@@ -425,14 +488,14 @@ pub(super) fn send_update(
         if state.encoding == Encoding::Zrle {
             send_zrle_rectangle(
                 stream,
-                frame,
+                &view,
                 *rect,
                 state.pixel_format,
                 &mut state.zrle_compressor,
                 shutdown,
             )?;
-            if state.copy_rect_enabled {
-                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            if shadow_enabled {
+                update_client_shadow(&view, *rect, state.pixel_format, &mut state.client_pixels)?;
             }
             continue;
         }
@@ -440,21 +503,21 @@ pub(super) fn send_update(
         if state.encoding == Encoding::Zlib {
             send_zlib_rectangle(
                 stream,
-                frame,
+                &view,
                 *rect,
                 state.pixel_format,
                 &mut state.zlib_compressor,
                 shutdown,
             )?;
-            if state.copy_rect_enabled {
-                update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+            if shadow_enabled {
+                update_client_shadow(&view, *rect, state.pixel_format, &mut state.client_pixels)?;
             }
             continue;
         }
 
-        send_raw_rectangle(stream, frame, *rect, state.pixel_format, shutdown)?;
-        if state.copy_rect_enabled {
-            update_client_shadow(frame, *rect, state.pixel_format, &mut state.client_pixels)?;
+        send_raw_rectangle(stream, &view, *rect, state.pixel_format, shutdown)?;
+        if shadow_enabled {
+            update_client_shadow(&view, *rect, state.pixel_format, &mut state.client_pixels)?;
         }
     }
 
@@ -545,7 +608,7 @@ fn send_pointer_position(
 
 fn send_raw_rectangle(
     stream: &mut (impl Read + Write),
-    frame: &Frame,
+    view: &FrameView<'_>,
     rectangle: DamageRect,
     pixel_format: PixelFormat,
     shutdown: &AtomicBool,
@@ -556,16 +619,17 @@ fn send_raw_rectangle(
         .and_then(|width| width.checked_mul(bytes_per_pixel))
         .ok_or_else(|| invalid_data("raw rectangle size overflows"))?;
     for y in rectangle.y..rectangle.y + rectangle.height {
-        if pixel_format == PixelFormat::DEFAULT {
+        if pixel_format == PixelFormat::DEFAULT && !view.has_cursor() {
             let start = (y as usize)
-                .checked_mul(frame.width as usize)
+                .checked_mul(view.frame.width as usize)
                 .and_then(|row| row.checked_add(rectangle.x as usize))
                 .and_then(|pixel| pixel.checked_mul(4))
                 .ok_or_else(|| invalid_data("raw rectangle offset overflows"))?;
             let end = start
                 .checked_add(row_capacity)
                 .ok_or_else(|| invalid_data("raw rectangle offset overflows"))?;
-            let row = frame
+            let row = view
+                .frame
                 .data
                 .get(start..end)
                 .ok_or_else(|| invalid_data("raw rectangle is outside the framebuffer"))?;
@@ -574,7 +638,7 @@ fn send_raw_rectangle(
         }
         let mut row = Vec::with_capacity(row_capacity);
         for x in rectangle.x..rectangle.x + rectangle.width {
-            let bgra = frame_pixel(frame, x, y)?;
+            let bgra = view.pixel(x, y)?;
             row.extend_from_slice(&pixel_format.encode(&bgra)[..bytes_per_pixel]);
         }
         write_all_interruptible(stream, &row, shutdown)?;
@@ -583,11 +647,12 @@ fn send_raw_rectangle(
 }
 
 fn update_client_shadow(
-    frame: &Frame,
+    view: &FrameView<'_>,
     rectangle: DamageRect,
     pixel_format: PixelFormat,
     shadow: &mut Option<Vec<[u8; 4]>>,
 ) -> io::Result<()> {
+    let frame = view.frame;
     let frame_width = frame.width as usize;
     let frame_height = frame.height as usize;
     if shadow.is_none()
@@ -612,7 +677,12 @@ fn update_client_shadow(
         })?;
         for y in 0..frame.height {
             for x in 0..frame.width {
-                initial.push(encoded_frame_pixel(frame, x, y, pixel_format)?);
+                initial.push(encoded_frame_pixel(
+                    &FrameView::plain(frame),
+                    x,
+                    y,
+                    pixel_format,
+                )?);
             }
         }
         *shadow = Some(initial);
@@ -631,18 +701,19 @@ fn update_client_shadow(
             let slot = shadow
                 .get_mut(index)
                 .ok_or_else(|| invalid_data("client framebuffer shadow is incomplete"))?;
-            *slot = encoded_frame_pixel(frame, x, y, pixel_format)?;
+            *slot = encoded_frame_pixel(&FrameView::plain(frame), x, y, pixel_format)?;
         }
     }
     Ok(())
 }
 
 fn find_copy_source(
-    frame: &Frame,
+    view: &FrameView<'_>,
     shadow: &[[u8; 4]],
     rectangle: DamageRect,
     pixel_format: PixelFormat,
 ) -> Option<(u16, u16)> {
+    let frame = view.frame;
     const SEARCH_RADIUS: i32 = 128;
     const MAX_CANDIDATES: usize = 65_536;
     const MAX_COMPARE_PIXELS: usize = 1_000_000;
@@ -662,7 +733,7 @@ fn find_copy_source(
     let last_x = frame.width.checked_sub(rectangle.width)?;
     let last_y = frame.height.checked_sub(rectangle.height)?;
     let destination_pixel =
-        encoded_frame_pixel(frame, rectangle.x, rectangle.y, pixel_format).ok()?;
+        encoded_frame_pixel(view, rectangle.x, rectangle.y, pixel_format).ok()?;
     let mut tested = 0usize;
     let mut visited = 0usize;
     let mut comparison_budget = MAX_COMPARE_PIXELS;
@@ -722,13 +793,9 @@ fn find_copy_source(
                     let target_y = rectangle.y + row;
                     let source_row = (source_y + row) as usize * frame_width + source_x as usize;
                     for column in 0..rectangle.width {
-                        let target = encoded_frame_pixel(
-                            frame,
-                            rectangle.x + column,
-                            target_y,
-                            pixel_format,
-                        )
-                        .ok()?;
+                        let target =
+                            encoded_frame_pixel(view, rectangle.x + column, target_y, pixel_format)
+                                .ok()?;
                         if shadow[source_row + column as usize] != target {
                             matches = false;
                             break 'pixels;
@@ -745,7 +812,7 @@ fn find_copy_source(
 }
 
 fn encode_rectangle_pixels(
-    frame: &Frame,
+    view: &FrameView<'_>,
     rectangle: DamageRect,
     pixel_format: PixelFormat,
 ) -> io::Result<Vec<u8>> {
@@ -761,7 +828,7 @@ fn encode_rectangle_pixels(
     })?;
     for y in rectangle.y..rectangle.y + rectangle.height {
         for x in rectangle.x..rectangle.x + rectangle.width {
-            let bgra = frame_pixel(frame, x, y)?;
+            let bgra = view.pixel(x, y)?;
             pixels.extend_from_slice(&pixel_format.encode(&bgra)[..bytes_per_pixel]);
         }
     }
@@ -770,13 +837,13 @@ fn encode_rectangle_pixels(
 
 fn send_zlib_rectangle(
     stream: &mut (impl Read + Write),
-    frame: &Frame,
+    view: &FrameView<'_>,
     rectangle: DamageRect,
     pixel_format: PixelFormat,
     compressor: &mut Compress,
     shutdown: &AtomicBool,
 ) -> io::Result<()> {
-    let pixels = encode_rectangle_pixels(frame, rectangle, pixel_format)?;
+    let pixels = encode_rectangle_pixels(view, rectangle, pixel_format)?;
     let compressed = compress_sync(compressor, &pixels)?;
     let length = u32::try_from(compressed.len())
         .map_err(|_| invalid_data("compressed Zlib rectangle exceeds RFB limit"))?;
@@ -833,24 +900,149 @@ pub(super) fn frame_pixel(frame: &Frame, x: u32, y: u32) -> io::Result<[u8; 4]> 
         .checked_mul(frame.width as usize)
         .and_then(|pixel| pixel.checked_add(x as usize))
         .and_then(|pixel| pixel.checked_mul(4))
-        .ok_or_else(|| invalid_data("Hextile pixel offset overflows"))?;
+        .ok_or_else(|| invalid_data("frame pixel offset overflows"))?;
     let end = start
         .checked_add(4)
-        .ok_or_else(|| invalid_data("Hextile pixel offset overflows"))?;
+        .ok_or_else(|| invalid_data("frame pixel offset overflows"))?;
     let pixel = frame
         .data
         .get(start..end)
-        .ok_or_else(|| invalid_data("Hextile pixel is outside the framebuffer"))?;
+        .ok_or_else(|| invalid_data("frame pixel is outside the framebuffer"))?;
     Ok([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
+/// A framebuffer view that blends an optional cursor image into the pixels at
+/// encoding time, for clients without cursor pseudo-encodings.
+pub(super) struct FrameView<'a> {
+    frame: &'a Frame,
+    /// Cursor image and the image coordinates of its top-left corner.
+    cursor: Option<(&'a crate::cursor::CursorShape, i32, i32)>,
+}
+
+impl<'a> FrameView<'a> {
+    /// View `frame`, drawing `cursor` at the pointer position when given.
+    pub(super) fn new(
+        frame: &'a Frame,
+        cursor: Option<(&'a crate::cursor::CursorShape, (i32, i32))>,
+    ) -> Self {
+        let cursor = cursor.map(|(shape, position)| {
+            (
+                shape,
+                position.0 - i32::from(shape.hotspot.0),
+                position.1 - i32::from(shape.hotspot.1),
+            )
+        });
+        Self { frame, cursor }
+    }
+
+    /// The frame without any cursor overlay.
+    pub(super) fn plain(frame: &'a Frame) -> Self {
+        Self {
+            frame,
+            cursor: None,
+        }
+    }
+
+    pub(super) fn has_cursor(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    /// One pixel, with the cursor blended over the frame when present.
+    pub(super) fn pixel(&self, x: u32, y: u32) -> io::Result<[u8; 4]> {
+        let mut pixel = frame_pixel(self.frame, x, y)?;
+        if let Some((shape, left, top)) = self.cursor {
+            let x = i32::try_from(x).unwrap_or(i32::MAX);
+            let y = i32::try_from(y).unwrap_or(i32::MAX);
+            if let Some(cursor_pixel) = cursor_pixel_at(shape, left, top, x, y) {
+                pixel = blend_over(pixel, cursor_pixel);
+            }
+        }
+        Ok(pixel)
+    }
+}
+
+/// The cursor pixel covering an image coordinate, if any.
+fn cursor_pixel_at(
+    shape: &crate::cursor::CursorShape,
+    left: i32,
+    top: i32,
+    x: i32,
+    y: i32,
+) -> Option<[u8; 4]> {
+    let offset_x = x.checked_sub(left)?;
+    let offset_y = y.checked_sub(top)?;
+    if offset_x < 0
+        || offset_y < 0
+        || offset_x >= i32::from(shape.width)
+        || offset_y >= i32::from(shape.height)
+    {
+        return None;
+    }
+    let index = (offset_y as usize * usize::from(shape.width) + offset_x as usize) * 4;
+    let pixel = shape.pixels.get(index..index + 4)?;
+    Some([pixel[0], pixel[1], pixel[2], pixel[3]])
+}
+
+/// Source-over alpha blend of a cursor pixel onto a frame pixel.
+fn blend_over(destination: [u8; 4], source: [u8; 4]) -> [u8; 4] {
+    let alpha = u32::from(source[3]);
+    if alpha == 0 {
+        return destination;
+    }
+    if alpha == 255 {
+        return source;
+    }
+    let inverse = 255 - alpha;
+    let blend = |source: u8, destination: u8| {
+        ((u32::from(source) * alpha + u32::from(destination) * inverse + 127) / 255) as u8
+    };
+    [
+        blend(source[0], destination[0]),
+        blend(source[1], destination[1]),
+        blend(source[2], destination[2]),
+        ((alpha * 255 + u32::from(destination[3]) * inverse + 127) / 255) as u8,
+    ]
+}
+
+/// The on-image rectangle covered by an embedded cursor, clipped to the frame.
+fn cursor_rect(
+    shape: &crate::cursor::CursorShape,
+    position: (i32, i32),
+    width: u16,
+    height: u16,
+) -> Option<DamageRect> {
+    let left = position.0 - i32::from(shape.hotspot.0);
+    let top = position.1 - i32::from(shape.hotspot.1);
+    let right = left + i32::from(shape.width);
+    let bottom = top + i32::from(shape.height);
+    let left = left.clamp(0, i32::from(width));
+    let top = top.clamp(0, i32::from(height));
+    let right = right.clamp(left, i32::from(width));
+    let bottom = bottom.clamp(top, i32::from(height));
+    if left == right || top == bottom {
+        return None;
+    }
+    Some(DamageRect {
+        x: left as u32,
+        y: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
+}
+
+/// Clients without cursor pseudo-encodings get the cursor composited into
+/// the image instead.
+fn embed_cursor(state: &ClientUpdateState) -> bool {
+    state.cursor_enabled && !state.rich_cursor_enabled && !state.pointer_pos_enabled
+}
+
 pub(super) fn encoded_frame_pixel(
-    frame: &Frame,
+    view: &FrameView<'_>,
     x: u32,
     y: u32,
     pixel_format: PixelFormat,
 ) -> io::Result<[u8; 4]> {
-    Ok(pixel_format.encode(&frame_pixel(frame, x, y)?))
+    Ok(pixel_format.encode(&view.pixel(x, y)?))
 }
 
 #[cfg(test)]
@@ -871,6 +1063,7 @@ pub(crate) fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> 
         cursor_snapshot: crate::cursor::CursorSnapshot::default(),
         sent_cursor_shape_sequence: 0,
         sent_cursor_position_sequence: 0,
+        drawn_cursor: None,
     }
 }
 
@@ -878,7 +1071,7 @@ pub(crate) fn test_update_state(encoding: Encoding, copy_rect_enabled: bool) -> 
 mod tests {
     use super::*;
     use flate2::Compression;
-    use std::io::Read;
+    use std::io::{Cursor, Read};
     use std::net::TcpListener;
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -1045,7 +1238,7 @@ mod tests {
             for _ in 0..2 {
                 send_zlib_rectangle(
                     &mut stream,
-                    &frame,
+                    &FrameView::plain(&frame),
                     rectangle,
                     PixelFormat::DEFAULT,
                     &mut compressor,
@@ -1135,5 +1328,96 @@ mod tests {
         );
         assert_eq!(&update[16..], &[0, 0, 0, 0]);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cursor_blend_uses_alpha_and_the_cursor_origin() {
+        let frame = Frame::new(2, 1, vec![10, 20, 30, 255, 10, 20, 30, 255]).unwrap();
+        let opaque = crate::cursor::CursorShape {
+            width: 1,
+            height: 1,
+            hotspot: (0, 0),
+            pixels: Arc::new(vec![1, 2, 3, 255]),
+        };
+        // The image origin is the pointer position minus the hotspot.
+        let view = FrameView::new(&frame, Some((&opaque, (1, 0))));
+        assert_eq!(view.pixel(0, 0).unwrap(), [10, 20, 30, 255]);
+        assert_eq!(view.pixel(1, 0).unwrap(), [1, 2, 3, 255]);
+
+        let transparent = crate::cursor::CursorShape {
+            pixels: Arc::new(vec![1, 2, 3, 0]),
+            ..opaque.clone()
+        };
+        let view = FrameView::new(&frame, Some((&transparent, (0, 0))));
+        assert_eq!(view.pixel(0, 0).unwrap(), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn cursor_rect_clips_to_the_frame() {
+        let shape = crate::cursor::CursorShape {
+            width: 2,
+            height: 2,
+            hotspot: (1, 1),
+            pixels: Arc::new(vec![0; 16]),
+        };
+        assert_eq!(
+            cursor_rect(&shape, (1, 1), 4, 4),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2
+            })
+        );
+        // A cursor sticking out past the top-left corner covers one pixel.
+        assert_eq!(
+            cursor_rect(&shape, (0, 0), 4, 4),
+            Some(DamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1
+            })
+        );
+        assert_eq!(cursor_rect(&shape, (-10, -10), 4, 4), None);
+    }
+
+    #[test]
+    fn embedded_cursor_is_blended_into_raw_updates() {
+        let frame = Frame::new(2, 2, [9u8, 9, 9, 255].repeat(4)).unwrap();
+        let shape = crate::cursor::CursorShape {
+            width: 1,
+            height: 1,
+            hotspot: (0, 0),
+            pixels: Arc::new(vec![1, 2, 3, 255]),
+        };
+        let mut state = test_update_state(Encoding::Raw, false);
+        state.cursor_enabled = true;
+        state.cursor_snapshot = crate::cursor::CursorSnapshot {
+            position: Some((1, 0)),
+            position_sequence: 1,
+            shape: Some(Arc::new(shape)),
+            shape_sequence: 1,
+        };
+        let mut out = Cursor::new(Vec::new());
+        send_update(
+            &mut out,
+            &frame,
+            &[DamageRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }],
+            &mut state,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let bytes = out.into_inner();
+        // FramebufferUpdate header (4), rectangle header (12), four pixels.
+        assert_eq!(bytes.len(), 4 + 12 + 16);
+        assert_eq!(&bytes[4 + 12..4 + 12 + 4], &[9, 9, 9, 255]);
+        assert_eq!(&bytes[4 + 12 + 4..4 + 12 + 8], &[1, 2, 3, 255]);
     }
 }
