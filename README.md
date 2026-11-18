@@ -56,15 +56,20 @@ Defaults:
 ```
 
 Raise or lower the simultaneous client limit with `--max-clients <N>` or
-`"max_clients": N` in JSON. Connections above the limit are closed immediately.
+`"max_clients": N` in JSON. Connections above the limit are rejected with an
+RFB failure reason.
 With multiple clients, clipboard text is broadcast to every client, and input
 events from all clients share the same remote desktop.
 
 For long-running sessions, finished client threads are joined and reaped, and
 client/frame-store counters are released even if a worker panics. TCP keepalive
-closes peers that disappear without closing the connection, while idle
-authenticated clients remain connected. A connection that does not complete
-authentication and initialization within 60 seconds is closed.
+closes peers that disappear without closing the connection. Clients idle for
+longer than `--client-timeout` seconds (default 300, `"client_timeout"` in
+JSON, 0 disables) are disconnected; idle means no client messages and no
+pending update request, so quiet viewers of a static screen are kept. A
+connection that does not complete authentication and initialization within
+`--handshake-timeout` seconds (default 60, `"handshake_timeout"` in JSON) is
+closed.
 
 The portal restore token is stored in an owner-only file at
 `$XDG_STATE_HOME/rvncserver/portal-restore-token` (falling back to
@@ -77,12 +82,13 @@ token is never logged.
 If the portal or PipeWire stream ends, the server stops serving the frozen
 framebuffer and tries to recreate the capture session, reusing the stored token.
 It makes at most three attempts with short backoff, each bounded by a timeout.
-If reinitialization fails, or the restarted stream has different dimensions than
-the running RFB session, the process exits with an error so a service manager
+A restarted stream with different dimensions resizes the desktop live. If
+reinitialization fails, the process exits with an error so a service manager
 can restart it.
 
 Remote input and clipboard sharing are disabled by default. Enable either
-capability explicitly when needed. VeNCrypt/TLS authentication is the default;
+capability explicitly when needed. The matching `--disable-input`,
+`--disable-cursor`, and `--disable-clipboard` override a `true` from JSON. VeNCrypt/TLS authentication is the default;
 classic VNC authentication can be selected for clients that need it:
 
 ```sh
@@ -130,9 +136,10 @@ stderr; daemonized stderr goes to `/dev/null` unless a log target is selected.
 The 50 MB/10-backup defaults apply when file logging is selected; they do not
 affect stderr or journald. Set `enable_cursor: true` in JSON or pass
 `--enable-cursor` to send the cursor shape (`RichCursor`) and movement
-(`PointerPos`) separately when a client advertises support. Cursor updates are
-disabled by default and depend on the compositor providing cursor metadata
-through PipeWire.
+(`PointerPos`) separately when a client advertises support. Clients that
+advertise neither pseudo-encoding get the cursor composited into the image
+instead. Cursor updates are disabled by default and depend on the compositor
+providing cursor metadata through PipeWire.
 Manage the daemon by its
 PID with `rvncserver --stop`, which sends SIGTERM and waits up to 10 seconds for
 graceful shutdown. The daemon writes and removes a PID file at
@@ -155,6 +162,9 @@ Example configuration:
 {
   "listen": "127.0.0.1",
   "port": 5900,
+  "max_clients": 4,
+  "client_timeout": 300,
+  "handshake_timeout": 60,
   "capture_probe": null,
   "enable_input": false,
   "enable_cursor": false,
@@ -255,12 +265,18 @@ This captures one normalized frame and writes it as a binary PPM file.
 - Experimental Apple DH authentication (SecurityType 30 and RFB 3.889), opt-in
   with `--auth apple-dh`; currently not working with macOS Screen Sharing
 - Up to `max_clients` simultaneous clients (default 4, maximum 10); excess
-  connections are closed immediately
+  connections are rejected with an RFB failure reason
 - 8-, 16-, and 32-bit true-color client pixel formats, including RGB332,
   RGB565, and 24-bit color in 32-bit pixels with either byte order
 - Zlib, ZRLE, Hextile, and Raw when offered by the client, selected according
   to its encoding preference order. CopyRect is used opportunistically when
   the server can verify a matching source in the client's known framebuffer.
+  ZRLE picks the smallest tile subencoding (solid, packed palette, palette
+  RLE, plain RLE, or raw) per 64x64 tile
+- DesktopSize pseudo-encoding: resolution changes are announced live and the
+  desktop resizes without disconnecting clients that support it
+- All monitor streams selected in the portal are composed into one desktop at
+  their logical positions and served as a single framebuffer
 - Keyboard keysym events and pointer motion/buttons/scroll through the
   permission-controlled RemoteDesktop portal when `--enable-input` is set.
   RFB button bits follow the protocol specification: buttons 1-3 are the
@@ -272,6 +288,7 @@ This captures one normalized frame and writes it as a binary PPM file.
   incremental requests when PipeWire supplies reliable damage metadata
 - Bounded damage history; missed or unavailable damage falls back to a full
   framebuffer region to preserve correctness
+- Per-peer rate limiting of authentication attempts
 - Clean handling of client disconnects and partial socket reads/writes
 
 ## Current limitations
@@ -290,8 +307,8 @@ This captures one normalized frame and writes it as a binary PPM file.
   Sharing. Apple-specific client messages remain unsupported. The mode does
   not encrypt session traffic.
 - VeNCrypt requires RFB 3.8; plaintext VNC Authentication also supports RFB 3.3.
-- macOS Screen Sharing compatibility with VNC Authentication has not yet been
-  verified against an actual Mac client.
+- macOS Screen Sharing works as a client with VNC Authentication. It does not
+  implement VeNCrypt, so use `--auth vnc` with it.
 - VeNCrypt X509Plain client compatibility varies; use a client that supports
   this subtype. Authentication attempts are
   rate-limited: five failures within a minute lock the peer out for five
@@ -355,18 +372,35 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 ## Tested environments
 
+- macOS Screen Sharing is the primary test client. Framebuffer updates,
+  keyboard and pointer input (including modifiers and special keys), and
+  connection handling were exercised through it.
 - COSMIC Wayland session on Pop!_OS, with `xdg-desktop-portal-cosmic`,
   PipeWire 1.6.8, and a 1920x1080 output. Capture and a full 1920x1080 Raw
   framebuffer update were verified with a local RFB protocol client. COSMIC
   rejects application-scoped persistence; the non-persistent fallback works.
-- GNOME, KDE Plasma, Sway, and Hyprland have not been tested yet. A graphical
-  VNC client has not been tested yet.
+- GNOME, KDE Plasma, Sway, and Hyprland have not been tested yet.
+- Multi-monitor composition and live desktop resizing are implemented and
+  unit-tested but not yet verified against a live multi-monitor session.
 
 ## Project layout
 
-- `src/cli.rs`: command-line parsing and validation
-- `src/capture.rs`: portal session and PipeWire capture
-- `src/framebuffer.rs`: frame normalization and the shared latest-frame store
-- `src/rfb.rs`: RFB 3.8 protocol implementation
+- `src/main.rs`: entry point, daemon and PID-file lifecycle
 - `src/server.rs`: capture/RFB wiring and shutdown
+- `src/cli.rs`: command-line parsing and validation
+- `src/capture.rs`: portal session and multi-stream PipeWire capture
+- `src/composite.rs`: multi-monitor layout and frame composition
+- `src/framebuffer.rs`: frame normalization and the shared latest-frame store
+- `src/cursor.rs`: cursor normalization and state
+- `src/input.rs`: RFB input events and Latin-1 clipboard conversion
+- `src/logging.rs`: timestamped logging, journald, and rotating file logs
+- `src/clipboard/`: clipboard backends (XDG Desktop Portal and Wayland)
+- `src/rfb/`: RFB protocol implementation
+  - `mod.rs`: protocol flow, client sessions, and wire I/O
+  - `listener.rs`: TCP listener and per-client worker threads
+  - `auth.rs` and `security.rs`: credentials, TLS identities, security negotiation
+  - `pixel.rs`: client pixel formats
+  - `encoding.rs`: framebuffer update scheduling and encodings
+  - `damage.rs`: damage-region accumulation and rectangle math
+  - `hextile.rs` and `zrle.rs`: tile encodings
 - `src/error.rs`: application error type
