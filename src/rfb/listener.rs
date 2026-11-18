@@ -25,8 +25,7 @@ use crate::framebuffer::FrameStore;
 use crate::input::ClientEvent;
 
 use super::{
-    AuthLimiter, HANDSHAKE_TIMEOUT, READ_POLL_INTERVAL, RfbConfig, WRITE_TIMEOUT, handle_client,
-    is_normal_disconnect,
+    AuthLimiter, READ_POLL_INTERVAL, RfbConfig, WRITE_TIMEOUT, handle_client, is_normal_disconnect,
 };
 
 /// Start the RFB listener thread.
@@ -112,7 +111,7 @@ fn run_listener(
                 }
                 let guard = ActiveClientGuard(Arc::clone(&active_clients));
                 let (handshake_tx, handshake_watchdog) =
-                    match spawn_handshake_watchdog(&stream, address, HANDSHAKE_TIMEOUT) {
+                    match spawn_handshake_watchdog(&stream, address, config.handshake_timeout) {
                         Ok((done_tx, handle)) => (Some(done_tx), Some(handle)),
                         Err(error) => {
                             crate::timestamped_log!(

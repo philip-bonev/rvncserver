@@ -310,8 +310,8 @@ This captures one normalized frame and writes it as a binary PPM file.
   update request, so quiet viewers of a static screen are kept. Dead peers
   are also detected through TCP keepalive (60 seconds idle, then three
   probes at 10-second intervals).
-- The authentication and initialization phase has a fixed 60-second timeout;
-  it is not configurable.
+- The authentication and initialization phase times out after
+  `--handshake-timeout` seconds (default 60).
 - With `--enable-cursor`, clients without cursor pseudo-encodings get
   the cursor composited into the image instead. CopyRect is disabled for
   such clients because the server cannot verify their composited pixels.

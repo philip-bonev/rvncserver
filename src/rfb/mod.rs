@@ -78,8 +78,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const INITIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
 const WAIT_SLICE: Duration = Duration::from_millis(250);
 
 /// How often keyboard events are summarized in the log. Individual key events
@@ -105,6 +103,8 @@ pub struct RfbConfig {
     /// Disconnect clients with no messages and no pending update request
     /// after this duration; zero disables the timeout.
     pub client_timeout: Duration,
+    /// Authentication and initialization timeout.
+    pub handshake_timeout: Duration,
     /// Optional allowlist; Raw remains a required fallback.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// Optional TLS/VeNCrypt authentication settings.
@@ -1006,6 +1006,7 @@ pub(crate) fn test_rfb_config(max_clients: usize) -> RfbConfig {
         max_clients,
         encodings: None,
         client_timeout: Duration::ZERO,
+        handshake_timeout: Duration::from_secs(60),
         authentication: None,
     }
 }
@@ -1052,6 +1053,7 @@ mod tests {
                     max_clients: 4,
                     encodings: None,
                     client_timeout: Duration::ZERO,
+                    handshake_timeout: Duration::from_secs(60),
                     authentication: None,
                 },
                 &server_shutdown,
@@ -1304,6 +1306,7 @@ mod tests {
                 max_clients: 4,
                 encodings: None,
                 client_timeout: Duration::ZERO,
+                handshake_timeout: Duration::from_secs(60),
                 authentication: Some(Arc::new(AuthenticationConfig::Vnc {
                     password: b"password".to_vec(),
                 })),
@@ -1379,6 +1382,7 @@ mod tests {
                     max_clients: 4,
                     encodings: None,
                     client_timeout: Duration::ZERO,
+                    handshake_timeout: Duration::from_secs(60),
                     authentication: None,
                 },
                 &server_shutdown,
@@ -1462,6 +1466,7 @@ mod tests {
                 clipboard_enabled: false,
                 max_clients: 4,
                 client_timeout: Duration::from_secs(1),
+                handshake_timeout: Duration::from_secs(60),
                 encodings: None,
                 authentication: None,
             };

@@ -179,6 +179,7 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
             clipboard_enabled,
             max_clients: config.max_clients,
             client_timeout: Duration::from_secs(config.client_timeout),
+            handshake_timeout: Duration::from_secs(config.handshake_timeout),
             encodings: config.encodings.clone(),
             authentication: Some(authentication),
         },

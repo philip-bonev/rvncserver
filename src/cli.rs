@@ -42,6 +42,9 @@ pub const DEFAULT_MAX_CLIENTS: usize = 4;
 /// Default client idle timeout in seconds; 0 disables it.
 pub const DEFAULT_CLIENT_TIMEOUT: u64 = 300;
 
+/// Default handshake timeout in seconds.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: u64 = 60;
+
 /// Largest accepted simultaneous RFB client limit.
 pub const MAX_CLIENTS_LIMIT: usize = 10;
 
@@ -113,6 +116,8 @@ pub struct Config {
     /// Disconnect clients with no messages and no pending update request
     /// after this many seconds; 0 disables the timeout.
     pub client_timeout: u64,
+    /// Authentication and initialization timeout in seconds.
+    pub handshake_timeout: u64,
     /// Optional allowlist of framebuffer encodings; Raw must be included.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// TLS server certificate PEM path.
@@ -229,6 +234,7 @@ struct FileConfig {
     enable_clipboard: Option<bool>,
     max_clients: Option<usize>,
     client_timeout: Option<u64>,
+    handshake_timeout: Option<u64>,
     encodings: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -260,6 +266,7 @@ where
     let mut enable_clipboard = false;
     let mut max_clients = DEFAULT_MAX_CLIENTS;
     let mut client_timeout = DEFAULT_CLIENT_TIMEOUT;
+    let mut handshake_timeout = DEFAULT_HANDSHAKE_TIMEOUT;
     let mut encodings = None;
     let mut tls_cert = None;
     let mut tls_key = None;
@@ -281,6 +288,7 @@ where
     let mut enable_clipboard_set = false;
     let mut max_clients_set = false;
     let mut client_timeout_set = false;
+    let mut handshake_timeout_set = false;
     let mut encodings_set = false;
     let mut tls_cert_set = false;
     let mut tls_key_set = false;
@@ -375,6 +383,23 @@ where
                         "client_timeout must be a non-negative integer of seconds",
                     )
                 })?;
+            }
+            "--handshake-timeout" => {
+                if handshake_timeout_set {
+                    return Err(CliError::DuplicateOption("--handshake-timeout"));
+                }
+                handshake_timeout_set = true;
+                let value = take_value(inline_value, &mut args, "--handshake-timeout")?;
+                handshake_timeout = value.parse::<u64>().map_err(|_| {
+                    CliError::IncompatibleOptions(
+                        "handshake_timeout must be an integer of at least 1 second",
+                    )
+                })?;
+                if handshake_timeout == 0 {
+                    return Err(CliError::IncompatibleOptions(
+                        "handshake_timeout must be an integer of at least 1 second",
+                    ));
+                }
             }
             "--capture-probe" => {
                 if capture_probe_set {
@@ -627,6 +652,16 @@ where
     if !client_timeout_set {
         client_timeout = file_config.client_timeout.unwrap_or(DEFAULT_CLIENT_TIMEOUT);
     }
+    if !handshake_timeout_set {
+        handshake_timeout = file_config
+            .handshake_timeout
+            .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT);
+        if handshake_timeout == 0 {
+            return Err(CliError::IncompatibleOptions(
+                "handshake_timeout must be at least 1 second",
+            ));
+        }
+    }
     if !(1..=MAX_CLIENTS_LIMIT).contains(&max_clients) {
         return Err(CliError::IncompatibleOptions(
             "max_clients must be between 1 and 10",
@@ -799,6 +834,7 @@ where
         enable_clipboard,
         max_clients,
         client_timeout,
+        handshake_timeout,
         encodings,
         tls_cert,
         tls_key,
@@ -963,6 +999,7 @@ Options:
   --max-clients <N>        Maximum simultaneous RFB clients (default: 4, max: 10)
   --client-timeout <SEC>   Disconnect clients idle this long (default: 300, 0 disables)
                            Idle means no messages and no pending update request
+  --handshake-timeout <SEC> Authentication and initialization timeout (default: 60)
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
   --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt modes
@@ -1080,6 +1117,14 @@ mod tests {
         assert_eq!(config(&["--client-timeout", "0"]).client_timeout, 0);
         assert_eq!(config(&[]).client_timeout, DEFAULT_CLIENT_TIMEOUT);
         assert!(parse(&["--client-timeout", "soon"]).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_handshake_timeout() {
+        assert_eq!(config(&["--handshake-timeout", "10"]).handshake_timeout, 10);
+        assert_eq!(config(&[]).handshake_timeout, DEFAULT_HANDSHAKE_TIMEOUT);
+        assert!(parse(&["--handshake-timeout", "0"]).is_err());
+        assert!(parse(&["--handshake-timeout", "soon"]).is_err());
     }
 
     #[test]
