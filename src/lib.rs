@@ -26,6 +26,7 @@
 pub mod capture;
 pub mod cli;
 pub mod clipboard;
+pub mod composite;
 pub mod cursor;
 pub mod error;
 pub mod framebuffer;

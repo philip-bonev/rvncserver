@@ -296,8 +296,10 @@ This captures one normalized frame and writes it as a binary PPM file.
   this subtype. Authentication attempts are
   rate-limited: five failures within a minute lock the peer out for five
   minutes.
-- Only the first stream advertised by the portal is used. Multi-monitor
-  selection is not implemented.
+- All monitor streams selected in the portal are composed into one
+  framebuffer at their logical desktop positions and served as a single
+  desktop. Gaps between monitors stay black. Pointer input is routed to
+  the monitor under the cursor.
 - Multiple clients share one input stream and one clipboard: the most recent
   keyboard or pointer event from any client wins, and clipboard updates are
   broadcast. There is no per-client input ownership or arbitration.

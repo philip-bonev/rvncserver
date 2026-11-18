@@ -35,7 +35,6 @@ use crate::input::{ClientEvent, latin1_to_utf8, utf8_to_latin1};
 use crate::rfb;
 
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(20);
-const FRAME_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Warn when a connected client has seen no new captured frames for this long.
 const CAPTURE_STALL_WARNING: Duration = Duration::from_secs(10);
 /// Rate limit for the capture-stall warning.
@@ -153,7 +152,7 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
     })?;
 
     let store = Arc::new(FrameStore::new());
-    store.publish(Arc::new(first_frame));
+    store.publish(first_frame);
     if config.enable_cursor {
         if let Some(cursor) = first_capture.cursor {
             store.publish_cursor(cursor);
@@ -191,7 +190,6 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
     on_started();
 
     let mut notify = capture.frame_notify();
-    let mut last_frame_error: Option<Instant> = None;
     let mut last_frame_seen = Instant::now();
     let mut last_stall_warning: Option<Instant> = None;
     // Startup transitions may still be queued after the first frame. Discard
@@ -200,32 +198,20 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
     let mut capture_lost = false;
 
     loop {
-        while let Some(video_frame) = capture.try_recv_frame() {
+        while let Some(update) = capture.try_recv_frame() {
             last_frame_seen = Instant::now();
             if config.enable_cursor
-                && let Some(cursor) = crate::cursor::CursorUpdate::from_video_frame(&video_frame)
+                && let Some(cursor) = update.cursor
             {
                 store.publish_cursor(cursor);
             }
 
-            // Publish every captured frame even while no client is connected.
-            // Capture is repaint-driven: discarding idle frames would freeze
+            // Publish every captured update even while no client is connected.
+            // Capture is repaint-driven: discarding idle updates would freeze
             // the store at the moment the previous client disconnected, and a
             // client connecting later could see that stale image indefinitely
             // while the screen stays static.
-            match Frame::from_video_frame(&video_frame) {
-                Ok(frame) => {
-                    store.publish(Arc::new(frame));
-                }
-                Err(error) => {
-                    let should_log = last_frame_error
-                        .is_none_or(|last| last.elapsed() >= FRAME_ERROR_LOG_INTERVAL);
-                    if should_log {
-                        crate::timestamped_log!("capture: skipping unusable frame: {error}");
-                        last_frame_error = Some(Instant::now());
-                    }
-                }
-            }
+            store.publish(update.frame);
         }
 
         // A connected client only sees new content when capture produces
@@ -334,11 +320,13 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
             // Discard the restarted stream's startup transitions for the same
             // reason as at initial startup.
             let _ = session.drain_state_events();
-            let mut first_frame = first.frame;
             // The restarted capture has no continuity with the old stream.
             // Force a full refresh so every client replaces its framebuffer.
-            first_frame.damage = FrameDamage::Full;
-            store.publish(Arc::new(first_frame));
+            let first_frame = Arc::new(Frame {
+                damage: FrameDamage::Full,
+                ..(*first.frame).clone()
+            });
+            store.publish(first_frame);
             if config.enable_cursor
                 && let Some(cursor) = first.cursor
             {
@@ -358,7 +346,6 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
             notify = session.frame_notify();
             capture = session;
             capture_lost = false;
-            last_frame_error = None;
             crate::timestamped_log!("capture: session reinitialized");
             continue;
         }

@@ -27,18 +27,17 @@ use std::time::Duration;
 
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::remote_desktop::DeviceType;
-use lamco_pipewire::{
-    PipeWireThreadCommand, PipeWireThreadManager, PwStreamState, StreamConfig, VideoFrame,
-};
+use lamco_pipewire::{PipeWireThreadCommand, PipeWireThreadManager, PwStreamState, StreamConfig};
 use lamco_portal::{
     ClipboardManager, PortalConfig, PortalError, PortalManager, PortalSessionHandle,
 };
 use tokio::sync::Notify;
 
 use crate::clipboard::portal::PortalClipboard;
+use crate::composite::{Composite, MonitorLayout, MonitorSpec};
 use crate::cursor::CursorUpdate;
 use crate::error::AppError;
-use crate::framebuffer::Frame;
+use crate::framebuffer::{Frame, FrameDamage};
 use crate::input::ClientEvent;
 
 /// RFB button bits held down between events: left, middle, right, and Back
@@ -91,15 +90,16 @@ pub struct CaptureSession {
     manager: PortalManager,
     clipboard: Option<Arc<ClipboardManager>>,
     pointer_buttons: u8,
-    stream_id: u32,
-    stream_size: (u32, u32),
+    layout: MonitorLayout,
+    composite: Composite,
+    frame_error_log: Option<std::time::Instant>,
 }
 
-/// Initial normalized frame and cursor metadata received with it, if any.
+/// A composited desktop update and the cursor metadata received with it.
 pub struct CapturedFrame {
-    /// Normalized desktop framebuffer.
-    pub frame: Frame,
-    /// Cursor state attached to the PipeWire buffer.
+    /// Composite framebuffer covering every captured monitor.
+    pub frame: Arc<Frame>,
+    /// Cursor state translated into composite coordinates.
     pub cursor: Option<CursorUpdate>,
 }
 
@@ -264,59 +264,73 @@ impl CaptureSession {
             }
         }
 
-        let stream = session.streams().first().ok_or_else(|| {
-            AppError::Capture("portal session did not provide a screen stream".to_string())
-        })?;
-
-        let stream_size = stream.size;
-        let node_id = stream.node_id;
-
-        if stream_size.0 == 0 || stream_size.1 == 0 {
-            return Err(AppError::Capture(format!(
-                "portal returned an empty stream size {}x{}",
-                stream_size.0, stream_size.1
-            )));
+        let streams = session.streams();
+        if streams.is_empty() {
+            return Err(AppError::Capture(
+                "portal session did not provide a screen stream".to_string(),
+            ));
         }
+        let monitors: Vec<MonitorSpec> = streams
+            .iter()
+            .map(|stream| (stream.node_id, stream.position, stream.size))
+            .collect();
+        for (node_id, _, (width, height)) in &monitors {
+            if *width == 0 || *height == 0 {
+                return Err(AppError::Capture(format!(
+                    "portal returned an empty stream size {width}x{height} for node {node_id}"
+                )));
+            }
+        }
+        let layout = MonitorLayout::from_monitors(&monitors).map_err(AppError::Capture)?;
+        let composite = Composite::new(layout.clone()).map_err(AppError::Capture)?;
 
         let pipewire_fd = session.pipewire_fd();
         let mut pipewire = PipeWireThreadManager::new(pipewire_fd)?;
 
-        let stream_config = StreamConfig::new("rvncserver")
-            .with_resolution(stream_size.0, stream_size.1)
-            .with_framerate(config.framerate)
-            .with_dmabuf(config.use_dmabuf)
-            .with_buffer_count(config.buffer_count);
-
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
-        if let Err(error) = pipewire.send_command(PipeWireThreadCommand::CreateStream {
-            stream_id: 0,
-            node_id,
-            config: stream_config,
-            response_tx,
-        }) {
-            let _ = pipewire.shutdown();
-            return Err(error.into());
-        }
-
-        match response_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        for (index, monitor) in monitors.iter().enumerate() {
+            let (node_id, _, size) = monitor;
+            let stream_config = StreamConfig::new("rvncserver")
+                .with_resolution(size.0, size.1)
+                .with_framerate(config.framerate)
+                .with_dmabuf(config.use_dmabuf)
+                .with_buffer_count(config.buffer_count);
+            let (response_tx, response_rx) = mpsc::sync_channel(1);
+            if let Err(error) = pipewire.send_command(PipeWireThreadCommand::CreateStream {
+                stream_id: index as u32,
+                node_id: *node_id,
+                config: stream_config,
+                response_tx,
+            }) {
                 let _ = pipewire.shutdown();
                 return Err(error.into());
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = pipewire.shutdown();
-                return Err(AppError::Capture(
-                    "timed out waiting for the PipeWire stream to be created".to_string(),
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = pipewire.shutdown();
-                return Err(AppError::Capture(
-                    "PipeWire thread exited while creating the stream".to_string(),
-                ));
+
+            match response_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = pipewire.shutdown();
+                    return Err(error.into());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = pipewire.shutdown();
+                    return Err(AppError::Capture(format!(
+                        "timed out waiting for PipeWire stream {index} to be created"
+                    )));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = pipewire.shutdown();
+                    return Err(AppError::Capture(
+                        "PipeWire thread exited while creating the stream".to_string(),
+                    ));
+                }
             }
         }
+
+        let (width, height) = layout.size();
+        crate::timestamped_log!(
+            "capture: composing {} monitor stream(s) into {width}x{height}",
+            monitors.len()
+        );
 
         Ok(Self {
             pipewire,
@@ -324,14 +338,91 @@ impl CaptureSession {
             manager,
             clipboard,
             pointer_buttons: 0,
-            stream_id: 0,
-            stream_size,
+            layout,
+            composite,
+            frame_error_log: None,
         })
     }
 
-    /// Receive a captured frame without blocking.
-    pub fn try_recv_frame(&self) -> Option<VideoFrame> {
-        self.pipewire.try_recv_frame()
+    /// Receive the next composited update without blocking.
+    ///
+    /// Every queued monitor frame is blitted into the composite before an
+    /// update is returned, so one update covers all monitors that changed.
+    /// With a single monitor the normalized frame is returned directly and no
+    /// composite copy is made.
+    pub fn try_recv_frame(&mut self) -> Option<CapturedFrame> {
+        let single = self.layout.monitors().len() == 1;
+        let mut cursor = None;
+        let mut damage = FrameDamage::Regions(Vec::new());
+        let mut composited = false;
+        let mut direct = None;
+        while let Some(video_frame) = self.pipewire.try_recv_frame() {
+            let monitor = match usize::try_from(video_frame.monitor_index)
+                .ok()
+                .filter(|index| *index < self.layout.monitors().len())
+            {
+                Some(monitor) => monitor,
+                None => continue,
+            };
+            let frame = match Frame::from_video_frame(&video_frame) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.log_frame_error(&error.to_string());
+                    continue;
+                }
+            };
+            if let Some(update) = CursorUpdate::from_video_frame(&video_frame) {
+                cursor = Some(self.translate_cursor(monitor, update));
+            }
+            if single {
+                direct = Some(Arc::new(frame));
+                continue;
+            }
+            match self.composite.blit(monitor, &frame) {
+                Ok(monitor_damage) => {
+                    damage = combine_damage(damage, monitor_damage);
+                    composited = true;
+                }
+                Err(error) => self.log_frame_error(&error.to_string()),
+            }
+        }
+        if let Some(frame) = direct {
+            return Some(CapturedFrame { frame, cursor });
+        }
+        if !composited {
+            return None;
+        }
+        let (width, height) = self.layout.size();
+        Some(CapturedFrame {
+            frame: Arc::new(Frame {
+                width,
+                height,
+                data: self.composite.snapshot(),
+                damage,
+                source_sequence: None,
+            }),
+            cursor,
+        })
+    }
+
+    /// Translate monitor-local cursor metadata into composite coordinates.
+    fn translate_cursor(&self, monitor: usize, update: CursorUpdate) -> CursorUpdate {
+        CursorUpdate {
+            position: update
+                .position
+                .map(|position| self.layout.translate_point(monitor, position)),
+            shape: update.shape,
+        }
+    }
+
+    fn log_frame_error(&mut self, message: &str) {
+        if self
+            .frame_error_log
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            crate::timestamped_log!("capture: skipping unusable frame: {message}");
+            self.frame_error_log = Some(std::time::Instant::now());
+        }
     }
 
     /// Create a backend adapter for the active portal clipboard session.
@@ -350,11 +441,6 @@ impl CaptureSession {
     /// Drain pending PipeWire stream state changes.
     pub fn drain_state_events(&self) -> Vec<lamco_pipewire::StreamStateEvent> {
         self.pipewire.drain_state_events()
-    }
-
-    /// Size reported by the portal for the selected stream.
-    pub fn stream_size(&self) -> (u32, u32) {
-        self.stream_size
     }
 
     /// Forward an RFB event through the permission-controlled portal session.
@@ -400,21 +486,19 @@ impl CaptureSession {
                 }
             }
             ClientEvent::Pointer { x, y, buttons } => {
-                let stream = self.session.streams.first().ok_or_else(|| {
-                    AppError::Capture("portal session has no input target stream".to_string())
-                })?;
-                let x =
-                    x.min(u16::try_from(self.stream_size.0.saturating_sub(1)).unwrap_or(u16::MAX));
-                let y =
-                    y.min(u16::try_from(self.stream_size.1.saturating_sub(1)).unwrap_or(u16::MAX));
+                // Composite coordinates are routed to the owning monitor and
+                // converted to that monitor's stream coordinates.
+                let (monitor, (local_x, local_y)) =
+                    self.layout.route_pointer(i32::from(x), i32::from(y));
+                let node_id = self.layout.monitors()[monitor].node_id;
                 let old_buttons = self.pointer_buttons;
                 self.manager
                     .remote_desktop()
                     .notify_pointer_motion_absolute(
                         self.session.ashpd_session(),
-                        stream.node_id,
-                        f64::from(x),
-                        f64::from(y),
+                        node_id,
+                        f64::from(local_x),
+                        f64::from(local_y),
                     )
                     .await?;
 
@@ -472,45 +556,32 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// Wait for the first usable frame, normalizing it before returning.
+    /// Wait for the first usable composited update.
     ///
-    /// Frames that cannot be normalized are skipped and reported at a bounded
+    /// Updates that cannot be produced are skipped and reported at a bounded
     /// rate. This is used both by the server startup path and by the capture
     /// probe.
     pub async fn wait_for_first_frame(
-        &self,
+        &mut self,
         timeout: Duration,
         capture_cursor: bool,
     ) -> Result<CapturedFrame, AppError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let notify = self.pipewire.frame_notify();
-        let mut last_error_log = std::time::Instant::now();
 
         loop {
-            while let Some(video_frame) = self.pipewire.try_recv_frame() {
-                let cursor = capture_cursor
-                    .then(|| CursorUpdate::from_video_frame(&video_frame))
-                    .flatten();
-                let buffer_type = match video_frame.meta.buffer_type {
-                    1 => "MemPtr",
-                    2 => "MemFd",
-                    3 => "DMA-BUF",
-                    _ => "unknown",
-                };
-                match Frame::from_video_frame(&video_frame) {
-                    Ok(frame) => {
-                        crate::timestamped_log!(
-                            "capture: first usable PipeWire buffer type: {buffer_type}"
-                        );
-                        return Ok(CapturedFrame { frame, cursor });
-                    }
-                    Err(error) => {
-                        if last_error_log.elapsed() >= Duration::from_secs(5) {
-                            crate::timestamped_log!("capture: skipping unusable frame: {error}");
-                            last_error_log = std::time::Instant::now();
-                        }
-                    }
-                }
+            if let Some(update) = self.try_recv_frame() {
+                let (width, height) = self.layout.size();
+                crate::timestamped_log!(
+                    "capture: first usable update at {}x{} from {} monitor stream(s)",
+                    width,
+                    height,
+                    self.layout.monitors().len()
+                );
+                return Ok(CapturedFrame {
+                    frame: update.frame,
+                    cursor: if capture_cursor { update.cursor } else { None },
+                });
             }
 
             for event in self.pipewire.drain_state_events() {
@@ -546,26 +617,30 @@ impl CaptureSession {
 
     /// Stop the PipeWire stream and join the capture thread.
     pub fn shutdown(&mut self) {
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
-        match self
-            .pipewire
-            .send_command(PipeWireThreadCommand::DestroyStream {
-                stream_id: self.stream_id,
-                response_tx,
-            }) {
-            Ok(()) => match response_rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    crate::timestamped_log!("capture: stream destruction failed: {error}");
-                }
+        for index in 0..self.layout.monitors().len() {
+            let (response_tx, response_rx) = mpsc::sync_channel(1);
+            match self
+                .pipewire
+                .send_command(PipeWireThreadCommand::DestroyStream {
+                    stream_id: index as u32,
+                    response_tx,
+                }) {
+                Ok(()) => match response_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        crate::timestamped_log!("capture: stream destruction failed: {error}");
+                    }
+                    Err(error) => {
+                        crate::timestamped_log!(
+                            "capture: stream destruction did not complete: {error}"
+                        );
+                    }
+                },
                 Err(error) => {
                     crate::timestamped_log!(
-                        "capture: stream destruction did not complete: {error}"
+                        "capture: could not request stream destruction: {error}"
                     );
                 }
-            },
-            Err(error) => {
-                crate::timestamped_log!("capture: could not request stream destruction: {error}");
             }
         }
 
@@ -667,6 +742,17 @@ fn remove_restore_token(path: &Path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             crate::timestamped_log!("capture: could not remove stale portal restore token: {error}")
+        }
+    }
+}
+
+/// Merge the damage of coalesced monitor updates into one composite damage.
+fn combine_damage(left: FrameDamage, right: FrameDamage) -> FrameDamage {
+    match (left, right) {
+        (FrameDamage::Full, _) | (_, FrameDamage::Full) => FrameDamage::Full,
+        (FrameDamage::Regions(mut left), FrameDamage::Regions(right)) => {
+            left.extend(right);
+            FrameDamage::Regions(left)
         }
     }
 }
