@@ -701,6 +701,7 @@ fn active_config_json(config: &Config) -> io::Result<String> {
         "enable_cursor": config.enable_cursor,
         "enable_clipboard": config.enable_clipboard,
         "max_clients": config.max_clients,
+        "client_timeout": config.client_timeout,
         "encodings": encodings,
         "auth_mode": auth_mode,
         "tls_cert": path_value(config.tls_cert.as_deref()),

@@ -39,6 +39,9 @@ pub const DEFAULT_LOG_MAX_SIZE: u64 = 50 * 1024 * 1024;
 /// Default number of simultaneous RFB clients.
 pub const DEFAULT_MAX_CLIENTS: usize = 4;
 
+/// Default client idle timeout in seconds; 0 disables it.
+pub const DEFAULT_CLIENT_TIMEOUT: u64 = 300;
+
 /// Largest accepted simultaneous RFB client limit.
 pub const MAX_CLIENTS_LIMIT: usize = 10;
 
@@ -107,6 +110,9 @@ pub struct Config {
     pub enable_clipboard: bool,
     /// Maximum number of simultaneous RFB clients.
     pub max_clients: usize,
+    /// Disconnect clients with no messages and no pending update request
+    /// after this many seconds; 0 disables the timeout.
+    pub client_timeout: u64,
     /// Optional allowlist of framebuffer encodings; Raw must be included.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// TLS server certificate PEM path.
@@ -222,6 +228,7 @@ struct FileConfig {
     enable_cursor: Option<bool>,
     enable_clipboard: Option<bool>,
     max_clients: Option<usize>,
+    client_timeout: Option<u64>,
     encodings: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -252,6 +259,7 @@ where
     let mut enable_cursor = false;
     let mut enable_clipboard = false;
     let mut max_clients = DEFAULT_MAX_CLIENTS;
+    let mut client_timeout = DEFAULT_CLIENT_TIMEOUT;
     let mut encodings = None;
     let mut tls_cert = None;
     let mut tls_key = None;
@@ -272,6 +280,7 @@ where
     let mut enable_cursor_set = false;
     let mut enable_clipboard_set = false;
     let mut max_clients_set = false;
+    let mut client_timeout_set = false;
     let mut encodings_set = false;
     let mut tls_cert_set = false;
     let mut tls_key_set = false;
@@ -353,6 +362,18 @@ where
                 let value = take_value(inline_value, &mut args, "--max-clients")?;
                 max_clients = value.parse::<usize>().map_err(|_| {
                     CliError::IncompatibleOptions("max_clients must be an integer between 1 and 10")
+                })?;
+            }
+            "--client-timeout" => {
+                if client_timeout_set {
+                    return Err(CliError::DuplicateOption("--client-timeout"));
+                }
+                client_timeout_set = true;
+                let value = take_value(inline_value, &mut args, "--client-timeout")?;
+                client_timeout = value.parse::<u64>().map_err(|_| {
+                    CliError::IncompatibleOptions(
+                        "client_timeout must be a non-negative integer of seconds",
+                    )
                 })?;
             }
             "--capture-probe" => {
@@ -603,6 +624,9 @@ where
     if !max_clients_set {
         max_clients = file_config.max_clients.unwrap_or(DEFAULT_MAX_CLIENTS);
     }
+    if !client_timeout_set {
+        client_timeout = file_config.client_timeout.unwrap_or(DEFAULT_CLIENT_TIMEOUT);
+    }
     if !(1..=MAX_CLIENTS_LIMIT).contains(&max_clients) {
         return Err(CliError::IncompatibleOptions(
             "max_clients must be between 1 and 10",
@@ -774,6 +798,7 @@ where
         enable_cursor,
         enable_clipboard,
         max_clients,
+        client_timeout,
         encodings,
         tls_cert,
         tls_key,
@@ -936,6 +961,8 @@ Options:
   --listen <ADDRESS>       IP address to bind (default: 127.0.0.1)
   --port <PORT>            TCP port to bind (default: 5900)
   --max-clients <N>        Maximum simultaneous RFB clients (default: 4, max: 10)
+  --client-timeout <SEC>   Disconnect clients idle this long (default: 300, 0 disables)
+                           Idle means no messages and no pending update request
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
   --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt modes
@@ -1045,6 +1072,14 @@ mod tests {
         assert!(parse(&["--max-clients", "11"]).is_err());
         assert!(parse(&["--max-clients", "many"]).is_err());
         assert!(parse(&["--max-clients", "2", "--max-clients", "3"]).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_client_timeout() {
+        assert_eq!(config(&["--client-timeout", "60"]).client_timeout, 60);
+        assert_eq!(config(&["--client-timeout", "0"]).client_timeout, 0);
+        assert_eq!(config(&[]).client_timeout, DEFAULT_CLIENT_TIMEOUT);
+        assert!(parse(&["--client-timeout", "soon"]).is_err());
     }
 
     #[test]

@@ -178,6 +178,7 @@ pub async fn run(config: Config, on_started: &dyn Fn()) -> Result<(), AppError> 
             cursor_enabled: config.enable_cursor,
             clipboard_enabled,
             max_clients: config.max_clients,
+            client_timeout: Duration::from_secs(config.client_timeout),
             encodings: config.encodings.clone(),
             authentication: Some(authentication),
         },

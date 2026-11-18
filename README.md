@@ -305,8 +305,11 @@ This captures one normalized frame and writes it as a binary PPM file.
   existing clients.
 - Connections above `max_clients` are rejected with an RFB failure reason
   during security negotiation.
-- Authenticated clients have no idle timeout. Dead peers are detected through
-  TCP keepalive (60 seconds idle, then three probes at 10-second intervals).
+- Clients idle for longer than `--client-timeout` (default 300 seconds, 0
+  disables) are disconnected. Idle means no client messages and no pending
+  update request, so quiet viewers of a static screen are kept. Dead peers
+  are also detected through TCP keepalive (60 seconds idle, then three
+  probes at 10-second intervals).
 - The authentication and initialization phase has a fixed 60-second timeout;
   it is not configurable.
 - With `--enable-cursor`, clients without cursor pseudo-encodings get

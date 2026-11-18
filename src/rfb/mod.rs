@@ -102,6 +102,9 @@ pub struct RfbConfig {
     pub clipboard_enabled: bool,
     /// Maximum number of simultaneous clients.
     pub max_clients: usize,
+    /// Disconnect clients with no messages and no pending update request
+    /// after this duration; zero disables the timeout.
+    pub client_timeout: Duration,
     /// Optional allowlist; Raw remains a required fallback.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// Optional TLS/VeNCrypt authentication settings.
@@ -225,6 +228,7 @@ fn handle_client(
         sent_cursor_position_sequence: 0,
         drawn_cursor: None,
     };
+    let mut last_client_message = Instant::now();
     let mut keyboard_input_warned = false;
     let mut pointer_input_warned = false;
     let mut received_button_mask = 0u8;
@@ -253,8 +257,22 @@ fn handle_client(
         }
 
         let Some(message_type) = read_message_type(&mut stream, shutdown, clipboard_rx)? else {
+            // A healthy viewer always keeps an incremental request pending,
+            // so "no messages and nothing pending" means the client has
+            // stopped using the session or is gone.
+            if config.client_timeout != Duration::ZERO
+                && update_state.pending_update.is_none()
+                && last_client_message.elapsed() >= config.client_timeout
+            {
+                crate::timestamped_log!(
+                    "rfb: disconnecting a client idle for {} seconds",
+                    config.client_timeout.as_secs()
+                );
+                return Ok(());
+            }
             continue;
         };
+        last_client_message = Instant::now();
         match message_type {
             0 => {
                 update_state.pixel_format = handle_set_pixel_format(&mut stream, shutdown)?;
@@ -987,6 +1005,7 @@ pub(crate) fn test_rfb_config(max_clients: usize) -> RfbConfig {
         clipboard_enabled: false,
         max_clients,
         encodings: None,
+        client_timeout: Duration::ZERO,
         authentication: None,
     }
 }
@@ -1032,6 +1051,7 @@ mod tests {
                     clipboard_enabled: true,
                     max_clients: 4,
                     encodings: None,
+                    client_timeout: Duration::ZERO,
                     authentication: None,
                 },
                 &server_shutdown,
@@ -1283,6 +1303,7 @@ mod tests {
                 clipboard_enabled: false,
                 max_clients: 4,
                 encodings: None,
+                client_timeout: Duration::ZERO,
                 authentication: Some(Arc::new(AuthenticationConfig::Vnc {
                     password: b"password".to_vec(),
                 })),
@@ -1357,6 +1378,7 @@ mod tests {
                     clipboard_enabled: false,
                     max_clients: 4,
                     encodings: None,
+                    client_timeout: Duration::ZERO,
                     authentication: None,
                 },
                 &server_shutdown,
@@ -1415,6 +1437,80 @@ mod tests {
         assert_eq!(u32::from_be_bytes(message[4..8].try_into().unwrap()), 5);
         assert_eq!(&message[8..], b"hello");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn idle_clients_without_a_pending_request_are_disconnected() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let store = Arc::new(FrameStore::new());
+        store.publish(Arc::new(Frame::new(1, 1, vec![0; 4]).unwrap()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_store = Arc::clone(&store);
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            let (_clipboard_tx, mut clipboard_rx) = tokio::sync::broadcast::channel(1);
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+            let config = RfbConfig {
+                width: 1,
+                height: 1,
+                name: "test".to_string(),
+                input_enabled: false,
+                cursor_enabled: false,
+                clipboard_enabled: false,
+                max_clients: 4,
+                client_timeout: Duration::from_secs(1),
+                encodings: None,
+                authentication: None,
+            };
+            handle_client(
+                stream,
+                &server_store,
+                &config,
+                &server_shutdown,
+                Some(&input_tx),
+                &mut clipboard_rx,
+                None,
+                &AuthLimiter::new(),
+            )
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut version = [0u8; 12];
+        client.read_exact(&mut version).unwrap();
+        client.write_all(RFB_VERSION).unwrap();
+        let mut security_types = [0u8; 2];
+        client.read_exact(&mut security_types).unwrap();
+        client.write_all(&[SECURITY_TYPE_NONE as u8]).unwrap();
+        let mut security_result = [0u8; 4];
+        client.read_exact(&mut security_result).unwrap();
+        client.write_all(&[1]).unwrap();
+        let mut server_init = [0u8; 24];
+        client.read_exact(&mut server_init).unwrap();
+        let mut name = [0u8; 4];
+        client.read_exact(&mut name).unwrap();
+
+        // One non-incremental request; its answer leaves no pending update.
+        let mut request = vec![3u8, 0];
+        for value in [0u16, 0, 1, 1] {
+            request.extend_from_slice(&value.to_be_bytes());
+        }
+        client.write_all(&request).unwrap();
+        let mut header = [0u8; 16];
+        client.read_exact(&mut header).unwrap();
+        let mut pixel = [0u8; 4];
+        client.read_exact(&mut pixel).unwrap();
+
+        // With no messages and no pending request the server must close the
+        // connection once the idle timeout expires.
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        server.join().unwrap().unwrap();
     }
 
     #[test]
