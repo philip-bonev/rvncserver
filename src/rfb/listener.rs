@@ -101,6 +101,12 @@ fn run_listener(
                         current,
                         config.max_clients
                     );
+                    crate::rfb::reject_client(
+                        stream,
+                        address,
+                        "too many connected clients",
+                        &shutdown,
+                    );
                     continue;
                 }
                 let guard = ActiveClientGuard(Arc::clone(&active_clients));
@@ -359,18 +365,24 @@ mod tests {
         second
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut byte = [0u8; 1];
-        match second.read(&mut byte) {
-            Ok(0) => {}
-            Ok(read) => panic!("rejected client unexpectedly received {read} bytes"),
-            Err(error) => assert!(
-                matches!(
-                    error.kind(),
-                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-                ),
-                "unexpected rejection error: {error}"
-            ),
-        }
+        // The rejection follows the protocol: version exchange first, then a
+        // failure security negotiation with a human-readable reason.
+        let mut version = [0u8; 12];
+        second.read_exact(&mut version).unwrap();
+        assert_eq!(&version, RFB_VERSION);
+        second.write_all(RFB_VERSION).unwrap();
+        let mut security_types = [0u8; 1];
+        second.read_exact(&mut security_types).unwrap();
+        assert_eq!(security_types[0], 0, "zero security types means failure");
+        let mut length = [0u8; 4];
+        second.read_exact(&mut length).unwrap();
+        let mut reason = vec![0u8; u32::from_be_bytes(length) as usize];
+        second.read_exact(&mut reason).unwrap();
+        assert!(
+            String::from_utf8_lossy(&reason).contains("too many"),
+            "unexpected reason: {}",
+            String::from_utf8_lossy(&reason)
+        );
 
         drop(first);
         shutdown.store(true, Ordering::Release);

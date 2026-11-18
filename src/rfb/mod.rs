@@ -465,6 +465,75 @@ fn write_server_init(
     Ok(())
 }
 
+/// Reject a connection with a protocol-level failure reason instead of
+/// closing it silently: the version exchange is followed by the
+/// specification's "connection failed" security negotiation.
+pub(super) fn reject_client(
+    mut stream: TcpStream,
+    address: std::net::SocketAddr,
+    reason: &str,
+    shutdown: &AtomicBool,
+) {
+    let result = reject_client_inner(&mut stream, reason, shutdown);
+    if let Err(error) = result {
+        crate::timestamped_log!("rfb: could not explain the rejection to {address}: {error}");
+    }
+}
+
+fn reject_client_inner(
+    stream: &mut TcpStream,
+    reason: &str,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
+    write_all_interruptible(stream, RFB_VERSION, shutdown)?;
+    // A broken or silent client must not stall the listener, so the version
+    // read has its own deadline instead of the interruptible retry loop.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut version = [0u8; 12];
+    let mut offset = 0;
+    while offset < version.len() {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(shutdown_error());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client did not send its version",
+            ));
+        }
+        match stream.read(&mut version[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client disconnected",
+                ));
+            }
+            Ok(read) => offset += read,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let version = parse_client_version(&version)?;
+    let reason = reason.as_bytes();
+    let reason_len = u32::try_from(reason.len()).map_err(|_| invalid_data("reason too long"))?;
+    match version {
+        RfbVersion::V3_3 => {
+            // Security-type 0 means the connection failed.
+            write_all_interruptible(stream, &0u32.to_be_bytes(), shutdown)?;
+            write_all_interruptible(stream, &reason_len.to_be_bytes(), shutdown)?;
+        }
+        RfbVersion::V3_8 | RfbVersion::Apple3_889 => {
+            // Zero security types followed by the failure reason.
+            write_all_interruptible(stream, &[0], shutdown)?;
+            write_all_interruptible(stream, &reason_len.to_be_bytes(), shutdown)?;
+        }
+    }
+    write_all_interruptible(stream, reason, shutdown)
+}
+
 fn handle_set_pixel_format(
     stream: &mut (impl Read + Write),
     shutdown: &AtomicBool,

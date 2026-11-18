@@ -301,8 +301,8 @@ This captures one normalized frame and writes it as a binary PPM file.
   broadcast. There is no per-client input ownership or arbitration.
 - The RFB ClientInit shared flag is ignored; new clients never disconnect
   existing clients.
-- Connections above `max_clients` are dropped before RFB negotiation; clients
-  see a closed connection rather than a protocol error.
+- Connections above `max_clients` are rejected with an RFB failure reason
+  during security negotiation.
 - Authenticated clients have no idle timeout. Dead peers are detected through
   TCP keepalive (60 seconds idle, then three probes at 10-second intervals).
 - The authentication and initialization phase has a fixed 60-second timeout;
