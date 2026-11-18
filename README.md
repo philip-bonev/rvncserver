@@ -372,14 +372,18 @@ This captures one normalized frame and writes it as a binary PPM file.
 
 ## Tested environments
 
+- Server: COSMIC desktop (latest release as of November 2026) on Pop!_OS 24.04
+  LTS (noble), with `xdg-desktop-portal-cosmic` (PipeWire 1.6.8 at the first
+  verification). COSMIC rejects application-scoped persistence; the
+  non-persistent fallback works.
 - macOS Screen Sharing is the primary test client. Framebuffer updates,
   keyboard and pointer input (including modifiers and special keys), and
   connection handling were exercised through it — including sustained
   day-to-day development done over the VNC session itself.
-- COSMIC Wayland session on Pop!_OS, with `xdg-desktop-portal-cosmic`,
-  PipeWire 1.6.8, and a 1920x1080 output. Capture and a full 1920x1080 Raw
-  framebuffer update were verified with a local RFB protocol client. COSMIC
-  rejects application-scoped persistence; the non-persistent fallback works.
+- Steam with several games was played through the session, exercising
+  full-motion content and keyboard input under load. Capture and a full
+  1920x1080 Raw framebuffer update were also verified with a local RFB
+  protocol client.
 - GNOME, KDE Plasma, Sway, and Hyprland have not been tested yet.
 - Multi-monitor composition and live desktop resizing are implemented and
   unit-tested but not yet verified against a live multi-monitor session.
