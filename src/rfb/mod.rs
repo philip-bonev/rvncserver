@@ -53,7 +53,7 @@ use encoding::{
 };
 use pixel::{PixelFormat, server_pixel_format};
 use security::{
-    SECURITY_TYPE_NONE, negotiate_apple_dh, negotiate_vencrypt, negotiate_vnc_auth,
+    AuthLimiter, SECURITY_TYPE_NONE, negotiate_apple_dh, negotiate_vencrypt, negotiate_vnc_auth,
     negotiate_vnc_tls_with_fallback,
 };
 
@@ -138,6 +138,9 @@ impl Write for ClientStream {
     }
 }
 
+// The parameters are the per-client session context, gathered from the
+// listener; a wrapper struct would only obscure them.
+#[allow(clippy::too_many_arguments)]
 fn handle_client(
     stream: TcpStream,
     store: &FrameStore,
@@ -146,6 +149,7 @@ fn handle_client(
     input_tx: Option<&tokio::sync::mpsc::Sender<ClientEvent>>,
     clipboard_rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
     handshake_done: Option<&std::sync::mpsc::Sender<()>>,
+    auth_limiter: &AuthLimiter,
 ) -> io::Result<()> {
     let mut tcp_stream = stream;
     let apple_auth = matches!(
@@ -166,63 +170,27 @@ fn handle_client(
     read_exact_interruptible(&mut tcp_stream, &mut version, shutdown)?;
     let version = parse_client_version(&version)?;
 
-    let mut stream = match config.authentication.as_deref() {
-        Some(AuthenticationConfig::VeNCrypt {
-            tls,
-            username,
-            password,
-        }) => {
-            if version != RfbVersion::V3_8 {
-                return Err(invalid_data("VeNCrypt authentication requires RFB 3.8"));
+    let peer = tcp_stream.peer_addr().ok().map(|address| address.ip());
+    if config.authentication.is_some()
+        && let Some(ip) = peer
+        && auth_limiter.is_blocked(ip)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "too many failed authentication attempts",
+        ));
+    }
+    let authentication = negotiate_authentication(tcp_stream, version, config, shutdown);
+    if let Some(ip) = peer {
+        match &authentication {
+            Ok(_) => auth_limiter.succeeded(ip),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                auth_limiter.failed(ip);
             }
-            negotiate_vencrypt(tcp_stream, tls, username, password, shutdown)?
+            Err(_) => {}
         }
-        Some(AuthenticationConfig::Vnc { password }) => {
-            negotiate_vnc_auth(&mut tcp_stream, version, password, true, shutdown)?;
-            ClientStream::Plain(tcp_stream)
-        }
-        Some(AuthenticationConfig::VncTls { tls, password }) => {
-            negotiate_vnc_tls_with_fallback(tcp_stream, version, tls, password, shutdown)?
-        }
-        Some(AuthenticationConfig::AppleDh { username, password }) => {
-            if version != RfbVersion::Apple3_889 {
-                return Err(invalid_data("Apple DH authentication requires RFB 3.889"));
-            }
-            negotiate_apple_dh(&mut tcp_stream, username, password, shutdown)?;
-            ClientStream::Plain(tcp_stream)
-        }
-        None => {
-            match version {
-                RfbVersion::V3_3 => {
-                    write_all_interruptible(
-                        &mut tcp_stream,
-                        &SECURITY_TYPE_NONE.to_be_bytes(),
-                        shutdown,
-                    )?;
-                }
-                RfbVersion::V3_8 => {
-                    write_all_interruptible(
-                        &mut tcp_stream,
-                        &[1, SECURITY_TYPE_NONE as u8],
-                        shutdown,
-                    )?;
-                    let security_type = read_u8(&mut tcp_stream, shutdown)?;
-                    if u32::from(security_type) != SECURITY_TYPE_NONE {
-                        return Err(invalid_data(format!(
-                            "client selected unsupported security type {security_type}"
-                        )));
-                    }
-                    write_all_interruptible(&mut tcp_stream, &0u32.to_be_bytes(), shutdown)?;
-                }
-                RfbVersion::Apple3_889 => {
-                    return Err(invalid_data(
-                        "Apple RFB 3.889 requires Apple DH authentication",
-                    ));
-                }
-            }
-            ClientStream::Plain(tcp_stream)
-        }
-    };
+    }
+    let mut stream = authentication?;
 
     // ClientInit: shared flag. Clients are always served concurrently, so the
     // flag does not disconnect existing clients.
@@ -464,6 +432,73 @@ fn write_server_init(
     write_all_interruptible(stream, &name_len.to_be_bytes(), shutdown)?;
     write_all_interruptible(stream, name_bytes, shutdown)?;
     Ok(())
+}
+
+/// Perform the security negotiation for `config` and return the session
+/// transport.
+fn negotiate_authentication(
+    mut tcp_stream: TcpStream,
+    version: RfbVersion,
+    config: &RfbConfig,
+    shutdown: &AtomicBool,
+) -> io::Result<ClientStream> {
+    Ok(match config.authentication.as_deref() {
+        Some(AuthenticationConfig::VeNCrypt {
+            tls,
+            username,
+            password,
+        }) => {
+            if version != RfbVersion::V3_8 {
+                return Err(invalid_data("VeNCrypt authentication requires RFB 3.8"));
+            }
+            negotiate_vencrypt(tcp_stream, tls, username, password, shutdown)?
+        }
+        Some(AuthenticationConfig::Vnc { password }) => {
+            negotiate_vnc_auth(&mut tcp_stream, version, password, true, shutdown)?;
+            ClientStream::Plain(tcp_stream)
+        }
+        Some(AuthenticationConfig::VncTls { tls, password }) => {
+            negotiate_vnc_tls_with_fallback(tcp_stream, version, tls, password, shutdown)?
+        }
+        Some(AuthenticationConfig::AppleDh { username, password }) => {
+            if version != RfbVersion::Apple3_889 {
+                return Err(invalid_data("Apple DH authentication requires RFB 3.889"));
+            }
+            negotiate_apple_dh(&mut tcp_stream, username, password, shutdown)?;
+            ClientStream::Plain(tcp_stream)
+        }
+        None => {
+            match version {
+                RfbVersion::V3_3 => {
+                    write_all_interruptible(
+                        &mut tcp_stream,
+                        &SECURITY_TYPE_NONE.to_be_bytes(),
+                        shutdown,
+                    )?;
+                }
+                RfbVersion::V3_8 => {
+                    write_all_interruptible(
+                        &mut tcp_stream,
+                        &[1, SECURITY_TYPE_NONE as u8],
+                        shutdown,
+                    )?;
+                    let security_type = read_u8(&mut tcp_stream, shutdown)?;
+                    if u32::from(security_type) != SECURITY_TYPE_NONE {
+                        return Err(invalid_data(format!(
+                            "client selected unsupported security type {security_type}"
+                        )));
+                    }
+                    write_all_interruptible(&mut tcp_stream, &0u32.to_be_bytes(), shutdown)?;
+                }
+                RfbVersion::Apple3_889 => {
+                    return Err(invalid_data(
+                        "Apple RFB 3.889 requires Apple DH authentication",
+                    ));
+                }
+            }
+            ClientStream::Plain(tcp_stream)
+        }
+    })
 }
 
 /// Reject a connection with a protocol-level failure reason instead of
@@ -1003,6 +1038,7 @@ mod tests {
                 Some(&input_tx),
                 &mut clipboard_rx,
                 None,
+                &AuthLimiter::new(),
             );
         });
 
@@ -1259,6 +1295,7 @@ mod tests {
                 Some(&input_tx),
                 &mut clipboard_rx,
                 None,
+                &AuthLimiter::new(),
             )
         });
 
@@ -1326,6 +1363,7 @@ mod tests {
                 None,
                 &mut clipboard_rx,
                 None,
+                &AuthLimiter::new(),
             );
         });
 

@@ -25,7 +25,7 @@ use crate::framebuffer::FrameStore;
 use crate::input::ClientEvent;
 
 use super::{
-    HANDSHAKE_TIMEOUT, READ_POLL_INTERVAL, RfbConfig, WRITE_TIMEOUT, handle_client,
+    AuthLimiter, HANDSHAKE_TIMEOUT, READ_POLL_INTERVAL, RfbConfig, WRITE_TIMEOUT, handle_client,
     is_normal_disconnect,
 };
 
@@ -79,6 +79,7 @@ fn run_listener(
     clipboard_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
 ) {
     let active_clients = Arc::new(AtomicUsize::new(0));
+    let auth_limiter = Arc::new(AuthLimiter::new());
     let mut workers = Vec::new();
 
     while !shutdown.load(Ordering::Acquire) {
@@ -124,6 +125,7 @@ fn run_listener(
                 let store = Arc::clone(&store);
                 let config = Arc::clone(&config);
                 let shutdown = Arc::clone(&shutdown);
+                let auth_limiter = Arc::clone(&auth_limiter);
                 let input_tx = input_tx.clone();
                 let mut clipboard_rx = clipboard_tx.subscribe();
                 let worker =
@@ -151,6 +153,7 @@ fn run_listener(
                                     input_tx.as_ref(),
                                     &mut clipboard_rx,
                                     handshake_tx.as_ref(),
+                                    &auth_limiter,
                                 )
                             };
                             drop(handshake_tx);

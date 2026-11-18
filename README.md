@@ -293,7 +293,9 @@ This captures one normalized frame and writes it as a binary PPM file.
 - macOS Screen Sharing compatibility with VNC Authentication has not yet been
   verified against an actual Mac client.
 - VeNCrypt X509Plain client compatibility varies; use a client that supports
-  this subtype. Authentication attempts are not currently rate-limited.
+  this subtype. Authentication attempts are
+  rate-limited: five failures within a minute lock the peer out for five
+  minutes.
 - Only the first stream advertised by the portal is used. Multi-monitor
   selection is not implemented.
 - Multiple clients share one input stream and one clipboard: the most recent

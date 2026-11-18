@@ -14,11 +14,13 @@
 
 //! RFB security negotiation and authentication crypto.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::sync::Arc;
+use std::net::{IpAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aes::Aes128;
 use aes::cipher::{BlockCipherDecrypt, KeyInit as AesKeyInit};
@@ -34,6 +36,84 @@ use super::{
     invalid_data, read_exact_interruptible, read_u8, read_u32, shutdown_error,
     write_all_interruptible,
 };
+
+/// Per-peer bound on failed authentication attempts, to slow down online
+/// password guessing.
+pub(super) struct AuthLimiter {
+    peers: Mutex<HashMap<IpAddr, AuthAttempts>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthAttempts {
+    failures: u32,
+    window_start: Instant,
+    locked_until: Option<Instant>,
+}
+
+/// Failures allowed per window before the peer is locked out.
+const AUTH_FAILURE_LIMIT: u32 = 5;
+/// Length of the failure-counting window.
+const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// Lockout applied once the failure limit is reached.
+const AUTH_LOCKOUT: Duration = Duration::from_secs(300);
+/// Bound on tracked peers; stale entries are dropped past it.
+const MAX_TRACKED_PEERS: usize = 1024;
+
+impl AuthLimiter {
+    pub(super) fn new() -> Self {
+        Self {
+            peers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `peer` is locked out after repeated authentication failures.
+    pub(super) fn is_blocked(&self, peer: IpAddr) -> bool {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer)
+            .and_then(|attempts| attempts.locked_until)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Record a failed authentication attempt for `peer`.
+    pub(super) fn failed(&self, peer: IpAddr) {
+        let now = Instant::now();
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if peers.len() >= MAX_TRACKED_PEERS {
+            peers.retain(|_, attempts| {
+                attempts.locked_until.is_some_and(|until| until > now)
+                    || now.saturating_duration_since(attempts.window_start) < AUTH_FAILURE_WINDOW
+            });
+        }
+        let attempts = peers.entry(peer).or_insert(AuthAttempts {
+            failures: 0,
+            window_start: now,
+            locked_until: None,
+        });
+        if now.saturating_duration_since(attempts.window_start) >= AUTH_FAILURE_WINDOW {
+            attempts.failures = 0;
+            attempts.window_start = now;
+        }
+        attempts.failures += 1;
+        if attempts.failures >= AUTH_FAILURE_LIMIT {
+            attempts.locked_until = Some(now + AUTH_LOCKOUT);
+            attempts.failures = 0;
+            attempts.window_start = now;
+        }
+    }
+
+    /// Record a successful authentication for `peer`.
+    pub(super) fn succeeded(&self, peer: IpAddr) {
+        self.peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&peer);
+    }
+}
 
 pub(super) const SECURITY_TYPE_NONE: u32 = 1;
 
@@ -480,6 +560,29 @@ mod tests {
                 0x38, 0xe2,
             ]
         );
+    }
+
+    #[test]
+    fn auth_limiter_locks_out_repeated_failures() {
+        let limiter = AuthLimiter::new();
+        let peer = "203.0.113.5".parse().unwrap();
+        for _ in 0..AUTH_FAILURE_LIMIT - 1 {
+            limiter.failed(peer);
+            assert!(!limiter.is_blocked(peer));
+        }
+        limiter.failed(peer);
+        assert!(limiter.is_blocked(peer));
+        // A success clears the record for that peer.
+        limiter.succeeded(peer);
+        assert!(!limiter.is_blocked(peer));
+        // Other peers are unaffected.
+        let other = "203.0.113.6".parse().unwrap();
+        assert!(!limiter.is_blocked(other));
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            limiter.failed(other);
+        }
+        assert!(limiter.is_blocked(other));
+        assert!(!limiter.is_blocked(peer));
     }
 
     #[test]
