@@ -372,15 +372,14 @@ fn handle_client(
                     key_events = 0;
                     key_event_report = Instant::now();
                 }
-                if is_modifier_keysym(keysym) {
+                // Special (0xff00+) and control-range (< 0x20) keysyms carry
+                // no typed text, so their values are safe to log; doing so
+                // also exposes clients that send raw scan codes instead of
+                // keysyms.
+                if is_special_keysym(keysym) || is_control_range_keysym(keysym) {
                     crate::timestamped_log!(
-                        "rfb: received modifier keysym {keysym:#x} {}",
+                        "rfb: received non-printable keysym {keysym:#x} {}",
                         if down { "down" } else { "up" }
-                    );
-                }
-                if down && is_ascii_control_keysym(keysym) {
-                    crate::timestamped_log!(
-                        "rfb: received an ASCII control-character keysym (value redacted)"
                     );
                 }
                 if keysym > i32::MAX as u32 {
@@ -542,16 +541,16 @@ impl<'a> ClientInputGuard<'a> {
     }
 }
 
-fn is_modifier_keysym(keysym: u32) -> bool {
-    matches!(
-        keysym,
-        0xff7e // Mode_switch
-            | 0xff7f // Num_Lock
-            | 0xffe1..=0xffee // Shift, Control, Caps, Meta, Alt, Super, Hyper
-    )
+/// Special keysyms (0xff00-0xffff: modifiers, arrows, function keys, and
+/// editing keys) carry no typed text, so their values are safe to log when
+/// diagnosing input problems.
+fn is_special_keysym(keysym: u32) -> bool {
+    (0xff00..=0xffff).contains(&keysym)
 }
 
-fn is_ascii_control_keysym(keysym: u32) -> bool {
+/// Control-range values (C0 controls and Delete) are not typed text either;
+/// clients that send raw scan codes instead of keysyms land exactly here.
+fn is_control_range_keysym(keysym: u32) -> bool {
     keysym < 0x20 || keysym == 0x7f
 }
 
