@@ -164,14 +164,6 @@ fn special_keycode(keysym: u32) -> Option<i32> {
     })
 }
 
-/// Stateful modifiers whose press is idempotent, so injecting them through
-/// both the keycode and the keysym paths is harmless and keeps working on
-/// backends that support only one of the two. Every other key uses a single
-/// path to avoid double effects (two arrow steps, a lock toggled twice).
-fn is_stateful_modifier(keysym: u32) -> bool {
-    matches!(keysym, 0xffe1..=0xffe4 | 0xffe7..=0xffee | 0xfe03)
-}
-
 impl CaptureSession {
     /// Create a portal session and connect the first advertised screen stream
     /// to a PipeWire stream.
@@ -369,9 +361,12 @@ impl CaptureSession {
     pub async fn handle_client_event(&mut self, event: ClientEvent) -> Result<(), AppError> {
         match event {
             ClientEvent::Key { keysym, pressed } => {
-                // Special keysyms are silently ignored by some compositors,
-                // while the keycode path is reliable, so non-printable keys
-                // are injected as evdev keycodes first.
+                // Special keysyms are silently ignored by some compositors
+                // and can even cancel an already-held key there, while the
+                // keycode path is reliable. Non-printable keys are injected
+                // as evdev keycodes; the keysym path is used only as a
+                // fallback when the keycode path fails, never together with
+                // it.
                 let mut injected = false;
                 if let Some(keycode) = special_keycode(keysym) {
                     match self
@@ -386,12 +381,7 @@ impl CaptureSession {
                         ),
                     }
                 }
-                // Stateful modifiers are additionally injected through the
-                // keysym path: their duplicates are idempotent and this keeps
-                // working on backends that support only one of the two paths.
-                // Every other key uses the keysym path only when the keycode
-                // path failed, to avoid double effects like two arrow steps.
-                if is_stateful_modifier(keysym) || !injected {
+                if !injected {
                     match self
                         .manager
                         .remote_desktop()
@@ -405,11 +395,6 @@ impl CaptureSession {
                         .await
                     {
                         Ok(()) => {}
-                        Err(error) if injected => {
-                            crate::timestamped_log!(
-                                "input: portal rejected modifier keysym {keysym:#x} but its keycode worked: {error}"
-                            );
-                        }
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -728,14 +713,6 @@ mod tests {
         assert_eq!(special_keycode(0xff0d), Some(28)); // Return
         assert_eq!(special_keycode(0x72), None); // 'r'
         assert_eq!(special_keycode(0x41), None); // 'A'
-    }
-
-    #[test]
-    fn only_stateful_modifiers_use_both_injection_paths() {
-        assert!(is_stateful_modifier(0xffe3)); // Control_L
-        assert!(is_stateful_modifier(0xfe03)); // AltGr
-        assert!(!is_stateful_modifier(0xffe5)); // Caps_Lock would toggle twice
-        assert!(!is_stateful_modifier(0xff51)); // arrows would move twice
     }
 
     #[test]
