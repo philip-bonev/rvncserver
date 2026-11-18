@@ -257,7 +257,16 @@ pub(super) fn negotiate_vnc_auth(
     read_exact_interruptible(stream, &mut response, shutdown)?;
     let expected = vnc_auth_response(password, &challenge)?;
     let authenticated = constant_time_equal(&response, &expected);
-    write_auth_result(stream, authenticated, version == RfbVersion::V3_8, shutdown)
+    write_auth_result(stream, authenticated, version == RfbVersion::V3_8, shutdown)?;
+    if !authenticated {
+        // The session must not continue after a failed authentication, no
+        // matter what the client does next.
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VNC authentication failed",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn negotiate_apple_dh(
@@ -470,6 +479,49 @@ mod tests {
                 0xb8, 0x66, 0x92, 0x41, 0x25, 0xc8, 0xee, 0xbb, 0x9d, 0xeb, 0xc1, 0xdb, 0x61, 0xc5,
                 0x38, 0xe2,
             ]
+        );
+    }
+
+    #[test]
+    fn vnc_auth_rejects_a_wrong_password() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            configure_stream(&stream).unwrap();
+            negotiate_vnc_auth(
+                &mut stream,
+                RfbVersion::V3_8,
+                b"password",
+                true,
+                &AtomicBool::new(false),
+            )
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut security_types = [0u8; 2];
+        client.read_exact(&mut security_types).unwrap();
+        client.write_all(&[SECURITY_TYPE_VNC_AUTH]).unwrap();
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        client
+            .write_all(&vnc_auth_response(b"wrong", &challenge).unwrap())
+            .unwrap();
+        let mut result = [0u8; 4];
+        client.read_exact(&mut result).unwrap();
+        assert_ne!(
+            u32::from_be_bytes(result),
+            0,
+            "failed authentication must be reported"
+        );
+        let outcome = server.join().unwrap();
+        assert_eq!(
+            outcome.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the session must not continue after a failed authentication"
         );
     }
 
