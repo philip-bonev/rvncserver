@@ -109,6 +109,8 @@ pub struct RfbConfig {
     pub client_timeout: Duration,
     /// Authentication and initialization timeout.
     pub handshake_timeout: Duration,
+    /// Deflate compression level for Zlib and ZRLE (0-9).
+    pub compression_level: u32,
     /// Optional allowlist; Raw remains a required fallback.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// Optional TLS/VeNCrypt authentication settings.
@@ -221,8 +223,8 @@ fn handle_client(
         last_sequence: 0,
         pending_damage: Vec::new(),
         pending_update: None,
-        zrle_compressor: Compress::new(Compression::default(), true),
-        zlib_compressor: Compress::new(Compression::default(), true),
+        zrle_compressor: Compress::new(Compression::new(config.compression_level), true),
+        zlib_compressor: Compress::new(Compression::new(config.compression_level), true),
         client_pixels: None,
         cursor_enabled: config.cursor_enabled,
         rich_cursor_enabled: false,
@@ -1000,6 +1002,7 @@ pub(crate) fn test_rfb_config(max_clients: usize) -> RfbConfig {
         encodings: None,
         client_timeout: Duration::ZERO,
         handshake_timeout: Duration::from_secs(60),
+        compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
         authentication: None,
     }
 }
@@ -1047,6 +1050,7 @@ mod tests {
                     encodings: None,
                     client_timeout: Duration::ZERO,
                     handshake_timeout: Duration::from_secs(60),
+                    compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
                     authentication: None,
                 },
                 &server_shutdown,
@@ -1300,6 +1304,7 @@ mod tests {
                 encodings: None,
                 client_timeout: Duration::ZERO,
                 handshake_timeout: Duration::from_secs(60),
+                compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
                 authentication: Some(Arc::new(AuthenticationConfig::Vnc {
                     password: b"password".to_vec(),
                 })),
@@ -1376,6 +1381,7 @@ mod tests {
                     encodings: None,
                     client_timeout: Duration::ZERO,
                     handshake_timeout: Duration::from_secs(60),
+                    compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
                     authentication: None,
                 },
                 &server_shutdown,
@@ -1460,6 +1466,7 @@ mod tests {
                 max_clients: 4,
                 client_timeout: Duration::ZERO,
                 handshake_timeout: Duration::from_secs(60),
+                compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
                 encodings: None,
                 authentication: None,
             };
@@ -1559,6 +1566,7 @@ mod tests {
                 max_clients: 4,
                 client_timeout: Duration::ZERO,
                 handshake_timeout: Duration::from_secs(60),
+                compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
                 encodings: None,
                 authentication: None,
             };
@@ -1634,6 +1642,7 @@ mod tests {
                 max_clients: 4,
                 client_timeout: Duration::from_secs(1),
                 handshake_timeout: Duration::from_secs(60),
+                compression_level: crate::cli::DEFAULT_COMPRESSION_LEVEL,
                 encodings: None,
                 authentication: None,
             };

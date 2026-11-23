@@ -106,6 +106,13 @@ only to troubleshoot a client's compressed-image rendering:
 
 Supported names are `raw`, `hextile`, `zlib`, `zrle`, and `copyrect`.
 
+Zlib and ZRLE compress with a configurable deflate level:
+`--compression-level <0-9>` or `"compression_level"` in JSON (default 6,
+matching the underlying deflate library). Levels 1 to 3 are recommended for
+fast local networks: they encode several times faster at a slightly larger
+stream size. Level 0 stores the data uncompressed. Raw and Hextile are not
+affected by this setting.
+
 By default, settings are loaded from `$XDG_CONFIG_HOME/rvncserver/config.json`
 or `~/.config/rvncserver/config.json`. Pass `--config <PATH>` to select another
 file. Command-line options override values from JSON. Paths in the JSON file are
@@ -165,6 +172,7 @@ Example configuration:
   "max_clients": 4,
   "client_timeout": 300,
   "handshake_timeout": 60,
+  "compression_level": 6,
   "capture_probe": null,
   "enable_input": false,
   "enable_cursor": false,

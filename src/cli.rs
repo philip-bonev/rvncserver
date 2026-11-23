@@ -45,6 +45,10 @@ pub const DEFAULT_CLIENT_TIMEOUT: u64 = 300;
 /// Default handshake timeout in seconds.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: u64 = 60;
 
+/// Default deflate compression level for Zlib and ZRLE, matching the
+/// underlying deflate library.
+pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
+
 /// Largest accepted simultaneous RFB client limit.
 pub const MAX_CLIENTS_LIMIT: usize = 10;
 
@@ -118,6 +122,8 @@ pub struct Config {
     pub client_timeout: u64,
     /// Authentication and initialization timeout in seconds.
     pub handshake_timeout: u64,
+    /// Deflate compression level for Zlib and ZRLE (0-9).
+    pub compression_level: u32,
     /// Optional allowlist of framebuffer encodings; Raw must be included.
     pub encodings: Option<Vec<RfbEncoding>>,
     /// TLS server certificate PEM path.
@@ -235,6 +241,7 @@ struct FileConfig {
     max_clients: Option<usize>,
     client_timeout: Option<u64>,
     handshake_timeout: Option<u64>,
+    compression_level: Option<u32>,
     encodings: Option<Vec<String>>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -267,6 +274,7 @@ where
     let mut max_clients = DEFAULT_MAX_CLIENTS;
     let mut client_timeout = DEFAULT_CLIENT_TIMEOUT;
     let mut handshake_timeout = DEFAULT_HANDSHAKE_TIMEOUT;
+    let mut compression_level = DEFAULT_COMPRESSION_LEVEL;
     let mut encodings = None;
     let mut tls_cert = None;
     let mut tls_key = None;
@@ -289,6 +297,7 @@ where
     let mut max_clients_set = false;
     let mut client_timeout_set = false;
     let mut handshake_timeout_set = false;
+    let mut compression_level_set = false;
     let mut encodings_set = false;
     let mut tls_cert_set = false;
     let mut tls_key_set = false;
@@ -400,6 +409,18 @@ where
                         "handshake_timeout must be an integer of at least 1 second",
                     ));
                 }
+            }
+            "--compression-level" => {
+                if compression_level_set {
+                    return Err(CliError::DuplicateOption("--compression-level"));
+                }
+                compression_level_set = true;
+                let value = take_value(inline_value, &mut args, "--compression-level")?;
+                compression_level = value.parse::<u32>().map_err(|_| {
+                    CliError::IncompatibleOptions(
+                        "compression_level must be an integer between 0 and 9",
+                    )
+                })?;
             }
             "--capture-probe" => {
                 if capture_probe_set {
@@ -667,6 +688,16 @@ where
             "max_clients must be between 1 and 10",
         ));
     }
+    if !compression_level_set {
+        compression_level = file_config
+            .compression_level
+            .unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    }
+    if compression_level > 9 {
+        return Err(CliError::IncompatibleOptions(
+            "compression_level must be between 0 and 9",
+        ));
+    }
     if !encodings_set {
         encodings = file_config
             .encodings
@@ -835,6 +866,7 @@ where
         max_clients,
         client_timeout,
         handshake_timeout,
+        compression_level,
         encodings,
         tls_cert,
         tls_key,
@@ -1000,6 +1032,8 @@ Options:
   --client-timeout <SEC>   Disconnect clients idle this long (default: 300, 0 disables)
                            Idle means no messages and no pending update request
   --handshake-timeout <SEC> Authentication and initialization timeout (default: 60)
+  --compression-level <0-9> Zlib/ZRLE deflate level (default: 6)
+                            Level 1-3 is recommended for fast local networks
   --capture-probe <PATH>   Capture one frame to a PPM file and exit
   --config <PATH>          Load JSON settings (default: ~/.config/rvncserver/config.json)
   --tls-cert <PATH>        TLS server certificate PEM for VeNCrypt modes
@@ -1083,6 +1117,7 @@ mod tests {
         assert!(!config.enable_cursor);
         assert!(!config.enable_clipboard);
         assert_eq!(config.max_clients, 4);
+        assert_eq!(config.compression_level, 6);
         assert_eq!(config.encodings, None);
         assert!(config.tls_cert.is_none());
         assert!(config.tls_key.is_none());
@@ -1109,6 +1144,21 @@ mod tests {
         assert!(parse(&["--max-clients", "11"]).is_err());
         assert!(parse(&["--max-clients", "many"]).is_err());
         assert!(parse(&["--max-clients", "2", "--max-clients", "3"]).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_compression_level() {
+        assert_eq!(config(&["--compression-level", "1"]).compression_level, 1);
+        assert_eq!(config(&["--compression-level=0"]).compression_level, 0);
+        assert_eq!(config(&["--compression-level", "9"]).compression_level, 9);
+        assert_eq!(
+            parse(&["--compression-level", "10"]),
+            Err(CliError::IncompatibleOptions(
+                "compression_level must be between 0 and 9"
+            ))
+        );
+        assert!(parse(&["--compression-level", "fast"]).is_err());
+        assert!(parse(&["--compression-level", "3", "--compression-level", "4"]).is_err());
     }
 
     #[test]
@@ -1354,7 +1404,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_cursor":true,"enable_clipboard":true,"max_clients":2,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
+            r#"{"listen":"0.0.0.0","port":5901,"enable_input":true,"enable_cursor":true,"enable_clipboard":true,"max_clients":2,"compression_level":3,"auth_mode":"vnc","tls_cert":"cert.pem","tls_key":"key.pem","password_file":"credentials.txt","encodings":["raw","zrle"],"daemonize":true,"log_file":"rvncserver.log","log_max_size":"2MB","log_max_rotations":2}"#,
         )
         .unwrap();
         let path_argument = path.to_string_lossy().into_owned();
@@ -1365,6 +1415,11 @@ mod tests {
         assert!(loaded.enable_cursor);
         assert!(loaded.enable_clipboard);
         assert_eq!(loaded.max_clients, 2);
+        assert_eq!(loaded.compression_level, 3);
+        assert_eq!(
+            config(&["--config", &path_argument, "--compression-level", "7"]).compression_level,
+            7
+        );
         assert_eq!(
             config(&["--config", &path_argument, "--max-clients", "5"]).max_clients,
             5

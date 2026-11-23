@@ -703,6 +703,7 @@ fn active_config_json(config: &Config) -> io::Result<String> {
         "max_clients": config.max_clients,
         "client_timeout": config.client_timeout,
         "handshake_timeout": config.handshake_timeout,
+        "compression_level": config.compression_level,
         "encodings": encodings,
         "auth_mode": auth_mode,
         "tls_cert": path_value(config.tls_cert.as_deref()),
