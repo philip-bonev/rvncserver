@@ -72,7 +72,11 @@ const MAX_ENCODINGS: u16 = 1024;
 
 const MAX_CUT_TEXT: u32 = 1024 * 1024;
 
-const READ_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Socket read timeout for the client loop. Each timeout wakes the loop so a
+/// pending update can pick up new damage, so this bounds how late an update
+/// is delivered while the client sends no messages. Mid-message reads retry
+/// through the same timeout and are unaffected.
+const READ_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
