@@ -677,7 +677,10 @@ fn send_raw_rectangle(
         .and_then(|width| width.checked_mul(bytes_per_pixel))
         .ok_or_else(|| invalid_data("raw rectangle size overflows"))?;
     for y in rectangle.y..rectangle.y + rectangle.height {
-        if pixel_format == PixelFormat::DEFAULT && !view.has_cursor() {
+        // Layout-equivalent formats need no per-pixel encoding: the captured
+        // bytes are already the client's bytes. The nominal depth does not
+        // matter here, only the channel layout.
+        if pixel_format.matches_bgra_layout() && !view.has_cursor() {
             let start = (y as usize)
                 .checked_mul(view.frame.width as usize)
                 .and_then(|row| row.checked_add(rectangle.x as usize))
@@ -884,6 +887,31 @@ fn encode_rectangle_pixels(
     pixels.try_reserve_exact(capacity).map_err(|error| {
         io::Error::other(format!("could not allocate encoded rectangle: {error}"))
     })?;
+    if pixel_format.matches_bgra_layout() && !view.has_cursor() {
+        // Encoded pixels are the captured bytes unchanged, so whole rows can
+        // be copied instead of encoded pixel by pixel.
+        let row_bytes = usize::try_from(rectangle.width)
+            .ok()
+            .and_then(|width| width.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| invalid_data("encoded rectangle size overflows"))?;
+        for y in rectangle.y..rectangle.y + rectangle.height {
+            let start = (y as usize)
+                .checked_mul(view.frame.width as usize)
+                .and_then(|row| row.checked_add(rectangle.x as usize))
+                .and_then(|pixel| pixel.checked_mul(4))
+                .ok_or_else(|| invalid_data("encoded rectangle offset overflows"))?;
+            let end = start
+                .checked_add(row_bytes)
+                .ok_or_else(|| invalid_data("encoded rectangle offset overflows"))?;
+            let row = view
+                .frame
+                .data
+                .get(start..end)
+                .ok_or_else(|| invalid_data("encoded rectangle is outside the framebuffer"))?;
+            pixels.extend_from_slice(row);
+        }
+        return Ok(pixels);
+    }
     for y in rectangle.y..rectangle.y + rectangle.height {
         for x in rectangle.x..rectangle.x + rectangle.width {
             let bgra = view.pixel(x, y)?;
@@ -1326,6 +1354,43 @@ mod tests {
             assert_eq!(&decoded[..written], &[1, 2, 3, 255, 4, 5, 6, 255]);
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn bgra_layout_fast_paths_copy_captured_bytes() {
+        let frame = Frame::new(
+            2,
+            2,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        )
+        .unwrap();
+        // macOS Screen Sharing negotiates this layout with depth 32; the
+        // fast paths must apply to it and copy the captured bytes.
+        let mut depth_32 = PixelFormat::DEFAULT;
+        depth_32.depth = 32;
+        let rectangle = DamageRect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 2,
+        };
+
+        // The Zlib/ZRLE pixel path copies rows for layout-equivalent formats.
+        let pixels =
+            encode_rectangle_pixels(&FrameView::plain(&frame), rectangle, depth_32).unwrap();
+        assert_eq!(pixels, vec![5, 6, 7, 8, 13, 14, 15, 16]);
+
+        // The Raw socket path does the same.
+        let mut sink = Cursor::new(Vec::new());
+        send_raw_rectangle(
+            &mut sink,
+            &FrameView::plain(&frame),
+            rectangle,
+            depth_32,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(sink.into_inner(), vec![5, 6, 7, 8, 13, 14, 15, 16]);
     }
 
     #[test]

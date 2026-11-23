@@ -63,6 +63,21 @@ impl PixelFormat {
         }
     }
 
+    /// True when encoding a captured BGRA pixel into this format is a plain
+    /// copy of the four captured bytes. Only the channel layout matters; the
+    /// nominal depth is deliberately ignored because some clients (macOS
+    /// Screen Sharing among them) report depth 32 for a 24-bit layout.
+    pub(super) fn matches_bgra_layout(self) -> bool {
+        self.bits_per_pixel == 32
+            && !self.big_endian
+            && self.red_max == 255
+            && self.green_max == 255
+            && self.blue_max == 255
+            && self.red_shift == 16
+            && self.green_shift == 8
+            && self.blue_shift == 0
+    }
+
     pub(super) fn used_component_bits(self) -> u32 {
         (u32::from(self.red_max) << self.red_shift)
             | (u32::from(self.green_max) << self.green_shift)
@@ -70,7 +85,7 @@ impl PixelFormat {
     }
 
     pub(super) fn encode(self, bgra: &[u8]) -> [u8; 4] {
-        if self == Self::DEFAULT {
+        if self.matches_bgra_layout() {
             return [bgra[0], bgra[1], bgra[2], bgra[3]];
         }
         let red = scale_channel(bgra[2], self.red_max) << self.red_shift;
@@ -244,6 +259,33 @@ mod tests {
         let mut wrong = server_pixel_format();
         wrong[10] = 0;
         assert!(PixelFormat::from_wire(&wrong).is_err());
+    }
+
+    #[test]
+    fn bgra_layout_equivalence_ignores_nominal_depth() {
+        // macOS Screen Sharing reports depth 32 for this layout; encoding
+        // must still be a plain byte copy.
+        let mut depth_32 = PixelFormat::DEFAULT;
+        depth_32.depth = 32;
+        for format in [PixelFormat::DEFAULT, depth_32] {
+            assert!(format.matches_bgra_layout());
+            assert_eq!(format.encode(&[1, 2, 3, 4]), [1, 2, 3, 4]);
+        }
+
+        // Any channel-layout difference disables the equivalence.
+        let mut shifted = PixelFormat::DEFAULT;
+        shifted.red_shift = 0;
+        shifted.blue_shift = 16;
+        assert!(!shifted.matches_bgra_layout());
+        let mut big_endian = PixelFormat::DEFAULT;
+        big_endian.big_endian = true;
+        assert!(!big_endian.matches_bgra_layout());
+        let mut narrow = PixelFormat::DEFAULT;
+        narrow.bits_per_pixel = 16;
+        assert!(!narrow.matches_bgra_layout());
+        let mut narrower_max = PixelFormat::DEFAULT;
+        narrower_max.red_max = 31;
+        assert!(!narrower_max.matches_bgra_layout());
     }
 
     #[test]
